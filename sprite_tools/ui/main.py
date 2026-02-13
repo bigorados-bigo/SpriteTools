@@ -25,6 +25,7 @@ from PySide6.QtCore import (
     QPointF,
     QRect,
     QSize,
+    QSettings,
     Qt,
     Signal,
     QTimer,
@@ -52,9 +53,11 @@ from PySide6.QtWidgets import (
     QSlider,
     QSpinBox,
     QSplitter,
+    QSizePolicy,
     QStyledItemDelegate,
     QStyle,
     QStyleOptionViewItem,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -518,6 +521,12 @@ class PaletteItemDelegate(QStyledItemDelegate):
         self.show_index_labels = True
         self.show_grid_lines = False
         self.local_rows: set[int] = set()
+        self.usage_counts: Dict[int, int] = {}
+        self.show_usage_badge = False
+        self.merge_source_rows: set[int] = set()
+        self.merge_destination_row: int | None = None
+        self.merge_candidate_risk: Dict[int, str] = {}
+        self.swatch_inset = 6
         self._last_selection_debug_key: tuple[Any, ...] | None = None
 
     def paint(self, painter: QPainter, option: QStyleOptionViewItem, index: QModelIndex) -> None:
@@ -532,7 +541,8 @@ class PaletteItemDelegate(QStyledItemDelegate):
         painter.fillRect(option.rect, QColor(42, 42, 42, 0))
 
         # Canonical swatch rect: single source of truth for color tile, local marker, and selection border.
-        swatch_side = min(option.rect.width(), option.rect.height()) - 12
+        inset = max(1, int(self.swatch_inset))
+        swatch_side = min(option.rect.width(), option.rect.height()) - (inset * 2)
         swatch_side = max(12, swatch_side)
         swatch_rect = QRect(
             option.rect.x() + (option.rect.width() - swatch_side) // 2,
@@ -607,6 +617,60 @@ class PaletteItemDelegate(QStyledItemDelegate):
             painter.setBrush(QColor(255, 215, 0, 220))
             painter.drawEllipse(marker)
             painter.restore()
+
+        if self.show_usage_badge and not is_empty:
+            usage = int(self.usage_counts.get(index.row(), 0))
+            if usage > 0:
+                painter.save()
+                badge_text = str(usage)
+                font = painter.font()
+                font.setPointSize(7)
+                font.setBold(True)
+                painter.setFont(font)
+                metrics = painter.fontMetrics()
+                badge_w = max(14, metrics.horizontalAdvance(badge_text) + 6)
+                badge_h = max(12, metrics.height() + 2)
+                badge_rect = QRect(
+                    swatch_rect.right() - badge_w + 1,
+                    swatch_rect.bottom() - badge_h + 1,
+                    badge_w,
+                    badge_h,
+                )
+                painter.setPen(QPen(QColor(18, 18, 18, 230), 1))
+                painter.setBrush(QColor(30, 30, 30, 220))
+                painter.drawRoundedRect(badge_rect, 3, 3)
+                painter.setPen(QColor(230, 230, 230))
+                painter.drawText(badge_rect, Qt.AlignmentFlag.AlignCenter, badge_text)
+                painter.restore()
+
+        if not is_empty:
+            risk_level = self.merge_candidate_risk.get(index.row())
+            if risk_level in {"safe", "risky"}:
+                painter.save()
+                risk_color = {
+                    "safe": QColor(96, 210, 120),
+                    "risky": QColor(255, 96, 96),
+                }[risk_level]
+                risk_rect = swatch_rect.adjusted(-3, -3, 3, 3).intersected(option.rect.adjusted(1, 1, -1, -1))
+                risk_pen = QPen(risk_color)
+                risk_pen.setWidth(2)
+                painter.setPen(risk_pen)
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.drawRect(risk_rect)
+                painter.restore()
+
+            is_source = index.row() in self.merge_source_rows
+            is_destination = self.merge_destination_row == index.row()
+            if is_source or is_destination:
+                painter.save()
+                border_color = QColor(86, 182, 255) if is_source else QColor(196, 120, 255)
+                role_rect = swatch_rect.adjusted(-2, -2, 2, 2).intersected(option.rect.adjusted(1, 1, -1, -1))
+                role_pen = QPen(border_color)
+                role_pen.setWidth(4)
+                painter.setPen(role_pen)
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.drawRect(role_rect)
+                painter.restore()
         
         if not is_selected:
             return
@@ -689,6 +753,18 @@ def _color_pixmap(color: ColorTuple, size: int = 32, alpha: int = 255) -> QPixma
     painter.end()
     
     return pixmap
+
+
+def _compute_forced_cell_size(viewport_width: int, columns: int, gap: int, *, min_cell: int = 16, max_cell: int = 96) -> int:
+    cols = max(1, int(columns))
+    safe_gap = max(0, int(gap))
+    available = max(1, int(viewport_width))
+    required_gap = (cols - 1) * safe_gap
+    cell = (available - required_gap) // cols
+    cell = max(min_cell, min(max_cell, cell))
+    while (cols * cell) + required_gap > available and cell > min_cell:
+        cell -= 1
+    return cell
 
 
 class PaletteModel(QAbstractListModel):
@@ -1106,9 +1182,80 @@ class PaletteListView(QListView):
         self.setIconSize(QSize(icon, icon))
         self.viewport().update()
 
+    def set_swatch_inset(self, inset: int) -> None:
+        self._delegate.swatch_inset = max(1, int(inset))
+        self.viewport().update()
+
+    def measure_first_row_columns(self, *, sample_limit: int = 128) -> int:
+        model = self.model_obj
+        total = model.rowCount()
+        if total <= 0:
+            return 0
+        first = self.visualRect(model.index(0))
+        if not first.isValid() or first.width() <= 0:
+            return 0
+        first_y = first.y()
+        columns = 1
+        max_rows = min(total, max(1, int(sample_limit)))
+        for row in range(1, max_rows):
+            rect = self.visualRect(model.index(row))
+            if not rect.isValid() or rect.width() <= 0:
+                continue
+            if abs(rect.y() - first_y) <= 1:
+                columns += 1
+                continue
+            if rect.y() > first_y:
+                break
+        return columns
+
     def set_local_rows(self, rows: Sequence[int]) -> None:
         self._delegate.local_rows = {int(row) for row in rows if 0 <= int(row) < 256}
         logger.debug("PaletteListView local rows updated count=%s sample=%s", len(self._delegate.local_rows), sorted(self._delegate.local_rows)[:12])
+        self.viewport().update()
+
+    def set_usage_counts(self, counts: Dict[int, int], *, show_badge: bool = True) -> None:
+        normalized: Dict[int, int] = {}
+        for row, count in counts.items():
+            row_int = int(row)
+            if 0 <= row_int < 256:
+                normalized[row_int] = max(0, int(count))
+        self._delegate.usage_counts = normalized
+        self._delegate.show_usage_badge = bool(show_badge)
+        logger.debug(
+            "PaletteListView usage counts updated rows=%s show_badge=%s sample=%s",
+            len(normalized),
+            show_badge,
+            dict(list(normalized.items())[:12]),
+        )
+        self.viewport().update()
+
+    def set_merge_roles(self, source_rows: Sequence[int], destination_row: int | None) -> None:
+        self._delegate.merge_source_rows = {int(row) for row in source_rows if 0 <= int(row) < 256}
+        self._delegate.merge_destination_row = (
+            int(destination_row)
+            if destination_row is not None and 0 <= int(destination_row) < 256
+            else None
+        )
+        logger.debug(
+            "PaletteListView merge roles source_count=%s destination=%s sources=%s",
+            len(self._delegate.merge_source_rows),
+            self._delegate.merge_destination_row,
+            sorted(self._delegate.merge_source_rows)[:16],
+        )
+        self.viewport().update()
+
+    def set_merge_candidate_risk(self, risk_map: Dict[int, str]) -> None:
+        normalized: Dict[int, str] = {}
+        for row, level in risk_map.items():
+            row_int = int(row)
+            if 0 <= row_int < 256 and level in {"safe", "risky"}:
+                normalized[row_int] = level
+        self._delegate.merge_candidate_risk = normalized
+        logger.debug(
+            "PaletteListView merge candidate risk updated rows=%s sample=%s",
+            len(normalized),
+            dict(list(normalized.items())[:16]),
+        )
         self.viewport().update()
 
     def _copy_selected_palette(self) -> None:
@@ -1678,24 +1825,24 @@ class PreviewPane(QWidget):
             if isinstance(event, QMouseEvent):
                 # Handle drag mode for sprite repositioning
                 if self._drag_mode:
-                    if etype == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:
+                    if etype == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.RightButton:
                         self._start_drag(event)
                         return True
                     if etype == QEvent.Type.MouseMove and self._drag_active:
                         self._drag_sprite(event)
                         return True
-                    if etype == QEvent.Type.MouseButtonRelease and event.button() == Qt.MouseButton.LeftButton:
+                    if etype == QEvent.Type.MouseButtonRelease and event.button() == Qt.MouseButton.RightButton:
                         self._end_drag()
                         return True
                 
-                # Handle pan mode (middle mouse button)
-                if etype == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.MiddleButton:
+                # Handle pan mode (left or middle mouse button when not in drag mode)
+                if etype == QEvent.Type.MouseButtonPress and event.button() in (Qt.MouseButton.LeftButton, Qt.MouseButton.MiddleButton):
                     self._start_pan(event)
                     return True
                 if etype == QEvent.Type.MouseMove and self._pan_active:
                     self._pan(event)
                     return True
-                if etype == QEvent.Type.MouseButtonRelease and event.button() == Qt.MouseButton.MiddleButton:
+                if etype == QEvent.Type.MouseButtonRelease and event.button() in (Qt.MouseButton.LeftButton, Qt.MouseButton.MiddleButton):
                     self._end_pan()
                     return True
         return super().eventFilter(obj, event)
@@ -1869,8 +2016,21 @@ class FloatingPaletteWindow(QWidget):
     def __init__(self, index: int, parent: QWidget | None = None) -> None:
         super().__init__(parent, Qt.WindowType.Window)
         self._window_index = index
+        self._settings = QSettings("SpriteTools", "SpriteTools")
+        self._settings_prefix = f"floating_palette/{self._window_index}"
+        self._is_loading_settings = False
+        self._layout_in_progress = False
+        self._shown_once = False
+        self._layout_timer = QTimer(self)
+        self._layout_timer.setSingleShot(True)
+        self._layout_timer.timeout.connect(self._apply_layout_options)
+        self._supported_drop_suffixes = {
+            ".act", ".gpl", ".pal", ".txt", ".hex", ".png", ".bmp", ".gif", ".jpg", ".jpeg"
+        }
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
         self.setWindowTitle(f"Palette Window #{index}")
         self.resize(460, 520)
+        self.setAcceptDrops(True)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(8, 8, 8, 8)
@@ -1881,13 +2041,20 @@ class FloatingPaletteWindow(QWidget):
         self.load_button.clicked.connect(self._load_palette)
         controls.addWidget(self.load_button)
 
+        self.clear_palette_btn = QPushButton("Clear Currently Loaded Palette")
+        self.clear_palette_btn.clicked.connect(self._clear_loaded_palette)
+        controls.addWidget(self.clear_palette_btn)
+
         self.mode_combo = QComboBox()
         self.mode_combo.addItem("Detect", "detect")
         self.mode_combo.addItem("Preserve", "preserve")
         self.mode_combo.setToolTip("For image imports: Detect builds palette, Preserve keeps source indices")
+        self.mode_combo.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        self.mode_combo.setMinimumWidth(110)
         controls.addWidget(self.mode_combo)
 
-        controls.addWidget(QLabel("Cols"))
+        controls.addSpacing(8)
+        controls.addWidget(QLabel("Columns"))
         self.columns_spin = QSpinBox()
         self.columns_spin.setRange(1, 32)
         self.columns_spin.setValue(8)
@@ -1905,12 +2072,21 @@ class FloatingPaletteWindow(QWidget):
 
         controls.addWidget(QLabel("Gap"))
         self.spacing_spin = QSpinBox()
-        self.spacing_spin.setRange(0, 20)
+        self.spacing_spin.setRange(-8, 20)
         self.spacing_spin.setValue(6)
         self.spacing_spin.valueChanged.connect(self._apply_layout_options)
         self.spacing_spin.setFixedWidth(50)
         controls.addWidget(self.spacing_spin)
+        controls.addStretch(1)
         root.addLayout(controls)
+
+        force_cols_row = QHBoxLayout()
+        self.force_columns_check = QCheckBox("Force palette view columns")
+        self.force_columns_check.setChecked(True)
+        self.force_columns_check.toggled.connect(self._apply_layout_options)
+        force_cols_row.addWidget(self.force_columns_check)
+        force_cols_row.addStretch(1)
+        root.addLayout(force_cols_row)
 
         toggles = QHBoxLayout()
         self.show_indices_check = QCheckBox("Indices")
@@ -1933,30 +2109,159 @@ class FloatingPaletteWindow(QWidget):
         self.palette_list.palette_changed.connect(self._on_palette_changed)
         root.addWidget(self.palette_list, 1)
 
-        self._apply_layout_options()
+        self._load_view_settings()
+        self._layout_timer.start(0)
+
+    def _settings_key(self, name: str) -> str:
+        return f"{self._settings_prefix}/{name}"
+
+    def _get_pref_bool(self, name: str, default: bool) -> bool:
+        value = self._settings.value(self._settings_key(name), default)
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on"}
+        return bool(value)
+
+    def _get_pref_int(self, name: str, default: int) -> int:
+        value = self._settings.value(self._settings_key(name), default)
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return int(default)
+
+    def _load_view_settings(self) -> None:
+        self._is_loading_settings = True
+        controls = [
+            self.columns_spin,
+            self.zoom_spin,
+            self.spacing_spin,
+            self.force_columns_check,
+            self.show_indices_check,
+            self.grid_lines_check,
+        ]
+        blocked_states = [control.blockSignals(True) for control in controls]
+        try:
+            self.columns_spin.setValue(max(1, min(32, self._get_pref_int("columns", self.columns_spin.value()))))
+            self.zoom_spin.setValue(max(16, min(96, self._get_pref_int("zoom", self.zoom_spin.value()))))
+            self.spacing_spin.setValue(max(-8, min(20, self._get_pref_int("gap", self.spacing_spin.value()))))
+            self.force_columns_check.setChecked(self._get_pref_bool("force_columns", self.force_columns_check.isChecked()))
+            self.show_indices_check.setChecked(self._get_pref_bool("show_indices", self.show_indices_check.isChecked()))
+            self.grid_lines_check.setChecked(self._get_pref_bool("show_grid", self.grid_lines_check.isChecked()))
+        finally:
+            for control, blocked in zip(controls, blocked_states):
+                control.blockSignals(blocked)
+            self._is_loading_settings = False
+        logger.debug(
+            "Floating palette settings loaded window=%s cols=%s zoom=%s gap=%s force=%s idx=%s grid=%s",
+            self._window_index,
+            self.columns_spin.value(),
+            self.zoom_spin.value(),
+            self.spacing_spin.value(),
+            self.force_columns_check.isChecked(),
+            self.show_indices_check.isChecked(),
+            self.grid_lines_check.isChecked(),
+        )
+
+    def _save_view_settings(self) -> None:
+        self._settings.setValue(self._settings_key("columns"), int(self.columns_spin.value()))
+        self._settings.setValue(self._settings_key("zoom"), int(self.zoom_spin.value()))
+        self._settings.setValue(self._settings_key("gap"), int(self.spacing_spin.value()))
+        self._settings.setValue(self._settings_key("force_columns"), bool(self.force_columns_check.isChecked()))
+        self._settings.setValue(self._settings_key("show_indices"), bool(self.show_indices_check.isChecked()))
+        self._settings.setValue(self._settings_key("show_grid"), bool(self.grid_lines_check.isChecked()))
 
     def _selected_mode(self) -> Literal["detect", "preserve"]:
         return "preserve" if self.mode_combo.currentData() == "preserve" else "detect"
 
     def _apply_layout_options(self) -> None:
-        cell = self.zoom_spin.value()
-        gap = self.spacing_spin.value()
-        cols = self.columns_spin.value()
-        self.palette_list.setSpacing(gap)
-        self.palette_list.set_cell_size(cell)
-        self.palette_list.set_show_index_labels(self.show_indices_check.isChecked())
-        self.palette_list.set_show_grid_lines(self.grid_lines_check.isChecked())
-        width_hint = cols * (cell + gap) + 30
-        self.palette_list.setMinimumWidth(width_hint)
-        logger.debug(
-            "Floating palette apply layout window=%s cols=%s cell=%s gap=%s show_idx=%s grid=%s",
-            self._window_index,
-            cols,
-            cell,
-            gap,
-            self.show_indices_check.isChecked(),
-            self.grid_lines_check.isChecked(),
-        )
+        if self._is_loading_settings or self._layout_in_progress:
+            return
+        self._layout_in_progress = True
+        try:
+            gap = self.spacing_spin.value()
+            cols = self.columns_spin.value()
+            force_columns = self.force_columns_check.isChecked()
+            effective_gap = max(0, gap)
+            tightness = max(0, -gap)
+            if force_columns:
+                available_width = max(120, self.palette_list.viewport().width())
+                if cols > 1:
+                    max_gap_for_cols = max(0, (available_width - (cols * 16)) // (cols - 1))
+                    if effective_gap > max_gap_for_cols:
+                        logger.debug(
+                            "Floating palette gap clamped window=%s requested_gap=%s clamped_gap=%s cols=%s viewport_w=%s",
+                            self._window_index,
+                            effective_gap,
+                            max_gap_for_cols,
+                            cols,
+                            available_width,
+                        )
+                        effective_gap = max_gap_for_cols
+                cell = _compute_forced_cell_size(available_width, cols, effective_gap)
+                self.palette_list.setSpacing(effective_gap)
+                self.palette_list.set_cell_size(cell)
+                realized_cols = self.palette_list.measure_first_row_columns()
+                if realized_cols and realized_cols != cols:
+                    attempts = 0
+                    while realized_cols < cols and cell > 16 and attempts < 40:
+                        cell -= 1
+                        self.palette_list.set_cell_size(cell)
+                        realized_cols = self.palette_list.measure_first_row_columns()
+                        attempts += 1
+                    while realized_cols > cols and cell < 96 and attempts < 80:
+                        cell += 1
+                        self.palette_list.set_cell_size(cell)
+                        new_realized = self.palette_list.measure_first_row_columns()
+                        attempts += 1
+                        if new_realized < cols:
+                            cell -= 1
+                            self.palette_list.set_cell_size(cell)
+                            realized_cols = self.palette_list.measure_first_row_columns()
+                            break
+                        realized_cols = new_realized
+                    logger.debug(
+                        "Floating palette exact-fit correction window=%s target_cols=%s realized_cols=%s cell=%s attempts=%s",
+                        self._window_index,
+                        cols,
+                        realized_cols,
+                        cell,
+                        attempts,
+                    )
+                if self.zoom_spin.value() != cell:
+                    self.zoom_spin.blockSignals(True)
+                    self.zoom_spin.setValue(cell)
+                    self.zoom_spin.blockSignals(False)
+            else:
+                available_width = self.palette_list.viewport().width()
+                cell = self.zoom_spin.value()
+            self.zoom_spin.setEnabled(not force_columns)
+            self.palette_list.setSpacing(effective_gap)
+            self.palette_list.set_cell_size(cell)
+            self.palette_list.set_swatch_inset(max(1, 6 - tightness))
+            self.palette_list.set_show_index_labels(self.show_indices_check.isChecked())
+            self.palette_list.set_show_grid_lines(self.grid_lines_check.isChecked())
+            if force_columns:
+                self.palette_list.setMinimumWidth(220)
+            else:
+                width_hint = cols * (cell + effective_gap) + 30
+                self.palette_list.setMinimumWidth(width_hint)
+            logger.debug(
+                "Floating palette apply layout window=%s force_cols=%s cols=%s cell=%s gap=%s effective_gap=%s tightness=%s viewport_w=%s show_idx=%s grid=%s",
+                self._window_index,
+                force_columns,
+                cols,
+                cell,
+                gap,
+                effective_gap,
+                tightness,
+                available_width,
+                self.show_indices_check.isChecked(),
+                self.grid_lines_check.isChecked(),
+            )
+            self._save_view_settings()
+        finally:
+            self._layout_in_progress = False
 
     def _update_count_label(self) -> None:
         count = sum(1 for color in self.palette_list.model_obj.colors if color is not None)
@@ -1965,6 +2270,12 @@ class FloatingPaletteWindow(QWidget):
 
     def _on_palette_changed(self, _colors: List[ColorTuple]) -> None:
         self._update_count_label()
+
+    def _clear_loaded_palette(self) -> None:
+        self.palette_list.set_colors([], slots=[], alphas=[], emit_signal=False)
+        self._update_count_label()
+        self.setWindowTitle(f"Palette Window #{self._window_index}")
+        logger.debug("Floating palette cleared window=%s", self._window_index)
 
     def _load_palette(self) -> None:
         file_path, _filter = QFileDialog.getOpenFileName(
@@ -1976,6 +2287,9 @@ class FloatingPaletteWindow(QWidget):
         if not file_path:
             return
         path = Path(file_path)
+        self._load_palette_from_path(path)
+
+    def _load_palette_from_path(self, path: Path) -> None:
         mode = self._selected_mode()
         try:
             colors, alphas, source = _load_palette_from_source(path, mode)
@@ -1995,6 +2309,801 @@ class FloatingPaletteWindow(QWidget):
             source,
             len(colors),
         )
+
+    def resizeEvent(self, event) -> None:  # type: ignore[override]
+        if hasattr(self, "force_columns_check") and self.force_columns_check.isChecked():
+            self._layout_timer.start(16)
+        super().resizeEvent(event)
+
+    def showEvent(self, event) -> None:  # type: ignore[override]
+        super().showEvent(event)
+        if not self._shown_once:
+            self._shown_once = True
+            self._layout_timer.start(0)
+
+    def dragEnterEvent(self, event) -> None:  # type: ignore[override]
+        urls = event.mimeData().urls() if event.mimeData().hasUrls() else []
+        for url in urls:
+            local = Path(url.toLocalFile())
+            if local.is_file() and local.suffix.lower() in self._supported_drop_suffixes:
+                event.acceptProposedAction()
+                return
+        event.ignore()
+
+    def dropEvent(self, event) -> None:  # type: ignore[override]
+        urls = event.mimeData().urls() if event.mimeData().hasUrls() else []
+        loaded = 0
+        for url in urls:
+            local = Path(url.toLocalFile())
+            if not local.is_file() or local.suffix.lower() not in self._supported_drop_suffixes:
+                continue
+            self._load_palette_from_path(local)
+            loaded += 1
+        if loaded:
+            logger.debug("Floating palette drop loaded window=%s files=%s", self._window_index, loaded)
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+
+class MergeOperationDialog(QDialog):
+    def __init__(self, owner: "SpriteToolsWindow") -> None:
+        super().__init__(owner)
+        self._owner = owner
+        self._source_rows: set[int] = set()
+        self._destination_row: int | None = None
+        self._scope_records: List[SpriteRecord] = []
+        self._source_after_color: ColorTuple = (255, 0, 255)
+        self._quick_assign_mouse_active = False
+        self._hover_palette_row: int | None = None
+        self._destination_blink_on = False
+        self._destination_blink_phase = 0.0
+        self._destination_blink_timer = QTimer(self)
+        self._destination_blink_timer.setInterval(30)
+        self._destination_blink_timer.timeout.connect(self._tick_destination_blink)
+        self._view_columns = max(1, min(32, self._owner._get_pref_int("merge/view_columns", 8)))
+        self._view_force_columns = self._owner._get_pref_bool("merge/view_force_columns", True)
+        self._view_zoom = max(16, min(96, self._owner._get_pref_int("merge/view_zoom", 42)))
+        self._view_gap = max(-8, min(20, self._owner._get_pref_int("merge/view_gap", 6)))
+        self._view_show_indices = self._owner._get_pref_bool("merge/view_show_indices", True)
+        self._view_show_grid = self._owner._get_pref_bool("merge/view_show_grid", True)
+        self.setModal(True)
+        self.setWindowTitle("Merge Indexes (Source → Destination)")
+        self.resize(1160, 700)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(8, 8, 8, 8)
+        root.setSpacing(6)
+
+        controls = QHBoxLayout()
+        controls.addWidget(QLabel("Apply To"))
+        self.scope_combo = QComboBox()
+        self.scope_combo.addItem("Global", "global")
+        self.scope_combo.addItem("Group", "group")
+        self.scope_combo.addItem("Local", "local")
+        self.scope_combo.setToolTip("Where merge changes are applied: all sprites, current group, or current sprite")
+        self.scope_combo.currentIndexChanged.connect(self._on_scope_changed)
+        controls.addWidget(self.scope_combo)
+
+        self.view_settings_btn = QPushButton("View")
+        self.view_settings_btn.setToolTip("Configure merge palette swatch view")
+        self.view_settings_btn.clicked.connect(self._open_view_settings)
+        controls.addWidget(self.view_settings_btn)
+
+        controls.addWidget(QLabel("Source Swatches After Merge"))
+        self.source_after_combo = QComboBox()
+        self.source_after_combo.addItem("Fill gaps (compact palette)", "compact_shift")
+        self.source_after_combo.addItem("Preserve source swatch colors", "preserve_colors")
+        self.source_after_combo.addItem("Recolor source swatches", "recolor_sources")
+        self.source_after_combo.setToolTip("Controls what happens to Source swatches after pixel remap")
+        self.source_after_combo.currentIndexChanged.connect(self._on_source_after_mode_changed)
+        controls.addWidget(self.source_after_combo)
+
+        self.source_after_color_btn = QPushButton("Pick color")
+        self.source_after_color_btn.clicked.connect(self._pick_source_after_color)
+        self.source_after_color_btn.setVisible(False)
+        controls.addWidget(self.source_after_color_btn)
+
+        controls.addStretch(1)
+        self.selection_label = QLabel("Source: none | Destination: none")
+        controls.addWidget(self.selection_label)
+        root.addLayout(controls)
+
+        quick_row = QHBoxLayout()
+        self.quick_assign_check = QCheckBox("Quick assign mode")
+        self.quick_assign_check.setChecked(True)
+        quick_row.addWidget(self.quick_assign_check)
+        self.quick_assign_hint_label = QLabel(
+            "L="
+            "<span style='color:rgb(86,182,255)'><b>Source</b></span> "
+            "| R="
+            "<span style='color:rgb(196,120,255)'><b>Destination</b></span> "
+            "| M=Clear swatch"
+        )
+        self.quick_assign_hint_label.setTextFormat(Qt.TextFormat.RichText)
+        quick_row.addWidget(self.quick_assign_hint_label)
+        quick_row.addStretch(1)
+        root.addLayout(quick_row)
+
+        role_row = QHBoxLayout()
+        self.tag_source_btn = QPushButton("Tag Selected as Source")
+        self.tag_source_btn.setStyleSheet(
+            "QPushButton { border: 1px solid rgb(86,182,255); color: rgb(86,182,255); font-weight: 600; }"
+        )
+        self.tag_source_btn.clicked.connect(self._mark_selected_as_sources)
+        role_row.addWidget(self.tag_source_btn)
+        self.tag_destination_btn = QPushButton("Set Current as Destination")
+        self.tag_destination_btn.setStyleSheet(
+            "QPushButton { border: 1px solid rgb(196,120,255); color: rgb(196,120,255); font-weight: 600; }"
+        )
+        self.tag_destination_btn.clicked.connect(self._set_current_as_destination)
+        role_row.addWidget(self.tag_destination_btn)
+        self.clear_roles_btn = QPushButton("Clear Source/Destination")
+        self.clear_roles_btn.clicked.connect(self._clear_source_destination)
+        role_row.addWidget(self.clear_roles_btn)
+        self.clear_all_btn = QPushButton("Clear All Selections")
+        self.clear_all_btn.clicked.connect(self._clear_all_selections)
+        role_row.addWidget(self.clear_all_btn)
+        self.clear_after_apply_check = QCheckBox("Clear selection after Apply Merge")
+        self.clear_after_apply_check.setChecked(self._owner._get_pref_bool("merge/clear_selection_after_apply", True))
+        self.clear_after_apply_check.toggled.connect(
+            lambda checked: self._owner._set_pref("merge/clear_selection_after_apply", bool(checked))
+        )
+        role_row.addWidget(self.clear_after_apply_check)
+        self.apply_button = QPushButton("Apply Merge")
+        self.apply_button.clicked.connect(self._apply_merge)
+        self.apply_button.setEnabled(False)
+        role_row.addWidget(self.apply_button)
+        role_row.addStretch(1)
+        root.addLayout(role_row)
+
+        self.role_legend_label = QLabel(
+            "<b>Role colors:</b> "
+            "<span style='color:rgb(86,182,255)'><b>Source</b></span> | "
+            "<span style='color:rgb(196,120,255)'><b>Destination</b></span>"
+        )
+        self.role_legend_label.setTextFormat(Qt.TextFormat.RichText)
+        root.addWidget(self.role_legend_label)
+
+        content_split = QSplitter(Qt.Orientation.Horizontal)
+        root.addWidget(content_split, 1)
+
+        self.tabs = QTabWidget()
+        content_split.addWidget(self.tabs)
+
+        main_tab = QWidget()
+        main_layout = QVBoxLayout(main_tab)
+        main_layout.setContentsMargins(6, 6, 6, 6)
+        self.palette_view = PaletteListView(main_tab)
+        self.palette_view.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.palette_view.setDragDropMode(QAbstractItemView.DragDropMode.NoDragDrop)
+        self.palette_view.setDragEnabled(False)
+        self.palette_view.setAcceptDrops(False)
+        self.palette_view.selection_changed.connect(self._on_palette_selection_changed)
+        self.palette_view.viewport().installEventFilter(self)
+        self.palette_view.setMouseTracking(True)
+        self.palette_view.viewport().setMouseTracking(True)
+        self._apply_palette_view_options()
+        main_layout.addWidget(self.palette_view, 1)
+        self.tabs.addTab(main_tab, "Palette")
+
+        groups_tab = QWidget()
+        groups_layout = QVBoxLayout(groups_tab)
+        groups_layout.setContentsMargins(6, 6, 6, 6)
+        self.group_list = QListWidget()
+        groups_layout.addWidget(self.group_list, 1)
+        self.tabs.addTab(groups_tab, "Group Impact")
+
+        sprites_tab = QWidget()
+        sprites_layout = QVBoxLayout(sprites_tab)
+        sprites_layout.setContentsMargins(6, 6, 6, 6)
+        self.sprite_list = QListWidget()
+        self.sprite_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.sprite_list.itemSelectionChanged.connect(self._on_sprite_pick_changed)
+        self.sprite_list.setIconSize(QSize(40, 40))
+        sprites_layout.addWidget(self.sprite_list, 1)
+        self.tabs.addTab(sprites_tab, "Sprite Impact")
+
+        preview_panel = QWidget()
+        preview_layout = QVBoxLayout(preview_panel)
+        preview_layout.setContentsMargins(6, 6, 6, 6)
+        preview_layout.setSpacing(6)
+        self.preview_title_label = QLabel("Preview (right panel, main-style checkerboard)")
+        preview_layout.addWidget(self.preview_title_label)
+
+        preview_split = QSplitter()
+        self.preview_sprite_list = QListWidget()
+        self.preview_sprite_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.preview_sprite_list.itemSelectionChanged.connect(self._on_sprite_pick_changed)
+        self.preview_sprite_list.setIconSize(QSize(40, 40))
+        preview_split.addWidget(self.preview_sprite_list)
+
+        self.preview_pane = PreviewPane()
+        self.preview_pane.title.setVisible(False)
+        if hasattr(self._owner, "filter_combo"):
+            mode = Qt.TransformationMode.FastTransformation if self._owner.filter_combo.currentIndex() == 0 else Qt.TransformationMode.SmoothTransformation
+            self.preview_pane.set_scaling_mode(mode)
+        preview_split.addWidget(self.preview_pane)
+        preview_split.setStretchFactor(0, 1)
+        preview_split.setStretchFactor(1, 3)
+        preview_layout.addWidget(preview_split, 1)
+        content_split.addWidget(preview_panel)
+        content_split.setStretchFactor(0, 2)
+        content_split.setStretchFactor(1, 1)
+        content_split.setSizes([760, 380])
+
+        self.impact_label = QLabel("Tag Source and Destination indexes")
+        self.impact_label.setTextFormat(Qt.TextFormat.RichText)
+        root.addWidget(self.impact_label)
+        self.risk_legend_label = QLabel(
+            "<b>Risk legend:</b> "
+            "<span style='color:#60d278'>Green</span> = selecting this Destination will <b>not lose pixel data</b>; "
+            "<span style='color:#ff6060'>Red</span> = selecting this Destination <b>will lose pixel data</b>"
+        )
+        self.risk_legend_label.setTextFormat(Qt.TextFormat.RichText)
+        root.addWidget(self.risk_legend_label)
+
+        actions = QHBoxLayout()
+        actions.addStretch(1)
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.reject)
+        actions.addWidget(close_btn)
+        root.addLayout(actions)
+
+        self._binding_shortcuts: List[QShortcut] = []
+        self._setup_key_bindings()
+        self._load_palette_snapshot()
+        self._refresh_views()
+
+    def _setup_key_bindings(self) -> None:
+        for shortcut in self._binding_shortcuts:
+            shortcut.setParent(None)
+        self._binding_shortcuts.clear()
+
+        binding_map: Dict[str, tuple[str, Callable[[], None]]] = {
+            "merge.apply": (self._owner._get_key_binding("merge.apply", "A"), self._on_apply_shortcut),
+        }
+        for action, (sequence, callback) in binding_map.items():
+            shortcut = QShortcut(QKeySequence(sequence), self)
+            shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+            shortcut.activated.connect(callback)
+            self._binding_shortcuts.append(shortcut)
+            logger.debug("Merge dialog binding action=%s sequence=%s", action, sequence)
+
+    def _on_apply_shortcut(self) -> None:
+        if self.apply_button.isEnabled():
+            self._apply_merge()
+
+    def _scope(self) -> Literal["global", "group", "local"]:
+        data = self.scope_combo.currentData()
+        if data == "group":
+            return "group"
+        if data == "local":
+            return "local"
+        return "global"
+
+    def _load_palette_snapshot(self) -> None:
+        self.palette_view.set_colors(
+            self._owner.palette_colors,
+            slots=self._owner._palette_slot_ids,
+            alphas=self._owner.palette_alphas,
+            emit_signal=False,
+        )
+
+    def _current_palette_row(self) -> int | None:
+        current = self.palette_view.currentIndex()
+        if current.isValid():
+            return int(current.row())
+        selected = self.palette_view.selectedIndexes()
+        if selected:
+            return int(selected[0].row())
+        return None
+
+    def _selection_payload(self) -> Tuple[List[int], int] | None:
+        if self._destination_row is None:
+            return None
+        sources = sorted(self._source_rows)
+        if not sources:
+            return None
+        return sources, int(self._destination_row)
+
+    def _mark_selected_as_sources(self) -> None:
+        rows = sorted({idx.row() for idx in self.palette_view.selectedIndexes()})
+        if not rows:
+            QMessageBox.information(self, "Source", "Select one or more indexes first.")
+            return
+        for row in rows:
+            if self._destination_row is not None and row == self._destination_row:
+                continue
+            self._source_rows.add(int(row))
+        self._refresh_views()
+
+    def _set_current_as_destination(self) -> None:
+        row = self._current_palette_row()
+        if row is None:
+            QMessageBox.information(self, "Destination", "Select one index as destination.")
+            return
+        self._destination_row = int(row)
+        if self._destination_row in self._source_rows:
+            self._source_rows.remove(self._destination_row)
+        self._refresh_views()
+
+    def _clear_source_destination(self) -> None:
+        self._source_rows.clear()
+        self._destination_row = None
+        self._refresh_views()
+
+    def _clear_all_selections(self) -> None:
+        self._source_rows.clear()
+        self._destination_row = None
+        self.palette_view.clearSelection()
+        self.preview_sprite_list.clearSelection()
+        self.sprite_list.clearSelection()
+        self._refresh_views()
+
+    def _on_scope_changed(self, _index: int) -> None:
+        scope = self._scope()
+        if scope != "global" and self.source_after_combo.currentData() == "compact_shift":
+            self.source_after_combo.setCurrentIndex(self.source_after_combo.findData("preserve_colors"))
+        self._refresh_views()
+
+    def _on_source_after_mode_changed(self, _index: int) -> None:
+        mode = self.source_after_combo.currentData()
+        self.source_after_color_btn.setVisible(mode == "recolor_sources")
+
+    def _pick_source_after_color(self) -> None:
+        current = QColor(*self._source_after_color)
+        color = QColorDialog.getColor(current, self, "Pick Source Swatch Color")
+        if not color.isValid():
+            return
+        self._source_after_color = (color.red(), color.green(), color.blue())
+        self.source_after_color_btn.setStyleSheet(
+            f"background-color: rgb({color.red()},{color.green()},{color.blue()});"
+        )
+
+    def _on_palette_selection_changed(self) -> None:
+        self._refresh_views()
+
+    def _apply_palette_view_options(self) -> None:
+        gap = max(-8, int(self._view_gap))
+        cols = max(1, int(self._view_columns))
+        effective_gap = max(0, gap)
+        tightness = max(0, -gap)
+        force_columns = bool(self._view_force_columns)
+        if force_columns:
+            viewport_width = max(120, self.palette_view.viewport().width())
+            cell = _compute_forced_cell_size(viewport_width, cols, effective_gap)
+            self.palette_view.setSpacing(effective_gap)
+            self.palette_view.set_cell_size(cell)
+            realized_cols = self.palette_view.measure_first_row_columns()
+            if realized_cols and realized_cols != cols:
+                attempts = 0
+                while realized_cols < cols and cell > 16 and attempts < 40:
+                    cell -= 1
+                    self.palette_view.set_cell_size(cell)
+                    realized_cols = self.palette_view.measure_first_row_columns()
+                    attempts += 1
+                while realized_cols > cols and cell < 96 and attempts < 80:
+                    cell += 1
+                    self.palette_view.set_cell_size(cell)
+                    new_realized = self.palette_view.measure_first_row_columns()
+                    attempts += 1
+                    if new_realized < cols:
+                        cell -= 1
+                        self.palette_view.set_cell_size(cell)
+                        realized_cols = self.palette_view.measure_first_row_columns()
+                        break
+                    realized_cols = new_realized
+                logger.debug(
+                    "Merge view exact-fit correction target_cols=%s realized_cols=%s cell=%s attempts=%s",
+                    cols,
+                    realized_cols,
+                    cell,
+                    attempts,
+                )
+            self._view_zoom = cell
+        else:
+            viewport_width = self.palette_view.viewport().width()
+            cell = max(16, min(96, int(self._view_zoom)))
+            realized_cols = self.palette_view.measure_first_row_columns()
+        self.palette_view.setSpacing(effective_gap)
+        self.palette_view.set_cell_size(cell)
+        self.palette_view.set_swatch_inset(max(1, 6 - tightness))
+        self.palette_view.set_show_index_labels(bool(self._view_show_indices))
+        self.palette_view.set_show_grid_lines(bool(self._view_show_grid))
+        if force_columns:
+            self.palette_view.setMinimumWidth(220)
+        else:
+            self.palette_view.setMinimumWidth(cols * (cell + effective_gap) + 30)
+        final_realized_cols = self.palette_view.measure_first_row_columns()
+        logger.debug(
+            "Merge dialog view applied force_cols=%s cols=%s realized_cols=%s zoom=%s gap=%s effective_gap=%s tightness=%s viewport_w=%s idx=%s grid=%s",
+            force_columns,
+            cols,
+            final_realized_cols,
+            cell,
+            gap,
+            effective_gap,
+            tightness,
+            viewport_width,
+            self._view_show_indices,
+            self._view_show_grid,
+        )
+
+    def _save_palette_view_options(self) -> None:
+        self._owner._set_pref("merge/view_columns", int(self._view_columns))
+        self._owner._set_pref("merge/view_force_columns", bool(self._view_force_columns))
+        self._owner._set_pref("merge/view_zoom", int(self._view_zoom))
+        self._owner._set_pref("merge/view_gap", int(self._view_gap))
+        self._owner._set_pref("merge/view_show_indices", bool(self._view_show_indices))
+        self._owner._set_pref("merge/view_show_grid", bool(self._view_show_grid))
+
+    def _open_view_settings(self) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Merge Palette View Settings")
+        dialog.setModal(True)
+        layout = QVBoxLayout(dialog)
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Columns"))
+        cols_spin = QSpinBox()
+        cols_spin.setRange(1, 32)
+        cols_spin.setValue(self._view_columns)
+        cols_spin.setFixedWidth(58)
+        row.addWidget(cols_spin)
+        row.addWidget(QLabel("Zoom"))
+        zoom_spin = QSpinBox()
+        zoom_spin.setRange(16, 96)
+        zoom_spin.setValue(self._view_zoom)
+        zoom_spin.setFixedWidth(58)
+        row.addWidget(zoom_spin)
+        row.addWidget(QLabel("Gap"))
+        gap_spin = QSpinBox()
+        gap_spin.setRange(-8, 20)
+        gap_spin.setValue(self._view_gap)
+        gap_spin.setFixedWidth(58)
+        row.addWidget(gap_spin)
+        row.addStretch(1)
+        layout.addLayout(row)
+
+        toggles = QHBoxLayout()
+        show_indices = QCheckBox("Indices")
+        show_indices.setChecked(self._view_show_indices)
+        toggles.addWidget(show_indices)
+        show_grid = QCheckBox("Grid")
+        show_grid.setChecked(self._view_show_grid)
+        toggles.addWidget(show_grid)
+        force_cols = QCheckBox("Force palette view columns")
+        force_cols.setChecked(self._view_force_columns)
+        toggles.addWidget(force_cols)
+        toggles.addStretch(1)
+        layout.addLayout(toggles)
+
+        def apply_settings() -> None:
+            self._view_columns = cols_spin.value()
+            self._view_force_columns = force_cols.isChecked()
+            self._view_zoom = zoom_spin.value()
+            self._view_gap = gap_spin.value()
+            self._view_show_indices = show_indices.isChecked()
+            self._view_show_grid = show_grid.isChecked()
+            zoom_spin.setEnabled(not self._view_force_columns)
+            self._apply_palette_view_options()
+            self._save_palette_view_options()
+            if self._view_force_columns:
+                zoom_spin.blockSignals(True)
+                zoom_spin.setValue(int(self._view_zoom))
+                zoom_spin.blockSignals(False)
+
+        cols_spin.valueChanged.connect(lambda _v: apply_settings())
+        zoom_spin.valueChanged.connect(lambda _v: apply_settings())
+        gap_spin.valueChanged.connect(lambda _v: apply_settings())
+        show_indices.toggled.connect(lambda _v: apply_settings())
+        show_grid.toggled.connect(lambda _v: apply_settings())
+        force_cols.toggled.connect(lambda _v: apply_settings())
+
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(dialog.accept)
+        layout.addWidget(close_btn)
+
+        apply_settings()
+        dialog.exec()
+
+    def _on_sprite_pick_changed(self) -> None:
+        self._refresh_preview_from_state()
+
+    def _tick_destination_blink(self) -> None:
+        if self._hover_palette_row is None:
+            self._destination_blink_timer.stop()
+            self._destination_blink_on = False
+            return
+        self._destination_blink_on = True
+        self._destination_blink_phase += float(getattr(self._owner, "_animation_speed", 0.15))
+        import math
+        if self._destination_blink_phase > 2 * math.pi:
+            self._destination_blink_phase -= 2 * math.pi
+        self._refresh_preview_from_state()
+
+    def _set_hover_palette_row(self, row: int | None) -> None:
+        if self._hover_palette_row == row:
+            return
+        self._hover_palette_row = row
+        self._update_destination_blink_state()
+        self._refresh_preview_from_state()
+
+    def _update_destination_blink_state(self) -> None:
+        highlight_enabled = bool(getattr(self._owner, "highlight_checkbox", None) and self._owner.highlight_checkbox.isChecked())
+        should_blink = self._hover_palette_row is not None
+        if should_blink and highlight_enabled and not self._destination_blink_timer.isActive():
+            self._destination_blink_on = True
+            self._destination_blink_phase = 0.0
+            self._destination_blink_timer.start()
+            logger.debug("Merge dialog hover highlight started hover_row=%s", self._hover_palette_row)
+            self._refresh_preview_from_state()
+        elif (not should_blink or not highlight_enabled) and self._destination_blink_timer.isActive():
+            self._destination_blink_timer.stop()
+            self._destination_blink_on = False
+            logger.debug("Merge dialog hover highlight stopped hover_row=%s", self._hover_palette_row)
+            self._refresh_preview_from_state()
+
+    def _refresh_preview_from_state(self) -> None:
+        selection = self._selection_payload()
+        if selection is None:
+            self._refresh_preview(None, None, self._scope())
+            return
+        sources, destination = selection
+        self._refresh_preview(sources, destination, self._scope())
+
+    def eventFilter(self, obj, event):  # type: ignore[override]
+        if obj is self.palette_view.viewport():
+            if event.type() == QEvent.Type.MouseMove and isinstance(event, QMouseEvent):
+                hover_index = self.palette_view.indexAt(event.pos())
+                self._set_hover_palette_row(int(hover_index.row()) if hover_index.isValid() else None)
+            elif event.type() in (QEvent.Type.Leave, QEvent.Type.HoverLeave):
+                self._set_hover_palette_row(None)
+            elif event.type() == QEvent.Type.Resize and self._view_force_columns:
+                self._apply_palette_view_options()
+
+        if obj is self.palette_view.viewport() and self.quick_assign_check.isChecked():
+            if event.type() == QEvent.Type.MouseButtonPress and isinstance(event, QMouseEvent):
+                index = self.palette_view.indexAt(event.pos())
+                if not index.isValid():
+                    return super().eventFilter(obj, event)
+                row = int(index.row())
+                if event.button() == Qt.MouseButton.LeftButton:
+                    self._quick_assign_mouse_active = True
+                    if self._destination_row == row:
+                        self._destination_row = None
+                        self._source_rows.add(row)
+                    elif row in self._source_rows:
+                        self._source_rows.remove(row)
+                    else:
+                        self._source_rows.add(row)
+                    self._refresh_views()
+                    self._update_destination_blink_state()
+                    return True
+                if event.button() == Qt.MouseButton.RightButton:
+                    self._quick_assign_mouse_active = True
+                    if self._destination_row == row:
+                        self._destination_row = None
+                    else:
+                        self._destination_row = row
+                        if row in self._source_rows:
+                            self._source_rows.remove(row)
+                    self._refresh_views()
+                    self._update_destination_blink_state()
+                    return True
+                if event.button() == Qt.MouseButton.MiddleButton:
+                    self._quick_assign_mouse_active = True
+                    if row in self._source_rows:
+                        self._source_rows.remove(row)
+                    if self._destination_row == row:
+                        self._destination_row = None
+                    self._refresh_views()
+                    self._update_destination_blink_state()
+                    return True
+            if self._quick_assign_mouse_active and event.type() == QEvent.Type.MouseMove:
+                return True
+            if self._quick_assign_mouse_active and event.type() == QEvent.Type.MouseButtonRelease:
+                self._quick_assign_mouse_active = False
+                return True
+            if event.type() == QEvent.Type.ContextMenu:
+                return True
+        return super().eventFilter(obj, event)
+
+    def _refresh_preview(
+        self,
+        sources: Sequence[int] | None,
+        destination: int | None,
+        scope: Literal["global", "group", "local"],
+    ) -> None:
+        selected_items = self.preview_sprite_list.selectedItems()
+        preview_records: List[SpriteRecord] = []
+        if selected_items:
+            for item in selected_items:
+                key = item.data(Qt.ItemDataRole.UserRole)
+                record = self._owner.sprite_records.get(str(key)) if key else None
+                if record is not None:
+                    preview_records.append(record)
+        if not preview_records:
+            current = self._owner._current_record()
+            if current is not None:
+                preview_records = [current]
+
+        selected_record = preview_records[0] if preview_records else None
+        if selected_record is None:
+            self.preview_pane.set_pixmap(None, reset_zoom=False)
+            return
+        self.preview_title_label.setText(f"Previewing: {selected_record.path.name}")
+        pixmap = self._owner._build_merge_preview_pixmap(
+            sources,
+            destination,
+            scope=scope,
+            record=selected_record,
+            highlight_index=self._hover_palette_row,
+            blink_highlight=self._destination_blink_on,
+            blink_phase=self._destination_blink_phase,
+        )
+        self.preview_pane.set_pixmap(pixmap, reset_zoom=False)
+
+    def _refresh_views(self) -> None:
+        scope = self._scope()
+        records = self._owner._merge_scope_records(scope)
+        self._scope_records = list(records)
+        self._refresh_preview_sprite_picker(records)
+        usage_counts = self._owner._usage_counts_for_records(records)
+        self.palette_view.set_usage_counts(usage_counts, show_badge=True)
+        self.palette_view.set_merge_roles(sorted(self._source_rows), self._destination_row)
+        risk_map = self._owner._compute_destination_risk_levels(sorted(self._source_rows), records)
+        self.palette_view.set_merge_candidate_risk(risk_map)
+
+        selection = self._selection_payload()
+        if selection is None:
+            source_text = sorted(self._source_rows)
+            source_value = source_text if source_text else "none"
+            destination_value = self._destination_row if self._destination_row is not None else "none"
+            self.selection_label.setText(
+                "<span style='color:rgb(86,182,255)'><b>Source</b></span>: "
+                f"{source_value} | "
+                "<span style='color:rgb(196,120,255)'><b>Destination</b></span>: "
+                f"{destination_value}"
+            )
+            if self._source_rows:
+                safe_count = sum(1 for value in risk_map.values() if value == "safe")
+                risky_count = sum(1 for value in risk_map.values() if value == "risky")
+                self.impact_label.setText(
+                    f"<b>Apply To</b>=<b>{scope}</b> sprites={len(records)} | "
+                    f"Destination hints: "
+                    f"<span style='color:#60d278'>will not lose pixel data={safe_count}</span> "
+                    f"<span style='color:#ff6060'>will lose pixel data={risky_count}</span>"
+                )
+            else:
+                self.impact_label.setText(f"<b>Apply To</b>=<b>{scope}</b> sprites={len(records)} | Tag Source and Destination")
+            self.apply_button.setEnabled(False)
+            self._refresh_group_list([], None)
+            self._refresh_sprite_list([], None)
+            self._refresh_preview(None, None, scope)
+            self._update_destination_blink_state()
+            return
+
+        sources, destination = selection
+        self.selection_label.setText(
+            "<span style='color:rgb(86,182,255)'><b>Source</b></span>: "
+            f"{sources} | "
+            "<span style='color:rgb(196,120,255)'><b>Destination</b></span>: "
+            f"{destination}"
+        )
+        impact = self._owner._analyze_merge_impact_for_records(sources, destination, records)
+        safe_count = sum(1 for value in risk_map.values() if value == "safe")
+        risky_count = sum(1 for value in risk_map.values() if value == "risky")
+        lose_text = (
+            "<span style='color:#ff6060'><b>Current selection: THIS MERGE WILL LOSE PIXEL DATA</b></span>"
+            if impact["risky_sprites"] > 0
+            else "<span style='color:#60d278'><b>Current selection: THIS MERGE WILL NOT LOSE PIXEL DATA</b></span>"
+        )
+        self.impact_label.setText(
+            f"{lose_text} | <b>Apply To</b>=<b>{scope}</b> affected={impact['affected_sprites']}/{impact['total_sprites']} | "
+            f"<span style='color:#60d278'>will not lose pixel data={safe_count}</span> "
+            f"<span style='color:#ff6060'>will lose pixel data={risky_count}</span>"
+        )
+        self._refresh_group_list(records, impact)
+        self._refresh_sprite_list(records, impact)
+        self._refresh_preview(sources, destination, scope)
+        self._update_destination_blink_state()
+        self.apply_button.setEnabled(True)
+
+    def _refresh_group_list(self, records: Sequence[SpriteRecord], impact: Dict[str, Any] | None) -> None:
+        self.group_list.clear()
+        if not records:
+            return
+        group_map: DefaultDict[str, Dict[str, int]] = defaultdict(lambda: {"total": 0, "affected": 0, "risky": 0})
+        affected_keys = set(impact.get("affected_keys", [])) if impact else set()
+        risky_keys = set(impact.get("risky_keys", [])) if impact else set()
+        for record in records:
+            group_id = record.group_id or "Ungrouped"
+            key = str(record.path)
+            group_map[group_id]["total"] += 1
+            if key in affected_keys:
+                group_map[group_id]["affected"] += 1
+            if key in risky_keys:
+                group_map[group_id]["risky"] += 1
+        for group_id in sorted(group_map.keys()):
+            data = group_map[group_id]
+            self.group_list.addItem(
+                f"{group_id}: total={data['total']} affected={data['affected']} risk={data['risky']}"
+            )
+
+    def _refresh_sprite_list(self, records: Sequence[SpriteRecord], impact: Dict[str, Any] | None) -> None:
+        self.sprite_list.clear()
+        if not records:
+            return
+        affected_keys = set(impact.get("affected_keys", [])) if impact else set()
+        risky_keys = set(impact.get("risky_keys", [])) if impact else set()
+        usage_by_key = impact.get("source_hits_by_key", {}) if impact else {}
+        for record in records:
+            key = str(record.path)
+            hits = usage_by_key.get(key, 0)
+            marker = "RISK" if key in risky_keys else ("AFFECT" if key in affected_keys else "SAFE")
+            item = QListWidgetItem(f"[{marker}] {record.path.name} source_hits={hits}")
+            item.setData(Qt.ItemDataRole.UserRole, record.path.as_posix())
+            icon_pixmap = record.pixmap.scaled(
+                QSize(40, 40), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation
+            )
+            item.setIcon(QIcon(icon_pixmap))
+            if marker == "RISK":
+                item.setBackground(QColor(100, 30, 30, 120))
+            elif marker == "AFFECT":
+                item.setBackground(QColor(90, 90, 35, 110))
+            else:
+                item.setBackground(QColor(25, 60, 25, 90))
+            self.sprite_list.addItem(item)
+
+    def _apply_merge(self) -> None:
+        selection = self._selection_payload()
+        if selection is None:
+            return
+        sources, destination = selection
+        scope = self._scope()
+        source_after_mode = str(self.source_after_combo.currentData() or "preserve_colors")
+        applied = self._owner._apply_source_destination_merge(
+            sources,
+            destination,
+            scope=scope,
+            source_after_mode=source_after_mode,
+            source_after_color=self._source_after_color,
+        )
+        if not applied:
+            QMessageBox.warning(self, "Merge", "Merge operation did not apply.")
+            return
+        self._load_palette_snapshot()
+        if self.clear_after_apply_check.isChecked():
+            logger.debug("Merge dialog apply completed; clearing selection after apply")
+            self._clear_all_selections()
+        else:
+            self._refresh_views()
+
+    def _refresh_preview_sprite_picker(self, records: Sequence[SpriteRecord]) -> None:
+        selected_keys = {item.data(Qt.ItemDataRole.UserRole) for item in self.preview_sprite_list.selectedItems()}
+        self.preview_sprite_list.blockSignals(True)
+        self.preview_sprite_list.clear()
+        for record in records:
+            item = QListWidgetItem(record.path.name)
+            item.setData(Qt.ItemDataRole.UserRole, record.path.as_posix())
+            icon_pixmap = record.pixmap.scaled(
+                QSize(40, 40), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation
+            )
+            item.setIcon(QIcon(icon_pixmap))
+            self.preview_sprite_list.addItem(item)
+            if record.path.as_posix() in selected_keys:
+                item.setSelected(True)
+        if self.preview_sprite_list.count() and not self.preview_sprite_list.selectedItems():
+            current = self._owner._current_record()
+            if current is not None:
+                for row in range(self.preview_sprite_list.count()):
+                    item = self.preview_sprite_list.item(row)
+                    if item and item.data(Qt.ItemDataRole.UserRole) == current.path.as_posix():
+                        item.setSelected(True)
+                        break
+        self.preview_sprite_list.blockSignals(False)
 
 
 class SpriteToolsWindow(QMainWindow):
@@ -2017,6 +3126,9 @@ class SpriteToolsWindow(QMainWindow):
         self._preview_timer = QTimer(self)
         self._preview_timer.setSingleShot(True)
         self._preview_timer.timeout.connect(self._render_preview)
+        self._main_palette_layout_timer = QTimer(self)
+        self._main_palette_layout_timer.setSingleShot(True)
+        self._main_palette_layout_timer.timeout.connect(self._apply_main_palette_layout_options)
         
         # Timer for smooth fade animation on selected color in preview
         self._highlight_animation_timer = QTimer(self)
@@ -2033,10 +3145,16 @@ class SpriteToolsWindow(QMainWindow):
         self._floating_palette_windows: List[FloatingPaletteWindow] = []
         self._floating_palette_window_counter = 0
         self._main_palette_columns = 8
+        self._main_palette_force_columns = True
         self._main_palette_zoom = 42
         self._main_palette_gap = 6
         self._main_palette_show_indices = True
         self._main_palette_show_grid = False
+        self._main_palette_layout_in_progress = False
+        self._last_main_palette_layout_signature: tuple[Any, ...] | None = None
+        self._merge_dialog: MergeOperationDialog | None = None
+        self._used_index_cache: Dict[str, set[int]] = {}
+        self._settings = QSettings("SpriteTools", "SpriteTools")
         
         self._history_manager: HistoryManager | None = None
         self._pending_palette_index_remap: Dict[int, int] | None = None
@@ -2081,6 +3199,7 @@ class SpriteToolsWindow(QMainWindow):
         self.palette_list = PaletteListView()
         self.palette_list.palette_changed.connect(self._on_palette_changed)
         self.palette_list.selection_changed.connect(self._on_palette_selection_changed)
+        self.palette_list.viewport().installEventFilter(self)
         self._apply_main_palette_layout_options()
         palette_layout.addWidget(palette_label)
         palette_layout.addWidget(self.selected_color_label)
@@ -2088,9 +3207,10 @@ class SpriteToolsWindow(QMainWindow):
         
         # Palette actions
         palette_actions = QHBoxLayout()
-        self.merge_button = QPushButton("Merge Selected")
-        self.merge_button.clicked.connect(self._merge_selected_colors)
-        self.merge_button.setEnabled(False)
+        self.merge_button = QPushButton("Merge Mode")
+        self.merge_button.clicked.connect(self._open_merge_operation_dialog)
+        self.merge_button.setEnabled(True)
+        self.merge_button.setToolTip("Select multiple indexes, then set current index as Destination")
         palette_actions.addWidget(self.merge_button)
         self.open_palette_window_btn = QPushButton("Palette Window")
         self.open_palette_window_btn.clicked.connect(self._open_floating_palette_window)
@@ -2278,8 +3398,9 @@ class SpriteToolsWindow(QMainWindow):
         global_offset_row.addWidget(self.global_offset_y_spin)
         self.global_drag_mode_btn = QPushButton("Global Drag")
         self.global_drag_mode_btn.setCheckable(True)
+        self.global_drag_mode_btn.setAutoExclusive(False)
         self.global_drag_mode_btn.setToolTip("Drag sprite in viewport to change GLOBAL offset")
-        self.global_drag_mode_btn.toggled.connect(lambda enabled: self._toggle_offset_drag_mode("global", enabled))
+        self.global_drag_mode_btn.clicked.connect(lambda: self._handle_drag_mode_button_click("global"))
         global_offset_row.addWidget(self.global_drag_mode_btn)
         offset_layout.addWidget(self.global_offset_widget)
 
@@ -2303,8 +3424,9 @@ class SpriteToolsWindow(QMainWindow):
         group_offset_row.addWidget(self.group_offset_y_spin)
         self.group_drag_mode_btn = QPushButton("Group Drag")
         self.group_drag_mode_btn.setCheckable(True)
+        self.group_drag_mode_btn.setAutoExclusive(False)
         self.group_drag_mode_btn.setToolTip("Drag sprite in viewport to change GROUP offset")
-        self.group_drag_mode_btn.toggled.connect(lambda enabled: self._toggle_offset_drag_mode("group", enabled))
+        self.group_drag_mode_btn.clicked.connect(lambda: self._handle_drag_mode_button_click("group"))
         group_offset_row.addWidget(self.group_drag_mode_btn)
         offset_layout.addWidget(self.group_offset_widget)
         
@@ -2329,8 +3451,9 @@ class SpriteToolsWindow(QMainWindow):
         per_sprite_offset_row.addWidget(self.sprite_offset_y_spin)
         self.individual_drag_mode_btn = QPushButton("Individual Drag")
         self.individual_drag_mode_btn.setCheckable(True)
+        self.individual_drag_mode_btn.setAutoExclusive(False)
         self.individual_drag_mode_btn.setToolTip("Drag sprite in viewport to change INDIVIDUAL sprite offset")
-        self.individual_drag_mode_btn.toggled.connect(lambda enabled: self._toggle_offset_drag_mode("individual", enabled))
+        self.individual_drag_mode_btn.clicked.connect(lambda: self._handle_drag_mode_button_click("individual"))
         per_sprite_offset_row.addWidget(self.individual_drag_mode_btn)
         offset_layout.addWidget(self.local_offset_widget)
         
@@ -2360,7 +3483,7 @@ class SpriteToolsWindow(QMainWindow):
         controls_row = QHBoxLayout()
         self.highlight_checkbox = QCheckBox("Highlight selected color")
         self.highlight_checkbox.setChecked(True)
-        self.highlight_checkbox.toggled.connect(self._update_preview_pixmap)
+        self.highlight_checkbox.toggled.connect(self._on_highlight_checkbox_toggled)
         controls_row.addWidget(self.highlight_checkbox)
         
         self.overlay_settings_btn = QPushButton("Overlay Settings...")
@@ -2414,7 +3537,82 @@ class SpriteToolsWindow(QMainWindow):
         self._update_loaded_count()
         self._setup_history_manager()
         self._install_shortcuts()
+        self._load_ui_settings()
         self._reset_history()
+
+    def _get_pref_bool(self, key: str, default: bool) -> bool:
+        value = self._settings.value(key, default)
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on"}
+        return bool(value)
+
+    def _get_pref_int(self, key: str, default: int) -> int:
+        value = self._settings.value(key, default)
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return int(default)
+
+    def _get_pref_float(self, key: str, default: float) -> float:
+        value = self._settings.value(key, default)
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return float(default)
+
+    def _set_pref(self, key: str, value: Any) -> None:
+        self._settings.setValue(key, value)
+
+    def _get_key_binding(self, action: str, default: str) -> str:
+        value = self._settings.value(f"bindings/{action}", default)
+        text = str(value).strip()
+        return text if text else default
+
+    def _save_preview_ui_settings(self) -> None:
+        self._set_pref("preview/highlight_enabled", bool(self.highlight_checkbox.isChecked()))
+        self._set_pref("preview/overlay_color", f"{self._overlay_color[0]},{self._overlay_color[1]},{self._overlay_color[2]}")
+        self._set_pref("preview/overlay_alpha_min", int(self._overlay_alpha_min))
+        self._set_pref("preview/overlay_alpha_max", int(self._overlay_alpha_max))
+        self._set_pref("preview/animation_speed", float(self._animation_speed))
+
+    def _load_ui_settings(self) -> None:
+        self._main_palette_columns = max(1, min(32, self._get_pref_int("palette/main_columns", self._main_palette_columns)))
+        self._main_palette_force_columns = self._get_pref_bool("palette/main_force_columns", self._main_palette_force_columns)
+        self._main_palette_zoom = max(16, min(96, self._get_pref_int("palette/main_zoom", self._main_palette_zoom)))
+        self._main_palette_gap = max(-8, min(20, self._get_pref_int("palette/main_gap", self._main_palette_gap)))
+        self._main_palette_show_indices = self._get_pref_bool("palette/main_show_indices", self._main_palette_show_indices)
+        self._main_palette_show_grid = self._get_pref_bool("palette/main_show_grid", self._main_palette_show_grid)
+        self._apply_main_palette_layout_options()
+
+        color_raw = str(self._settings.value("preview/overlay_color", "255,255,255"))
+        parts = [part.strip() for part in color_raw.split(",")]
+        if len(parts) == 3:
+            try:
+                parsed = tuple(max(0, min(255, int(part))) for part in parts)
+                if len(parsed) == 3:
+                    self._overlay_color = (parsed[0], parsed[1], parsed[2])
+            except ValueError:
+                pass
+        self._overlay_alpha_min = max(0, min(255, self._get_pref_int("preview/overlay_alpha_min", self._overlay_alpha_min)))
+        self._overlay_alpha_max = max(self._overlay_alpha_min, min(255, self._get_pref_int("preview/overlay_alpha_max", self._overlay_alpha_max)))
+        self._animation_speed = max(0.01, min(0.50, self._get_pref_float("preview/animation_speed", self._animation_speed)))
+
+        highlight_enabled = self._get_pref_bool("preview/highlight_enabled", self.highlight_checkbox.isChecked())
+        self.highlight_checkbox.setChecked(highlight_enabled)
+        logger.debug(
+            "UI settings loaded main_cols=%s main_force=%s main_zoom=%s main_gap=%s highlight=%s overlay_color=%s alpha_min=%s alpha_max=%s speed=%.2f",
+            self._main_palette_columns,
+            self._main_palette_force_columns,
+            self._main_palette_zoom,
+            self._main_palette_gap,
+            highlight_enabled,
+            self._overlay_color,
+            self._overlay_alpha_min,
+            self._overlay_alpha_max,
+            self._animation_speed,
+        )
 
     def _clear_all_sprites(self) -> None:
         """Clear all loaded sprites and reset palette."""
@@ -2447,6 +3645,7 @@ class SpriteToolsWindow(QMainWindow):
         self._next_group_id = 1
         self._next_slot_id = 0
         self._slot_color_lookup = {}
+        self._invalidate_used_index_cache("clear-all")
         self._sync_palette_model()
         self._refresh_group_overview()
         self.preview_panel.set_pixmap(None, reset_zoom=True)
@@ -2496,6 +3695,7 @@ class SpriteToolsWindow(QMainWindow):
             list_widget.addItem(item)
             added += 1
         if added:
+            self._invalidate_used_index_cache("load-images")
             self.statusBar().showMessage(f"Loaded {added} image(s)", 3000)
             if not had_selection and list_widget.count():
                 first_new_row = max(0, starting_count)
@@ -2929,6 +4129,244 @@ class SpriteToolsWindow(QMainWindow):
             item.setText(f"[{group.group_id}] {base_name}")
             item.setBackground(QColor(group.color[0], group.color[1], group.color[2], 70))
             item.setToolTip(f"{base_name}\nGroup: {group.group_id} ({group.mode})")
+        self._highlight_sprites_for_palette_index(self._current_selected_palette_index())
+
+    def _invalidate_used_index_cache(self, reason: str) -> None:
+        self._used_index_cache = {}
+        logger.debug("Used-index cache invalidated reason=%s", reason)
+
+    def _record_used_indices(self, record: SpriteRecord) -> set[int]:
+        key = str(record.path)
+        cached = self._used_index_cache.get(key)
+        if cached is not None:
+            return cached
+        used = set(int(px) for px in record.indexed_image.getdata())
+        self._used_index_cache[key] = used
+        return used
+
+    def _merge_scope_records(self, scope: Literal["global", "group", "local"]) -> List[SpriteRecord]:
+        if scope == "global":
+            return list(self.sprite_records.values())
+        anchor = self._current_record()
+        if anchor is None:
+            return []
+        if scope == "local":
+            return [anchor]
+        if anchor.group_id:
+            return list(self._iter_group_records(anchor))
+        return [anchor]
+
+    def _usage_counts_for_records(self, records: Sequence[SpriteRecord]) -> Dict[int, int]:
+        counts: Dict[int, int] = {}
+        for record in records:
+            for idx in self._record_used_indices(record):
+                counts[idx] = counts.get(idx, 0) + 1
+        logger.debug("Usage counts computed scope_records=%s non_zero=%s", len(records), len(counts))
+        return counts
+
+    def _analyze_merge_impact_for_records(
+        self,
+        source_rows: Sequence[int],
+        destination_row: int,
+        records: Sequence[SpriteRecord],
+    ) -> Dict[str, Any]:
+        source_set = set(int(row) for row in source_rows)
+        affected_sprites = 0
+        risky_sprites = 0
+        affected_keys: List[str] = []
+        risky_keys: List[str] = []
+        source_hits_by_key: Dict[str, int] = {}
+        for record in records:
+            used_indices = self._record_used_indices(record)
+            key = str(record.path)
+            source_hits = sum(1 for idx in source_set if idx in used_indices)
+            source_hits_by_key[key] = source_hits
+            if source_hits > 0:
+                affected_sprites += 1
+                affected_keys.append(key)
+            destination_present = destination_row in used_indices
+            risk = source_hits >= 2 or (destination_present and source_hits >= 1)
+            if risk:
+                risky_sprites += 1
+                risky_keys.append(key)
+        payload = {
+            "source_rows": list(source_rows),
+            "destination_row": int(destination_row),
+            "total_sprites": len(records),
+            "affected_sprites": affected_sprites,
+            "risky_sprites": risky_sprites,
+            "affected_keys": affected_keys,
+            "risky_keys": risky_keys,
+            "source_hits_by_key": source_hits_by_key,
+        }
+        logger.debug("Merge impact scoped %s", payload)
+        return payload
+
+    def _compute_destination_risk_levels(
+        self,
+        source_rows: Sequence[int],
+        records: Sequence[SpriteRecord],
+    ) -> Dict[int, str]:
+        source_set = {int(row) for row in source_rows}
+        if not source_set:
+            return {}
+        candidate_risk: Dict[int, str] = {}
+        for candidate in range(len(self.palette_colors)):
+            if candidate in source_set:
+                continue
+            affected = 0
+            risky = 0
+            for record in records:
+                used = self._record_used_indices(record)
+                source_hits = sum(1 for src in source_set if src in used)
+                if source_hits == 0:
+                    continue
+                affected += 1
+                if source_hits >= 2 or candidate in used:
+                    risky += 1
+            if affected == 0:
+                continue
+            if risky == 0:
+                candidate_risk[candidate] = "safe"
+            else:
+                candidate_risk[candidate] = "risky"
+        logger.debug(
+            "Merge destination risk sources=%s records=%s candidates=%s",
+            sorted(source_set),
+            len(records),
+            len(candidate_risk),
+        )
+        return candidate_risk
+
+    @staticmethod
+    def _compose_checkerboard_rgba(base_rgba: Image.Image) -> Image.Image:
+        width, height = base_rgba.size
+        checker = Image.new("RGBA", (width, height), (0, 0, 0, 255))
+        tile = 8
+        light = (200, 200, 200, 255)
+        dark = (150, 150, 150, 255)
+        for y in range(0, height, tile):
+            for x in range(0, width, tile):
+                checker.paste(
+                    light if ((x // tile) + (y // tile)) % 2 == 0 else dark,
+                    (x, y, min(x + tile, width), min(y + tile, height)),
+                )
+        checker.alpha_composite(base_rgba)
+        return checker
+
+    def _build_merge_preview_pixmap(
+        self,
+        source_rows: Sequence[int] | None,
+        destination_row: int | None,
+        *,
+        scope: Literal["global", "group", "local"],
+        record: SpriteRecord | None = None,
+        highlight_index: int | None = None,
+        blink_highlight: bool = False,
+        blink_phase: float = 0.0,
+    ) -> QPixmap | None:
+        target_record = record or self._current_record()
+        if target_record is None:
+            return None
+        preview_img = target_record.indexed_image.copy()
+        merged_index_data: List[int] | None = None
+        if destination_row is not None:
+            source_set = {int(row) for row in (source_rows or []) if int(row) != int(destination_row)}
+            if source_set:
+                pixels = list(preview_img.getdata())
+                merged_index_data = [destination_row if px in source_set else px for px in pixels]
+                preview_img.putdata(merged_index_data)
+        rgba = preview_img.convert("RGBA")
+
+        if blink_highlight and highlight_index is not None:
+            index_data = merged_index_data if merged_index_data is not None else list(preview_img.getdata())
+            rgba_data = list(rgba.getdata())
+            import math
+            fade = (math.sin(blink_phase) + 1) / 2
+            alpha_min = int(getattr(self, "_overlay_alpha_min", 77))
+            alpha_max = int(getattr(self, "_overlay_alpha_max", 255))
+            alpha_range = max(0, alpha_max - alpha_min)
+            animated_alpha = int(alpha_min + alpha_range * fade)
+            overlay_rgb = tuple(getattr(self, "_overlay_color", (255, 255, 255)))
+            overlay_r, overlay_g, overlay_b = int(overlay_rgb[0]), int(overlay_rgb[1]), int(overlay_rgb[2])
+            blend = max(0.0, min(1.0, animated_alpha / 255.0))
+            highlighted: List[Tuple[int, int, int, int]] = []
+            for pixel_idx, (r, g, b, a) in enumerate(rgba_data):
+                if pixel_idx < len(index_data) and index_data[pixel_idx] == highlight_index and a > 0:
+                    nr = min(255, int(r * (1.0 - blend) + overlay_r * blend))
+                    ng = min(255, int(g * (1.0 - blend) + overlay_g * blend))
+                    nb = min(255, int(b * (1.0 - blend) + overlay_b * blend))
+                    highlighted.append((nr, ng, nb, a))
+                else:
+                    highlighted.append((r, g, b, a))
+            rgba.putdata(highlighted)
+
+        composed = self._compose_checkerboard_rgba(rgba)
+        qimage = ImageQt(composed)
+        pixmap = QPixmap.fromImage(qimage)
+        logger.debug(
+            "Merge preview sprite=%s scope=%s source_rows=%s destination=%s hover_index=%s blink=%s phase=%.2f size=%sx%s",
+            target_record.path.name,
+            scope,
+            sorted({int(row) for row in (source_rows or [])}),
+            destination_row,
+            highlight_index,
+            blink_highlight,
+            blink_phase,
+            pixmap.width(),
+            pixmap.height(),
+        )
+        return pixmap
+
+    def _current_selected_palette_index(self) -> int | None:
+        current = self.palette_list.currentIndex()
+        if current.isValid():
+            return int(current.row())
+        selected = self.palette_list.selectedIndexes()
+        if selected:
+            return int(selected[0].row())
+        return None
+
+    def _highlight_sprites_for_palette_index(self, palette_index: int | None) -> None:
+        list_widget = self.images_panel.list_widget
+        for row in range(list_widget.count()):
+            item = list_widget.item(row)
+            if item is None:
+                continue
+            key = item.data(Qt.ItemDataRole.UserRole)
+            if not key:
+                continue
+            record = self.sprite_records.get(str(key))
+            if record is None:
+                continue
+            base_name = item.data(_SPRITE_BASE_NAME_ROLE) or record.path.name
+            base_tooltip = item.toolTip().split("\nUses index:")[0]
+            base_bg = QColor(0, 0, 0, 0)
+            if record.group_id:
+                group = self._palette_groups.get(record.group_id)
+                if group is not None:
+                    base_bg = QColor(group.color[0], group.color[1], group.color[2], 70)
+
+            if palette_index is None:
+                item.setBackground(base_bg)
+                item.setToolTip(base_tooltip)
+                continue
+
+            used = self._record_used_indices(record)
+            if palette_index in used:
+                item.setBackground(QColor(70, 180, 255, 120))
+                item.setToolTip(f"{base_tooltip}\nUses index: {palette_index}")
+            else:
+                item.setBackground(base_bg)
+                item.setToolTip(base_tooltip)
+
+    def _open_merge_operation_dialog(self) -> None:
+        if not self.palette_colors:
+            QMessageBox.information(self, "Merge", "No palette colors available for merge.")
+            return
+        dialog = MergeOperationDialog(self)
+        self._merge_dialog = dialog
+        dialog.exec()
 
     def _selected_group_id(self) -> str | None:
         item = self.images_panel.group_list.currentItem()
@@ -3730,6 +5168,7 @@ class SpriteToolsWindow(QMainWindow):
                 targets = [member for member in self._iter_group_records(anchor) if member.load_mode == "detect"]
                 for record in targets:
                     self._apply_detect_remap_to_record(record, pixel_remap)
+                self._invalidate_used_index_cache(f"palette-remap-detect:{reason}")
 
                 logger.debug(
                     "Detect remap propagated group=%s reason=%s targets=%s entries=%s",
@@ -3854,6 +5293,7 @@ class SpriteToolsWindow(QMainWindow):
                 target.indexed_image.putdata([pixel_remap.get(px, px) for px in pixels])
                 self._apply_palette_to_record(target, self.palette_colors, self.palette_alphas)
                 target.palette = list(self.palette_colors)
+            self._invalidate_used_index_cache(f"palette-remap-preserve:{reason}")
         else:
             old_color_by_slot = {idx: color for idx, color in enumerate(old_colors)}
             old_alpha_by_slot = {idx: (old_alphas[idx] if idx < len(old_alphas) else 255) for idx in range(len(old_colors))}
@@ -4159,8 +5599,17 @@ class SpriteToolsWindow(QMainWindow):
             self.statusBar().showMessage(f"Palette exported: {palette_path.name}", 3000)
 
     def _open_floating_palette_window(self) -> None:
-        self._floating_palette_window_counter += 1
-        window = FloatingPaletteWindow(self._floating_palette_window_counter, self)
+        self._floating_palette_windows = [w for w in self._floating_palette_windows if w is not None and w.isVisible()]
+        used_indices = {
+            int(getattr(window, "_window_index", 0))
+            for window in self._floating_palette_windows
+            if int(getattr(window, "_window_index", 0)) > 0 and window.isVisible()
+        }
+        next_index = 1
+        while next_index in used_indices:
+            next_index += 1
+        self._floating_palette_window_counter = next_index
+        window = FloatingPaletteWindow(next_index, self)
         self._floating_palette_windows.append(window)
 
         def _cleanup_closed_window() -> None:
@@ -4171,30 +5620,99 @@ class SpriteToolsWindow(QMainWindow):
         window.show()
         logger.debug(
             "Opened floating palette window index=%s active_windows=%s",
-            self._floating_palette_window_counter,
+            next_index,
             len(self._floating_palette_windows),
         )
 
     def _apply_main_palette_layout_options(self) -> None:
         if not hasattr(self, "palette_list"):
             return
-        cell = max(16, int(self._main_palette_zoom))
-        gap = max(0, int(self._main_palette_gap))
-        cols = max(1, int(self._main_palette_columns))
-        self.palette_list.setSpacing(gap)
-        self.palette_list.set_cell_size(cell)
-        self.palette_list.set_show_index_labels(bool(self._main_palette_show_indices))
-        self.palette_list.set_show_grid_lines(bool(self._main_palette_show_grid))
-        width_hint = cols * (cell + gap) + 30
-        self.palette_list.setMinimumWidth(max(260, width_hint))
-        logger.debug(
-            "Main palette layout cols=%s cell=%s gap=%s show_idx=%s grid=%s",
-            cols,
-            cell,
-            gap,
-            self._main_palette_show_indices,
-            self._main_palette_show_grid,
-        )
+        if self._main_palette_layout_in_progress:
+            logger.debug("Main palette layout skipped (in progress)")
+            return
+
+        self._main_palette_layout_in_progress = True
+        try:
+            gap = max(-8, int(self._main_palette_gap))
+            cols = max(1, int(self._main_palette_columns))
+            effective_gap = max(0, gap)
+            tightness = max(0, -gap)
+            force_columns = bool(self._main_palette_force_columns)
+            available_width = self.palette_list.viewport().width()
+            signature = (
+                force_columns,
+                cols,
+                int(self._main_palette_zoom),
+                gap,
+                bool(self._main_palette_show_indices),
+                bool(self._main_palette_show_grid),
+                int(available_width),
+            )
+            if signature == self._last_main_palette_layout_signature:
+                return
+            self._last_main_palette_layout_signature = signature
+
+            if force_columns:
+                available_width = max(120, available_width)
+                cell = _compute_forced_cell_size(available_width, cols, effective_gap)
+                self.palette_list.setSpacing(effective_gap)
+                self.palette_list.set_cell_size(cell)
+                realized_cols = self.palette_list.measure_first_row_columns()
+                if realized_cols and realized_cols != cols:
+                    attempts = 0
+                    while realized_cols < cols and cell > 16 and attempts < 40:
+                        cell -= 1
+                        self.palette_list.set_cell_size(cell)
+                        realized_cols = self.palette_list.measure_first_row_columns()
+                        attempts += 1
+                    while realized_cols > cols and cell < 96 and attempts < 80:
+                        cell += 1
+                        self.palette_list.set_cell_size(cell)
+                        new_realized = self.palette_list.measure_first_row_columns()
+                        attempts += 1
+                        if new_realized < cols:
+                            cell -= 1
+                            self.palette_list.set_cell_size(cell)
+                            realized_cols = self.palette_list.measure_first_row_columns()
+                            break
+                        realized_cols = new_realized
+                    logger.debug(
+                        "Main palette exact-fit correction target_cols=%s realized_cols=%s cell=%s attempts=%s",
+                        cols,
+                        realized_cols,
+                        cell,
+                        attempts,
+                    )
+                self._main_palette_zoom = cell
+            else:
+                available_width = self.palette_list.viewport().width()
+                cell = max(16, min(96, int(self._main_palette_zoom)))
+            self.palette_list.setSpacing(effective_gap)
+            self.palette_list.set_cell_size(cell)
+            self.palette_list.set_swatch_inset(max(1, 6 - tightness))
+            self.palette_list.set_show_index_labels(bool(self._main_palette_show_indices))
+            self.palette_list.set_show_grid_lines(bool(self._main_palette_show_grid))
+            if force_columns:
+                self.palette_list.setMinimumWidth(260)
+            else:
+                width_hint = cols * (cell + effective_gap) + 30
+                self.palette_list.setMinimumWidth(max(260, width_hint))
+            final_realized_cols = self.palette_list.measure_first_row_columns()
+            logger.debug(
+                "Main palette layout force_cols=%s cols=%s realized_cols=%s cell=%s gap=%s effective_gap=%s tightness=%s viewport_w=%s show_idx=%s grid=%s",
+                force_columns,
+                cols,
+                final_realized_cols,
+                cell,
+                gap,
+                effective_gap,
+                tightness,
+                available_width,
+                self._main_palette_show_indices,
+                self._main_palette_show_grid,
+            )
+        finally:
+            self._main_palette_layout_in_progress = False
 
     def _open_main_palette_view_settings(self) -> None:
         dialog = QDialog(self)
@@ -4203,7 +5721,7 @@ class SpriteToolsWindow(QMainWindow):
         layout = QVBoxLayout(dialog)
 
         row = QHBoxLayout()
-        row.addWidget(QLabel("Cols"))
+        row.addWidget(QLabel("Columns"))
         cols_spin = QSpinBox()
         cols_spin.setRange(1, 32)
         cols_spin.setValue(self._main_palette_columns)
@@ -4217,7 +5735,7 @@ class SpriteToolsWindow(QMainWindow):
         row.addWidget(zoom_spin)
         row.addWidget(QLabel("Gap"))
         gap_spin = QSpinBox()
-        gap_spin.setRange(0, 20)
+        gap_spin.setRange(-8, 20)
         gap_spin.setValue(self._main_palette_gap)
         gap_spin.setFixedWidth(58)
         row.addWidget(gap_spin)
@@ -4230,22 +5748,38 @@ class SpriteToolsWindow(QMainWindow):
         show_grid = QCheckBox("Grid")
         show_grid.setChecked(self._main_palette_show_grid)
         toggles.addWidget(show_grid)
+        force_columns_check = QCheckBox("Force palette view columns")
+        force_columns_check.setChecked(self._main_palette_force_columns)
+        toggles.addWidget(force_columns_check)
         toggles.addStretch(1)
         layout.addLayout(toggles)
 
         def apply_settings() -> None:
             self._main_palette_columns = cols_spin.value()
+            self._main_palette_force_columns = force_columns_check.isChecked()
             self._main_palette_zoom = zoom_spin.value()
             self._main_palette_gap = gap_spin.value()
             self._main_palette_show_indices = show_indices.isChecked()
             self._main_palette_show_grid = show_grid.isChecked()
+            zoom_spin.setEnabled(not self._main_palette_force_columns)
+            self._set_pref("palette/main_columns", int(self._main_palette_columns))
+            self._set_pref("palette/main_force_columns", bool(self._main_palette_force_columns))
+            self._set_pref("palette/main_zoom", int(self._main_palette_zoom))
+            self._set_pref("palette/main_gap", int(self._main_palette_gap))
+            self._set_pref("palette/main_show_indices", bool(self._main_palette_show_indices))
+            self._set_pref("palette/main_show_grid", bool(self._main_palette_show_grid))
             self._apply_main_palette_layout_options()
+            if self._main_palette_force_columns:
+                zoom_spin.blockSignals(True)
+                zoom_spin.setValue(int(self._main_palette_zoom))
+                zoom_spin.blockSignals(False)
 
         cols_spin.valueChanged.connect(lambda _v: apply_settings())
         zoom_spin.valueChanged.connect(lambda _v: apply_settings())
         gap_spin.valueChanged.connect(lambda _v: apply_settings())
         show_indices.toggled.connect(lambda _v: apply_settings())
         show_grid.toggled.connect(lambda _v: apply_settings())
+        force_columns_check.toggled.connect(lambda _v: apply_settings())
 
         close_btn = QPushButton("Close")
         close_btn.clicked.connect(dialog.accept)
@@ -4641,37 +6175,33 @@ class SpriteToolsWindow(QMainWindow):
             group.offset_y,
         )
     
-    def _toggle_offset_drag_mode(self, mode: Literal["global", "group", "individual"], enabled: bool) -> None:
-        """Toggle drag mode target for viewport-driven offset updates."""
-        if enabled:
-            others = [self.global_drag_mode_btn, self.group_drag_mode_btn, self.individual_drag_mode_btn]
-            for other in others:
-                if other is self.sender():
-                    continue
-                blocked = other.blockSignals(True)
-                other.setChecked(False)
-                other.blockSignals(blocked)
-            self._active_offset_drag_mode = mode
-            self.preview_panel.set_drag_mode(True)
-            logger.debug("Offset drag mode enabled mode=%s", mode)
-            return
+    def _handle_drag_mode_button_click(self, mode: Literal["global", "group", "individual"]) -> None:
+        """Deterministic on/off click behavior for drag mode buttons."""
+        button_map = {
+            "global": self.global_drag_mode_btn,
+            "group": self.group_drag_mode_btn,
+            "individual": self.individual_drag_mode_btn,
+        }
+        target_button = button_map[mode]
 
-        global_active = self.global_drag_mode_btn.isChecked()
-        group_active = self.group_drag_mode_btn.isChecked()
-        individual_active = self.individual_drag_mode_btn.isChecked()
-        if not global_active and not group_active and not individual_active:
+        if self._active_offset_drag_mode == mode:
+            for button in button_map.values():
+                blocked = button.blockSignals(True)
+                button.setChecked(False)
+                button.blockSignals(blocked)
             self._active_offset_drag_mode = "none"
             self.preview_panel.set_drag_mode(False)
-            logger.debug("Offset drag mode disabled")
-        else:
-            if global_active:
-                self._active_offset_drag_mode = "global"
-            elif group_active:
-                self._active_offset_drag_mode = "group"
-            else:
-                self._active_offset_drag_mode = "individual"
-            self.preview_panel.set_drag_mode(True)
-            logger.debug("Offset drag mode switched mode=%s", self._active_offset_drag_mode)
+            logger.debug("Offset drag mode disabled via click mode=%s", mode)
+            return
+
+        for key, button in button_map.items():
+            blocked = button.blockSignals(True)
+            button.setChecked(key == mode)
+            button.blockSignals(blocked)
+
+        self._active_offset_drag_mode = mode
+        self.preview_panel.set_drag_mode(True)
+        logger.debug("Offset drag mode enabled via click mode=%s", mode)
     
     def _handle_drag_offset_changed(self, dx: int, dy: int) -> None:
         """Handle offset changes from viewport dragging."""
@@ -4862,6 +6392,17 @@ class SpriteToolsWindow(QMainWindow):
         self._update_preview_pixmap()
         self._update_selected_color_label()
         self._update_merge_button_state()
+        self._highlight_sprites_for_palette_index(self._current_selected_palette_index())
+
+    def _on_highlight_checkbox_toggled(self, checked: bool) -> None:
+        self._set_pref("preview/highlight_enabled", bool(checked))
+        if not checked:
+            self._highlight_animation_timer.stop()
+        else:
+            if self.palette_list.selectedIndexes() and not self._highlight_animation_timer.isActive():
+                self._highlight_animation_phase = 0.0
+                self._highlight_animation_timer.start()
+        self._update_preview_pixmap()
     
     def _update_highlight_animation(self) -> None:
         """Update smooth fade animation for highlight."""
@@ -4895,6 +6436,7 @@ class SpriteToolsWindow(QMainWindow):
             if result.isValid():
                 self._overlay_color = (result.red(), result.green(), result.blue())
                 color_button.setStyleSheet(f"background-color: rgb({result.red()}, {result.green()}, {result.blue()}); border: 1px solid #888;")
+                self._save_preview_ui_settings()
                 self._update_preview_pixmap()
         
         color_button.clicked.connect(choose_color)
@@ -4916,6 +6458,7 @@ class SpriteToolsWindow(QMainWindow):
                 min_slider.setValue(value)
             self._overlay_alpha_min = value
             min_label.setText(f"{int(value / 2.55)}%")
+            self._save_preview_ui_settings()
             self._update_preview_pixmap()
         
         min_slider.valueChanged.connect(update_min)
@@ -4937,6 +6480,7 @@ class SpriteToolsWindow(QMainWindow):
                 max_slider.setValue(value)
             self._overlay_alpha_max = value
             max_label.setText(f"{int(value / 2.55)}%")
+            self._save_preview_ui_settings()
             self._update_preview_pixmap()
         
         max_slider.valueChanged.connect(update_max)
@@ -4956,6 +6500,7 @@ class SpriteToolsWindow(QMainWindow):
             self._animation_speed = value / 100.0
             speed_label.setText(f"{self._animation_speed:.2f}x")
             logger.debug(f"Animation speed changed: {self._animation_speed:.2f}")
+            self._save_preview_ui_settings()
         
         speed_slider.valueChanged.connect(update_speed)
         speed_layout.addWidget(speed_slider)
@@ -5031,9 +6576,133 @@ class SpriteToolsWindow(QMainWindow):
             self.selected_color_label.setText(f"{len(selected_indexes)} colors selected")
     
     def _update_merge_button_state(self) -> None:
-        """Enable merge button when 2 or more colors are selected."""
-        selected_count = len(self.palette_list.selectedIndexes())
-        self.merge_button.setEnabled(selected_count >= 2)
+        """Enable merge tool button whenever a palette exists."""
+        enabled = len(self.palette_colors) > 0
+        self.merge_button.setEnabled(enabled)
+        self.merge_button.setText("Merge Sources → Destination")
+
+    def _resolve_merge_source_destination(self) -> Tuple[List[int], int] | None:
+        selected_rows = sorted({idx.row() for idx in self.palette_list.selectedIndexes()})
+        if len(selected_rows) < 2:
+            return None
+        current = self.palette_list.currentIndex()
+        destination_row = current.row() if current.isValid() else selected_rows[0]
+        if destination_row not in selected_rows:
+            destination_row = selected_rows[0]
+        source_rows = [row for row in selected_rows if row != destination_row]
+        if not source_rows:
+            return None
+        return source_rows, destination_row
+
+    def _analyze_merge_impact(self, source_rows: Sequence[int], destination_row: int) -> Dict[str, Any]:
+        return self._analyze_merge_impact_for_records(
+            source_rows,
+            destination_row,
+            list(self.sprite_records.values()),
+        )
+
+    def _apply_source_destination_merge(
+        self,
+        source_rows: Sequence[int],
+        destination_row: int,
+        *,
+        scope: Literal["global", "group", "local"] = "global",
+        source_after_mode: str = "compact_shift",
+        source_after_color: ColorTuple = (255, 0, 255),
+    ) -> bool:
+        source_rows_sorted = sorted({int(row) for row in source_rows if int(row) != int(destination_row)})
+        if not source_rows_sorted:
+            logger.debug("Merge apply skipped: empty source rows")
+            return False
+        if not (0 <= destination_row < len(self.palette_colors)):
+            logger.debug("Merge apply skipped: invalid destination row=%s", destination_row)
+            return False
+
+        records = self._merge_scope_records(scope)
+        if not records:
+            logger.debug("Merge apply skipped: no records for scope=%s", scope)
+            return False
+
+        impact = self._analyze_merge_impact_for_records(source_rows_sorted, destination_row, records)
+        mode = source_after_mode
+        if mode == "compact_shift" and scope != "global":
+            logger.debug("Merge mode compact_shift downgraded to preserve_colors for scope=%s", scope)
+            mode = "preserve_colors"
+        compact = mode == "compact_shift"
+        logger.info(
+            "Merge apply start scope=%s mode=%s sources=%s destination=%s affected=%s risky=%s",
+            scope,
+            mode,
+            source_rows_sorted,
+            destination_row,
+            impact["affected_sprites"],
+            impact["risky_sprites"],
+        )
+
+        if compact:
+            pixel_remap: Dict[int, int] = {}
+            for old_idx in range(len(self.palette_colors)):
+                shift = sum(1 for row in source_rows_sorted if row < old_idx)
+                pixel_remap[old_idx] = old_idx - shift
+            for source_row in source_rows_sorted:
+                pixel_remap[source_row] = pixel_remap[destination_row]
+
+            for record in self.sprite_records.values():
+                pixels = list(record.indexed_image.getdata())
+                record.indexed_image.putdata([pixel_remap.get(px, px) for px in pixels])
+
+            for source_row in reversed(source_rows_sorted):
+                self.palette_colors.pop(source_row)
+                self.palette_alphas.pop(source_row)
+                self._palette_slot_ids.pop(source_row)
+
+            self._palette_slot_ids = list(range(len(self.palette_colors)))
+            if len(self.palette_alphas) != len(self.palette_colors):
+                self.palette_alphas = [255] * len(self.palette_colors)
+
+            new_pil_palette: List[int] = []
+            for color in self.palette_colors:
+                new_pil_palette.extend(color)
+            while len(new_pil_palette) < 768:
+                new_pil_palette.append(0)
+
+            for record in self.sprite_records.values():
+                record.indexed_image.putpalette(new_pil_palette)
+                record.slot_bindings = {slot_id: idx for idx, slot_id in enumerate(self._palette_slot_ids)}
+
+            self._sync_palette_model()
+        else:
+            pixel_remap = {source_row: destination_row for source_row in source_rows_sorted}
+            for record in records:
+                pixels = list(record.indexed_image.getdata())
+                record.indexed_image.putdata([pixel_remap.get(px, px) for px in pixels])
+
+            if mode == "recolor_sources":
+                for source_row in source_rows_sorted:
+                    if 0 <= source_row < len(self.palette_colors):
+                        self.palette_colors[source_row] = source_after_color
+                new_pil_palette: List[int] = []
+                for color in self.palette_colors:
+                    new_pil_palette.extend(color)
+                while len(new_pil_palette) < 768:
+                    new_pil_palette.append(0)
+                for record in self.sprite_records.values():
+                    record.indexed_image.putpalette(new_pil_palette)
+                self._sync_palette_model()
+
+        self._invalidate_used_index_cache(f"merge:{scope}:{mode}")
+        self._last_processed_indexed = None
+        self._last_index_data = None
+        self._last_palette_info = None
+        self._last_preview_rgba = None
+        self._update_selected_color_label()
+        self._schedule_preview_update()
+        self._record_history(f"merge:{scope}", force=True)
+        self.statusBar().showMessage(
+            f"Merged {len(source_rows_sorted)} Source index(es) → Destination #{destination_row} | scope={scope} mode={mode} affected={impact['affected_sprites']} risk={impact['risky_sprites']}",
+            4000,
+        )
+        return True
 
     @staticmethod
     def _shift_block_list(values: List[Any], start: int, end: int, target_start: int) -> List[Any]:
@@ -5125,100 +6794,39 @@ class SpriteToolsWindow(QMainWindow):
         )
     
     def _merge_selected_colors(self) -> None:
-        """Merge selected palette colors into the first selected one."""
-        selected_indexes = self.palette_list.selectedIndexes()
-        if len(selected_indexes) < 2:
-            QMessageBox.warning(self, "Merge Error", "Please select at least 2 colors to merge.")
+        """Merge selected Source palette indexes into a single Destination index."""
+        selection = self._resolve_merge_source_destination()
+        if selection is None:
+            QMessageBox.warning(self, "Merge Error", "Select at least 2 indexes including one Destination.")
             return
-        
-        rows = sorted([idx.row() for idx in selected_indexes])
-        target_row = rows[0]  # Keep the first selected color
-        source_rows = rows[1:]  # Merge all others into it
-        
-        target_color = self.palette_colors[target_row]
-        
+
+        source_rows, destination_row = selection
+        destination_color = self.palette_colors[destination_row]
+        impact = self._analyze_merge_impact(source_rows, destination_row)
+
         # Ask user for confirmation
         reply = QMessageBox.question(
             self,
             "Merge Colors",
-            f"Merge {len(source_rows)} colors into index #{target_row} RGB{target_color}?\n"
-            f"All instances of the other colors will be replaced with #{target_row}.",
+            (
+                f"Merge {len(source_rows)} Source index(es) into Destination #{destination_row} RGB{destination_color}?\n"
+                f"Affected sprites: {impact['affected_sprites']}/{impact['total_sprites']}\n"
+                f"Detail-loss risk sprites: {impact['risky_sprites']}\n"
+                f"All Source instances will be replaced with Destination #{destination_row}."
+            ),
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.Yes
         )
-        
+
         if reply != QMessageBox.StandardButton.Yes:
             return
-        
-        target_slot = self._palette_slot_ids[target_row]
-        logger.info(f"=== MERGE: Merging slots {[self._palette_slot_ids[r] for r in source_rows]} into slot {target_slot}")
-        
-        # Build pixel remap: unified_index -> new_unified_index
-        # After removing rows, all indices above them shift down
-        pixel_remap: Dict[int, int] = {}
-        for old_idx in range(len(self.palette_colors)):
-            # Count how many rows below old_idx will be removed
-            shift = sum(1 for r in source_rows if r < old_idx)
-            new_idx = old_idx - shift
-            pixel_remap[old_idx] = new_idx
-            logger.debug(f"  Remap unified index {old_idx} -> {new_idx}")
-        
-        # For merged colors, remap to target
-        for source_row in source_rows:
-            pixel_remap[source_row] = pixel_remap[target_row]
-            logger.debug(f"  Remap merged index {source_row} -> {pixel_remap[target_row]}")
-        
-        # Apply pixel remap to all sprites
-        for record in self.sprite_records.values():
-            img = record.indexed_image
-            pixels = list(img.getdata())
-            remapped_pixels = [pixel_remap.get(px, px) for px in pixels]
-            img.putdata(remapped_pixels)
-            logger.debug(f"  Remapped pixels in {record.path.name}")
-        
-        # Remove merged colors from unified palette
-        for source_row in reversed(source_rows):
-            self.palette_colors.pop(source_row)
-            self.palette_alphas.pop(source_row)
-            self._palette_slot_ids.pop(source_row)
-        
-        # After merge, palette indices are sequential 0, 1, 2, ...
-        # Reset slot IDs to match the new sequential indices
-        self._palette_slot_ids = list(range(len(self.palette_colors)))
-        if len(self.palette_alphas) != len(self.palette_colors):
-            self.palette_alphas = [255] * len(self.palette_colors)
-        logger.debug(f"  Reset slot IDs to sequential: {self._palette_slot_ids[:20]}")
-        
-        # Update the PIL palette in each sprite's indexed_image to match the new unified palette
-        new_pil_palette = []
-        for color in self.palette_colors:
-            new_pil_palette.extend(color)
-        # Pad to 256 entries
-        while len(new_pil_palette) < 768:
-            new_pil_palette.append(0)
-        
-        for record in self.sprite_records.values():
-            record.indexed_image.putpalette(new_pil_palette)
-            logger.debug(f"  Updated PIL palette in {record.path.name}")
-        
-        # Rebuild slot_bindings for all sprites after palette change
-        for record in self.sprite_records.values():
-            record.slot_bindings = {}
-            for idx, slot_id in enumerate(self._palette_slot_ids):
-                record.slot_bindings[slot_id] = idx
-        
-        # Rebuild models and lookup
-        self._sync_palette_model()
-        
-        # Clear all cached preview data since pixels were remapped and palette changed
-        self._last_processed_indexed = None
-        self._last_index_data = None
-        self._last_palette_info = None
-        self._last_preview_rgba = None
-        
-        self.statusBar().showMessage(f"Merged {len(source_rows)} colors into index #{target_row}", 3000)
-        self._record_history("merge")
-        self._schedule_preview_update()
+
+        self._apply_source_destination_merge(
+            source_rows,
+            destination_row,
+            scope="global",
+            source_after_mode="compact_shift",
+        )
     
     def _auto_merge_colors(self) -> None:
         """Auto-merge similar colors based on tolerance."""
@@ -5293,6 +6901,7 @@ class SpriteToolsWindow(QMainWindow):
             remapped_pixels = [pixel_remap.get(px, px) for px in pixels]
             img.putdata(remapped_pixels)
             logger.debug(f"  Remapped pixels in {record.path.name}")
+        self._invalidate_used_index_cache("auto-merge-remap")
         
         # Remove merged colors from unified palette
         for source_idx in sorted_merges:
@@ -5588,6 +7197,9 @@ class SpriteToolsWindow(QMainWindow):
         self._reset_zoom_next = False
 
     def eventFilter(self, source, event):  # type: ignore[override]
+        if hasattr(self, "palette_list") and source is self.palette_list.viewport():
+            if event.type() == QEvent.Type.Resize and self._main_palette_force_columns:
+                self._main_palette_layout_timer.start(24)
         if source is self.images_panel.list_widget:
             if event.type() == QEvent.Type.KeyPress:
                 if event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):

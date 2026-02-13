@@ -1,5 +1,39 @@
 # SpriteTools Release Notes
 
+## v0.2.0 (Main)
+
+### Highlights
+
+- Added full merge workflow with explicit Source/Destination semantics and a dedicated merge dialog.
+- Added scope-aware merge application (`Global`, `Group`, `Local`) with impact/risk visibility.
+- Added merge preview improvements including sprite picker, hover highlight, and role coloring.
+- Added palette usage/risk overlays in swatch view for safer merge decisions.
+
+### Palette View + Layout
+
+- Added shared view settings across main palette, merge palette, and floating palette windows:
+  - Columns
+  - Zoom
+  - Gap
+  - Force Columns
+  - Show Indices
+  - Show Grid
+- Added robust forced-column fitting logic with measured realized-columns correction.
+- Added resize/debounce/re-entrancy protections to reduce layout churn.
+- Added per-floating-window persisted settings and first-show deferred layout apply.
+
+### Interaction and UX
+
+- Added deterministic click behavior for drag mode buttons:
+  - click active mode again to turn it off
+  - click another mode to switch mode cleanly
+- Updated preview drag/pan behavior to avoid accidental mode conflicts.
+- Added clear action and drag/drop loading improvements for floating palette windows.
+
+### Notes
+
+- This release supersedes `v0.1.0` for current `main`.
+
 ## v0.1.0 (Main)
 
 ### Highlights
