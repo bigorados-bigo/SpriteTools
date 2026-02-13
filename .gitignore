@@ -1,0 +1,21 @@
+# Python artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environments
+.venv/
+
+# Build outputs
+build/
+dist/
+out/
+sprite_outputs/
+
+# Logs and temp files
+*.log
+*.tmp
+sprite_tools_debug.log
+temp_rgb.png
+debug_frame_*.png
+616.png
