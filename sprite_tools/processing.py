@@ -92,9 +92,12 @@ def _build_slot_remap(slot_map: Sequence[int] | None, palette_size: int) -> Dict
 def _apply_index_remap(image: Image.Image, mapping: Dict[int, int]) -> None:
     if not mapping:
         return
-    data = list(image.getdata())
-    translated = [mapping.get(px, px) for px in data]
-    image.putdata(translated)
+    lut = list(range(256))
+    for src, dst in mapping.items():
+        if 0 <= src < 256:
+            lut[src] = max(0, min(255, int(dst)))
+    remapped = image.point(lut)
+    image.paste(remapped)
 
 
 def _prepare_indexed_image(image: Image.Image, options: ProcessOptions) -> Image.Image:
@@ -206,9 +209,12 @@ def build_index_map(
 def apply_index_map(image: Image.Image, mapping: Dict[int, int]) -> None:
     if not mapping:
         return
-    data = list(image.getdata())
-    translated = [mapping.get(px, px) for px in data]
-    image.putdata(translated)
+    lut = list(range(256))
+    for src, dst in mapping.items():
+        if 0 <= src < 256:
+            lut[src] = max(0, min(255, int(dst)))
+    remapped = image.point(lut)
+    image.paste(remapped)
 
 
 def rotate_palette(image: Image.Image, palette: PaletteInfo, bg_index: int, bg_color: ColorTuple) -> None:
@@ -224,9 +230,35 @@ def rotate_palette(image: Image.Image, palette: PaletteInfo, bg_index: int, bg_c
 
 
 def set_transparency(image: Image.Image, palette: PaletteInfo, transparent_index: int | None) -> None:
+    palette_size = max(256, palette.size)
+    alpha_table: List[int] | None = None
+    existing = image.info.get("transparency")
+
+    if isinstance(existing, int):
+        alpha_table = [255] * palette_size
+        if 0 <= existing < palette_size:
+            alpha_table[existing] = 0
+    elif isinstance(existing, (bytes, bytearray, list, tuple)):
+        alpha_table = [255] * palette_size
+        for index in range(min(palette_size, len(existing))):
+            try:
+                alpha_table[index] = max(0, min(255, int(existing[index])))
+            except (TypeError, ValueError):
+                alpha_table[index] = 255
+
     if transparent_index is not None:
-        image.info["transparency"] = transparent_index
-    elif palette.transparent_index is not None:
+        if alpha_table is None:
+            alpha_table = [255] * palette_size
+        if 0 <= transparent_index < palette_size:
+            alpha_table[transparent_index] = 0
+        image.info["transparency"] = bytes(alpha_table)
+        return
+
+    if alpha_table is not None and any(alpha < 255 for alpha in alpha_table):
+        image.info["transparency"] = bytes(alpha_table)
+        return
+
+    if palette.transparent_index is not None:
         image.info["transparency"] = palette.transparent_index
     elif "transparency" in image.info:
         del image.info["transparency"]
@@ -339,9 +371,15 @@ def transform_indexed_image(
         if options.target_palette:
             working = _apply_palette_override(working, options.target_palette)
         set_transparency(working, palette, transparent_index)
+        canvas_target = options.canvas_size if options.canvas_size is not None else working.size
+        should_recanvas = (
+            options.canvas_size is not None
+            or options.offset_x != 0
+            or options.offset_y != 0
+        )
         canvas = (
-            make_canvas(working, options.canvas_size, options.fill_index, options.offset_x, options.offset_y)
-            if options.canvas_size
+            make_canvas(working, canvas_target, options.fill_index, options.offset_x, options.offset_y)
+            if should_recanvas
             else working
         )
         updated_palette = extract_palette(canvas)
@@ -360,9 +398,15 @@ def transform_indexed_image(
     apply_index_map(working, mapping)
     rotate_palette(working, palette, bg_index, bg_color)
     set_transparency(working, palette, transparent_index)
+    canvas_target = options.canvas_size if options.canvas_size is not None else working.size
+    should_recanvas = (
+        options.canvas_size is not None
+        or options.offset_x != 0
+        or options.offset_y != 0
+    )
     canvas = (
-        make_canvas(working, options.canvas_size, options.fill_index, options.offset_x, options.offset_y)
-        if options.canvas_size
+        make_canvas(working, canvas_target, options.fill_index, options.offset_x, options.offset_y)
+        if should_recanvas
         else working
     )
     updated_palette = extract_palette(canvas)

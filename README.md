@@ -17,6 +17,7 @@ Utilities for batch-editing indexed PNG sprites with palette-aware rules inspire
 - Pads/crops sprites onto a square canvas and exports both PNG and Adobe ACT palette files.
 - Simple CLI that works on individual files or entire folders, with optional ACT palette enforcement.
 - PySide6 GUI prototype with a loaded-images list, detected-colors pane that supports drag & drop reorder plus color editing (double-click), and a live preview pane that reflects palette tweaks immediately.
+- Project-system MVP in GUI: create/open/save folder-based `.spto` projects (legacy `.spritetools` still supported) with managed sprite import into `sources/sprites` and per-sprite metadata persistence.
 - Drag-and-drop support: drop individual images or entire folders onto the window to import sprites quickly.
 - Custom canvas sizing (including smart cropping when the canvas is smaller than the sprite).
 - Ctrl+Z / Ctrl+Y undo and redo for palette edits, slot reordering, fill modes, and canvas settings.
@@ -61,7 +62,27 @@ Each processed sprite is saved to `{output}/{original_name}.png` alongside a `{o
 	```pwsh
 	python -m sprite_tools.ui
 	```
-	Drag files/folders directly onto the window or use **Load Images**. Click entries to see thumbnails/preview, drag swatches to reorder the palette, and double-click a swatch to recolor it. The preview pane will re-render using the current palette mapping.
+	Use the classic **File** menu for **Import Sprites... / New Project... / Open Project... / Open Recent / Save / Save Project As...**. (`Save Project As...` snapshots whatever is currently open into a named project folder.) `Open Recent` is a dropdown submenu and shows a placeholder when no history exists. The loaded-images pane keeps **Clear Sprites** plus a read-only project info strip (name/mode/state/folder) so active context is always visible while maximizing workspace area. Click entries to see thumbnails/preview, drag swatches to reorder the palette, and double-click a swatch to recolor it. The preview pane will re-render using the current palette mapping.
+
+## Project Conventions
+
+- Default project folder suffix is `.spto`.
+- Legacy project folder suffix `.spritetools` remains supported for opening existing projects.
+- Project manifest file is always `project.json` at project root.
+- Managed projects copy imported sprites into `sources/sprites` so the project is portable.
+- Editable state is persisted in `metadata/sprites.json`; exports should default to `exports/renders`.
+- On project open, missing sources can be relinked by scanning a user-selected folder for matching filenames.
+- Projects autosave into `backups/autosave/`; if a newer autosave snapshot exists on open, SpriteTools prompts to restore it.
+- Autosave reports lightweight status in the status bar (throttled to avoid UI noise).
+- Project info tooltip shows last save/autosave UTC timestamp for quick recency checks.
+- If autosave recovery is used on open, project info tooltip includes a recovery-source tag for session clarity.
+- `Save` is enabled only when an active project is open; `Save Project As...` remains available for snapshotting current workspace state.
+- On window close with unsaved project changes, SpriteTools prompts with `Save / Discard / Cancel`.
+- File menu actions ship with conventional defaults (`Ctrl+N`, `Ctrl+O`, `Ctrl+S`, `Ctrl+Shift+S`, `Ctrl+Q`) and remain fully settings-backed via `bindings/*`.
+- Use `Edit > Keyboard Shortcuts...` (`Ctrl+Alt+K`) to remap commands with live key capture, conflict checks, and reset options.
+- Merge Mode actions are also bindable (apply, source/destination tagging, clear actions, scope switching, view settings, close).
+- Keyboard shortcuts support JSON profile export/import from the same dialog.
+- Closing the shortcuts dialog with unsaved changes prompts `Save / Discard / Cancel`.
 
 ## Building a shareable GUI bundle
 
@@ -90,6 +111,15 @@ PyInstaller still prints warnings about optional Qt SQL/Designer helpers (OCI, L
 - Add a diagnostics pane that shows palette index usage across all loaded sprites.
 - Provide preset canvas sizes plus per-sprite overrides.
 - Optional dithering controls inside the GUI preview.
+
+## Release QA Checklist (Shortcuts + Merge)
+
+- Open `Edit > Keyboard Shortcuts...`, change one shortcut, save, reopen app, verify persistence.
+- Trigger a conflict by assigning a used shortcut and verify conflict blocking message.
+- Export shortcuts to JSON, import JSON, verify bindings are applied.
+- Close shortcuts dialog with unsaved changes and verify `Save / Discard / Cancel` prompt.
+- Open Merge Mode and verify configured bindings for apply/tag/clear/scope/view/close all execute correctly.
+- Reopen Merge Mode and verify no stale dialog state or shortcut regressions.
 
 ## GitHub upload and release
 

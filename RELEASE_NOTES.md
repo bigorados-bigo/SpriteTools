@@ -1,5 +1,35 @@
 # SpriteTools Release Notes
 
+## v0.2.1 (Main, in progress)
+
+### Project System
+
+- Added project-system MVP with create/open/save flows and folder-based manifests (`project.json`).
+- Added `Save As` support to duplicate/relocate projects.
+- Added `Save As` fallback behavior: when no project is active, user is prompted for a project folder name.
+- Updated default project folder suffix to `.spto` (legacy `.spritetools` remains supported).
+- Managed projects now copy imported sprites into `sources/sprites` so projects do not rely on original source paths.
+- Added autosave snapshots in `backups/autosave` with open-time recovery prompt when autosave is newer than manifest state.
+
+### Planning Updates
+
+- Added long-term roadmap milestone for a full keybindings window (edit/reset/conflict detection/profile portability).
+
+### UX
+
+- Added `Edit > Keyboard Shortcuts...` dialog for in-app shortcut editing.
+- Added organized two-column keybindings list (`Action`, `Shortcut`) with live key-capture assignment.
+- Added conflict checks and reset options (per-action and reset-all) in keybindings dialog.
+- Shortcut updates now apply immediately to menu actions plus Undo/Redo and persist via `QSettings` (`bindings/*`).
+- Added extensive Merge Mode bindable actions (apply, source/destination tagging, clear actions, scope switching, view settings, close).
+- Added shortcuts profile export/import (`.json`) with validation and conflict blocking on import.
+- Added unsaved-change indicator and close confirmation (`Save / Discard / Cancel`) in the keybindings dialog.
+
+### Fixes
+
+- Fixed project open/reset crash caused by stale `status_label` access.
+- Added and passed manual QA checklist for shortcuts editor + merge-mode shortcut flows (persistence, conflict handling, import/export, unsaved-close prompt, merge dialog bindings).
+
 ## v0.2.0 (Main)
 
 ### Highlights

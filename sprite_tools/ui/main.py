@@ -4,7 +4,10 @@ import json
 import hashlib
 import re
 import sys
-from collections import defaultdict
+import time
+from datetime import datetime, timezone
+from collections import defaultdict, deque
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, DefaultDict, Dict, List, Literal, Sequence, Tuple
@@ -30,7 +33,7 @@ from PySide6.QtCore import (
     Signal,
     QTimer,
 )
-from PySide6.QtGui import QColor, QIcon, QKeySequence, QMouseEvent, QPainter, QPen, QPixmap, QWheelEvent, QShortcut, QBitmap, QImage
+from PySide6.QtGui import QAction, QColor, QIcon, QKeySequence, QMouseEvent, QPainter, QPen, QPixmap, QWheelEvent, QShortcut, QBitmap, QImage, QRegion
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -40,6 +43,7 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QFormLayout,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QAbstractItemView,
     QListWidget,
@@ -47,6 +51,8 @@ from PySide6.QtWidgets import (
     QListView,
     QMainWindow,
     QMessageBox,
+    QInputDialog,
+    QKeySequenceEdit,
     QPushButton,
     QGroupBox,
     QScrollArea,
@@ -58,12 +64,20 @@ from PySide6.QtWidgets import (
     QStyle,
     QStyleOptionViewItem,
     QTabWidget,
+    QTableWidget,
+    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
 
+try:
+    from PySide6.QtOpenGLWidgets import QOpenGLWidget
+except Exception:  # noqa: BLE001
+    QOpenGLWidget = None
+
 from sprite_tools.file_scanner import ScanOptions, iter_image_files, is_supported_image
 from sprite_tools.palette_ops import PaletteError, PaletteInfo, extract_palette, read_act_palette
+from sprite_tools.project_system import PROJECT_MANIFEST_NAME, ProjectManifest, ProjectPaths, ProjectService, ProjectSpriteEntry
 from sprite_tools.quantization import quantize_image
 from sprite_tools.processing import ProcessOptions, process_image_object, process_sprite, write_act
 
@@ -75,6 +89,9 @@ _EXCEPTION_HOOK_INSTALLED = False
 _PALETTE_CLIPBOARD_MIME = "application/x-spritetools-palette+json"
 _SPRITE_BASE_NAME_ROLE = Qt.ItemDataRole.UserRole + 1
 _GROUP_ID_ROLE = Qt.ItemDataRole.UserRole + 2
+_PROJECT_FOLDER_SUFFIX = ".spto"
+_PROJECT_LEGACY_FOLDER_SUFFIX = ".spritetools"
+_RECENT_PROJECTS_LIMIT = 8
 _GROUP_COLOR_PRESETS: List[ColorTuple] = [
     (220, 120, 120),
     (120, 180, 240),
@@ -393,6 +410,10 @@ class HistoryField:
     apply: Callable[[Any], None]
 
 
+def _process_preview_request(source: Image.Image, options: ProcessOptions) -> tuple[Image.Image, PaletteInfo]:
+    return process_image_object(source, options)
+
+
 class HistoryManager:
     def __init__(self) -> None:
         self._fields: Dict[str, HistoryField] = {}
@@ -419,7 +440,13 @@ class HistoryManager:
         self._ready = True
         logger.debug("History reset label=%s fields=%s entries=%s index=%s", label, list(self._fields.keys()), len(self._history), self._index)
 
-    def record(self, label: str, *, force: bool = False) -> bool:
+    def record(
+        self,
+        label: str,
+        *,
+        force: bool = False,
+        include_fields: Sequence[str] | None = None,
+    ) -> bool:
         if not self._ready or self._restoring:
             logger.debug(
                 "History record skipped label=%s ready=%s restoring=%s force=%s",
@@ -429,7 +456,7 @@ class HistoryManager:
                 force,
             )
             return False
-        snapshot = self._capture_state()
+        snapshot = self._capture_state(include_fields=include_fields)
         if not force and self._history and snapshot == self._history[self._index].state:
             logger.debug("History record dedup label=%s index=%s entries=%s", label, self._index, len(self._history))
             return False
@@ -439,9 +466,10 @@ class HistoryManager:
         self._history.append(HistoryEntry(label=label, state=snapshot))
         self._index += 1
         logger.debug(
-            "History record added label=%s force=%s index=%s entries=%s",
+            "History record added label=%s force=%s fields=%s index=%s entries=%s",
             label,
             force,
+            list(include_fields) if include_fields is not None else "all",
             self._index,
             len(self._history),
         )
@@ -492,8 +520,11 @@ class HistoryManager:
     def can_redo(self) -> bool:
         return self._ready and self._index >= 0 and self._index < len(self._history) - 1
 
-    def _capture_state(self) -> Dict[str, Any]:
-        return {name: field.capture() for name, field in self._fields.items()}
+    def _capture_state(self, include_fields: Sequence[str] | None = None) -> Dict[str, Any]:
+        if include_fields is None:
+            return {name: field.capture() for name, field in self._fields.items()}
+        selected = [name for name in include_fields if name in self._fields]
+        return {name: self._fields[name].capture() for name in selected}
 
     def _apply_state(self, state: Dict[str, Any]) -> None:
         self._restoring = True
@@ -1750,9 +1781,111 @@ class PaletteListView(QListView):
             painter.drawLine(start, end)
 
 
+class PreviewCanvas(QWidget):
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._pixmap: QPixmap | None = None
+        self._overlay_layers: List[tuple[int, QRegion, QColor]] = []
+        self._placeholder_text = "Select an image to preview"
+        self.setMinimumSize(200, 200)
+
+    def set_display_pixmap(self, pixmap: QPixmap | None) -> None:
+        if pixmap is None:
+            self._pixmap = None
+            self.update()
+            return
+        if self._pixmap is not None and self._pixmap.cacheKey() == pixmap.cacheKey():
+            return
+        self._pixmap = pixmap
+        self.update()
+
+    def _pixmap_top_left(self) -> QPoint:
+        pixmap = self._pixmap
+        if pixmap is None:
+            return QPoint(0, 0)
+        return QPoint((self.width() - pixmap.width()) // 2, (self.height() - pixmap.height()) // 2)
+
+    def _overlay_bounds(self, layers: Sequence[tuple[int, QRegion, QColor]]) -> QRect:
+        pixmap = self._pixmap
+        if pixmap is None or not layers:
+            return QRect()
+        origin = self._pixmap_top_left()
+        bounds = QRect()
+        for _layer_key, region, _color in layers:
+            region_rect = region.boundingRect()
+            if region_rect.isEmpty():
+                continue
+            translated = QRect(region_rect)
+            translated.translate(origin)
+            bounds = translated if bounds.isNull() else bounds.united(translated)
+        return bounds
+
+    def set_overlay_layers(self, layers: Sequence[tuple[int, QRegion, QColor]]) -> None:
+        previous_layers = self._overlay_layers
+        normalized: List[tuple[int, QRegion, QColor]] = []
+        for layer_key, region, color in layers:
+            if region.isEmpty():
+                continue
+            normalized.append((int(layer_key), region, QColor(color)))
+        self._overlay_layers = normalized
+        if self._pixmap is None:
+            self.update()
+            return
+        previous_bounds = self._overlay_bounds(previous_layers)
+        current_bounds = self._overlay_bounds(self._overlay_layers)
+        dirty = previous_bounds.united(current_bounds)
+        if dirty.isNull() or dirty.isEmpty():
+            self.update()
+            return
+        self.update(dirty.adjusted(-2, -2, 2, 2).intersected(self.rect()))
+
+    def paintEvent(self, event) -> None:  # type: ignore[override]
+        event_rect = event.rect() if hasattr(event, "rect") else self.rect()
+        painter = QPainter(self)
+        painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
+        painter.fillRect(event_rect, Qt.GlobalColor.transparent)
+
+        if self._pixmap is None:
+            painter.setPen(QColor(180, 180, 180))
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, self._placeholder_text)
+            painter.end()
+            return
+
+        pixmap = self._pixmap
+        origin = self._pixmap_top_left()
+        px = origin.x()
+        py = origin.y()
+        bounds = QRect(px, py, pixmap.width(), pixmap.height())
+        exposed = bounds.intersected(event_rect)
+        if exposed.isEmpty():
+            painter.end()
+            return
+
+        source = QRect(exposed.x() - px, exposed.y() - py, exposed.width(), exposed.height())
+        painter.drawPixmap(exposed, pixmap, source)
+
+        if self._overlay_layers:
+            for _layer_key, region, color in self._overlay_layers:
+                translated = QRegion(region)
+                translated.translate(px, py)
+                translated = translated.intersected(QRegion(bounds))
+                translated = translated.intersected(QRegion(exposed))
+                if translated.isEmpty():
+                    continue
+                painter.save()
+                painter.setClipRegion(translated)
+                painter.fillRect(exposed, color)
+                painter.restore()
+
+        painter.end()
+
+
 class PreviewPane(QWidget):
     zoomChanged = Signal(float)
     drag_offset_changed = Signal(int, int)  # (dx, dy) in pixels
+    drag_started = Signal()
+    drag_finished = Signal(int, int)  # total delta for this drag interaction
+    panning_changed = Signal(bool)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -1761,10 +1894,15 @@ class PreviewPane(QWidget):
         layout.setSpacing(6)
         self.title = QLabel("Preview")
         self.title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.image_label = QLabel()
-        self.image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.image_label.setMinimumSize(200, 200)
+        self.image_label = PreviewCanvas()
         self.scroll_area = QScrollArea()
+        self._gpu_viewport_enabled = False
+        if QOpenGLWidget is not None:
+            try:
+                self.scroll_area.setViewport(QOpenGLWidget())
+                self._gpu_viewport_enabled = True
+            except Exception:  # noqa: BLE001
+                logger.debug("PreviewPane OpenGL viewport unavailable; using default viewport", exc_info=True)
         self.scroll_area.setWidget(self.image_label)
         self.scroll_area.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.scroll_area.setWidgetResizable(False)
@@ -1773,15 +1911,34 @@ class PreviewPane(QWidget):
         self.scroll_area.viewport().installEventFilter(self)
         self.image_label.installEventFilter(self)
         self._source_pixmap: QPixmap | None = None
+        self._scaled_base_pixmap: QPixmap | None = None
+        self._scaled_base_size = QSize(0, 0)
+        self._overlay_layers: List[tuple[int, QRegion, QColor]] = []
+        self._overlay_source_size = QSize(0, 0)
+        self._overlay_scaled_region_cache: Dict[tuple[int, int, int, int, int], QRegion] = {}
+        self._backdrop_pixmap: QPixmap | None = None
+        self._backdrop_key: tuple[int, int, int | None, int | None, int | None, int | None] | None = None
+        self._checker_tile_pixmap: QPixmap | None = None
+        self._drag_backdrop_rgba: tuple[int, int, int, int] | None = None
         self._zoom = 1.0
         self._min_zoom = 0.25
         self._max_zoom = 8.0
         self._transform_mode = Qt.TransformationMode.FastTransformation
         self._pan_active = False
+        self._pan_margin_px = 96
         self._pan_last_pos = QPointF(0, 0)
+        self._pan_pending_dx = 0.0
+        self._pan_pending_dy = 0.0
+        self._pan_apply_timer = QTimer(self)
+        self._pan_apply_timer.setInterval(8)
+        self._pan_apply_timer.timeout.connect(self._flush_pan_delta)
         self._drag_mode = False
         self._drag_active = False
         self._drag_start_pos = QPointF(0, 0)
+        self._drag_accum_dx = 0
+        self._drag_accum_dy = 0
+        self._drag_visual_dx = 0
+        self._drag_visual_dy = 0
         layout.addWidget(self.title)
         layout.addWidget(self.scroll_area, 1)
     
@@ -1795,25 +1952,99 @@ class PreviewPane(QWidget):
             self._drag_active = False
 
     def set_pixmap(self, pixmap: QPixmap | None, *, reset_zoom: bool = False) -> None:
-        logger.debug(f"PreviewPane.set_pixmap called: pixmap={'None' if pixmap is None else f'{pixmap.width()}x{pixmap.height()}'}, reset_zoom={reset_zoom}")
         if pixmap is None:
-            self.image_label.clear()
-            self.image_label.setText("Select an image to preview")
+            self.image_label.set_display_pixmap(None)
+            self.image_label.set_overlay_layers([])
             self._source_pixmap = None
+            self._scaled_base_pixmap = None
+            self._scaled_base_size = QSize(0, 0)
+            self._overlay_layers = []
+            self._overlay_source_size = QSize(0, 0)
+            self._overlay_scaled_region_cache = {}
+            self._backdrop_pixmap = None
+            self._backdrop_key = None
+            self._drag_visual_dx = 0
+            self._drag_visual_dy = 0
             if reset_zoom:
                 self._zoom = 1.0
-            self.image_label.adjustSize()
+            self.image_label.resize(QSize(200, 200))
             return
+
+        if self._source_pixmap is not None and self._source_pixmap.cacheKey() == pixmap.cacheKey():
+            if reset_zoom:
+                self._zoom = 1.0
+                self._apply_scaled_pixmap()
+            return
+
         self._source_pixmap = pixmap
+        self._scaled_base_pixmap = None
+        self._scaled_base_size = QSize(0, 0)
+        self._overlay_scaled_region_cache = {}
+        self._backdrop_pixmap = None
+        self._backdrop_key = None
+        self._drag_visual_dx = 0
+        self._drag_visual_dy = 0
         if reset_zoom:
             self._zoom = 1.0
-        self.image_label.setText("")
         self._apply_scaled_pixmap()
-        logger.debug(f"PreviewPane.set_pixmap completed")
 
     def resizeEvent(self, event) -> None:  # type: ignore[override]
         self._apply_scaled_pixmap()
         super().resizeEvent(event)
+
+    def set_overlay_layers(self, layers: Sequence[tuple[int, QRegion, QColor]], source_size: QSize) -> None:
+        normalized: List[tuple[int, QRegion, QColor]] = []
+        for layer_key, region, color in layers:
+            if region.isEmpty():
+                continue
+            normalized.append((int(layer_key), region, QColor(color)))
+        self._overlay_layers = normalized
+        if self._overlay_source_size != QSize(source_size):
+            self._overlay_scaled_region_cache = {}
+        self._overlay_source_size = QSize(source_size)
+        self._push_overlay_layers_to_canvas()
+
+    def _scaled_overlay_region(self, layer_key: int, region: QRegion, target_size: QSize) -> QRegion:
+        source_w = max(1, int(self._overlay_source_size.width()))
+        source_h = max(1, int(self._overlay_source_size.height()))
+        target_w = max(1, int(target_size.width()))
+        target_h = max(1, int(target_size.height()))
+        cache_key = (int(layer_key), source_w, source_h, target_w, target_h)
+        cached = self._overlay_scaled_region_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        sx = target_w / source_w
+        sy = target_h / source_h
+        scaled = QRegion()
+        for rect in region:
+            x = int(rect.x() * sx)
+            y = int(rect.y() * sy)
+            x2 = int((rect.x() + rect.width()) * sx)
+            y2 = int((rect.y() + rect.height()) * sy)
+            w = max(1, x2 - x)
+            h = max(1, y2 - y)
+            scaled = scaled.united(QRegion(x, y, w, h))
+
+        self._overlay_scaled_region_cache[cache_key] = scaled
+        return scaled
+
+    def _push_overlay_layers_to_canvas(self) -> None:
+        if self._drag_active or not self._overlay_layers:
+            self.image_label.set_overlay_layers([])
+            return
+        if self._overlay_source_size.isEmpty() or self._scaled_base_pixmap is None:
+            self.image_label.set_overlay_layers([])
+            return
+
+        target_size = self._scaled_base_pixmap.size()
+        display_overlay_layers: List[tuple[int, QRegion, QColor]] = []
+        for layer_key, source_region, color in self._overlay_layers:
+            scaled_region = self._scaled_overlay_region(layer_key, source_region, target_size)
+            if scaled_region.isEmpty():
+                continue
+            display_overlay_layers.append((layer_key, scaled_region, color))
+        self.image_label.set_overlay_layers(display_overlay_layers)
 
     def eventFilter(self, obj, event):  # type: ignore[override]
         etype = event.type()
@@ -1845,11 +2076,19 @@ class PreviewPane(QWidget):
                 if etype == QEvent.Type.MouseButtonRelease and event.button() in (Qt.MouseButton.LeftButton, Qt.MouseButton.MiddleButton):
                     self._end_pan()
                     return True
+            if self._pan_active and etype in (QEvent.Type.Leave, QEvent.Type.HoverLeave):
+                self._end_pan()
+                return True
         return super().eventFilter(obj, event)
     
     def _start_drag(self, event: QMouseEvent) -> None:
         """Start dragging sprite for repositioning."""
         self._drag_active = True
+        self._drag_accum_dx = 0
+        self._drag_accum_dy = 0
+        self._drag_visual_dx = 0
+        self._drag_visual_dy = 0
+        self.drag_started.emit()
         if hasattr(event, 'position'):
             self._drag_start_pos = event.position()
         else:
@@ -1873,12 +2112,26 @@ class PreviewPane(QWidget):
             dy = int(delta.y() / self._zoom)
             
             if dx != 0 or dy != 0:
+                self._drag_accum_dx += dx
+                self._drag_accum_dy += dy
+                self._drag_visual_dx += dx
+                self._drag_visual_dy += dy
                 self.drag_offset_changed.emit(dx, dy)
+                self._apply_scaled_pixmap()
                 self._drag_start_pos = current_pos
     
     def _end_drag(self) -> None:
         """End dragging sprite."""
         self._drag_active = False
+        self.drag_finished.emit(self._drag_accum_dx, self._drag_accum_dy)
+        self._drag_accum_dx = 0
+        self._drag_accum_dy = 0
+
+    def is_dragging(self) -> bool:
+        return self._drag_active
+
+    def current_zoom(self) -> float:
+        return float(self._zoom)
 
     def wheelEvent(self, event):  # type: ignore[override]
         if not isinstance(event, QWheelEvent) or not self._handle_wheel_zoom(event):
@@ -1889,18 +2142,95 @@ class PreviewPane(QWidget):
             return
         target_width = max(1, int(self._source_pixmap.width() * self._zoom))
         target_height = max(1, int(self._source_pixmap.height() * self._zoom))
-        scaled = self._source_pixmap.scaled(
-            QSize(target_width, target_height),
-            Qt.AspectRatioMode.KeepAspectRatio,
-            self._transform_mode,
+        target_size = QSize(target_width, target_height)
+        if self._scaled_base_pixmap is None or self._scaled_base_size != target_size:
+            self._scaled_base_pixmap = self._source_pixmap.scaled(
+                target_size,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                self._transform_mode,
+            )
+            self._scaled_base_size = target_size
+
+        display_pixmap = self._scaled_base_pixmap
+        if display_pixmap is None:
+            return
+
+        use_solid_drag_backdrop = self._drag_active and self._drag_backdrop_rgba is not None
+        backdrop = self._ensure_backdrop(display_pixmap.size(), solid_rgba=self._drag_backdrop_rgba if use_solid_drag_backdrop else None)
+
+        if self._drag_active and (self._drag_visual_dx != 0 or self._drag_visual_dy != 0):
+            shifted = QPixmap(display_pixmap.size())
+            shifted.fill(Qt.GlobalColor.transparent)
+            painter = QPainter(shifted)
+            offset_x = int(self._drag_visual_dx * self._zoom)
+            offset_y = int(self._drag_visual_dy * self._zoom)
+            painter.drawPixmap(offset_x, offset_y, display_pixmap)
+            painter.end()
+            display_pixmap = shifted
+
+        if backdrop is not None:
+            composed = QPixmap(backdrop)
+            painter = QPainter(composed)
+            painter.drawPixmap(0, 0, display_pixmap)
+            painter.end()
+            display_pixmap = composed
+
+        self.image_label.set_display_pixmap(display_pixmap)
+        self._push_overlay_layers_to_canvas()
+        viewport_size = self.scroll_area.viewport().size()
+        padded_width = max(display_pixmap.width(), viewport_size.width() + (self._pan_margin_px * 2))
+        padded_height = max(display_pixmap.height(), viewport_size.height() + (self._pan_margin_px * 2))
+        self.image_label.resize(QSize(max(1, padded_width), max(1, padded_height)))
+
+    def _ensure_backdrop(self, size: QSize, solid_rgba: tuple[int, int, int, int] | None = None) -> QPixmap | None:
+        if size.width() <= 0 or size.height() <= 0:
+            return None
+        key = (
+            int(size.width()),
+            int(size.height()),
+            None if solid_rgba is None else int(solid_rgba[0]),
+            None if solid_rgba is None else int(solid_rgba[1]),
+            None if solid_rgba is None else int(solid_rgba[2]),
+            None if solid_rgba is None else int(solid_rgba[3]),
         )
-        self.image_label.setPixmap(scaled)
-        self.image_label.resize(scaled.size())
+        if self._backdrop_pixmap is not None and self._backdrop_key == key:
+            return self._backdrop_pixmap
+
+        backdrop = QPixmap(size)
+        painter = QPainter(backdrop)
+        if solid_rgba is not None:
+            painter.fillRect(QRect(0, 0, size.width(), size.height()), QColor(*solid_rgba))
+        else:
+            checker_tile = self._checker_tile_pixmap
+            if checker_tile is None:
+                checker_tile = QPixmap(16, 16)
+                tile_painter = QPainter(checker_tile)
+                light = QColor(200, 200, 200, 255)
+                dark = QColor(150, 150, 150, 255)
+                tile_painter.fillRect(QRect(0, 0, 16, 16), light)
+                tile_painter.fillRect(QRect(8, 0, 8, 8), dark)
+                tile_painter.fillRect(QRect(0, 8, 8, 8), dark)
+                tile_painter.end()
+                self._checker_tile_pixmap = checker_tile
+            painter.drawTiledPixmap(QRect(0, 0, size.width(), size.height()), checker_tile)
+        painter.end()
+        self._backdrop_pixmap = backdrop
+        self._backdrop_key = key
+        return backdrop
+
+    def set_drag_backdrop_rgba(self, rgba: tuple[int, int, int, int] | None) -> None:
+        self._drag_backdrop_rgba = rgba
+        self._backdrop_pixmap = None
+        self._backdrop_key = None
 
     def set_scaling_mode(self, mode: Qt.TransformationMode) -> None:
         if self._transform_mode == mode:
             return
         self._transform_mode = mode
+        self._scaled_base_pixmap = None
+        self._scaled_base_size = QSize(0, 0)
+        self._backdrop_pixmap = None
+        self._backdrop_key = None
         self._apply_scaled_pixmap()
 
     def _handle_wheel_zoom(self, event: QWheelEvent) -> bool:
@@ -1922,6 +2252,13 @@ class PreviewPane(QWidget):
         if self._source_pixmap is None:
             return
         self._pan_active = True
+        self.panning_changed.emit(True)
+        self._pan_pending_dx = 0.0
+        self._pan_pending_dy = 0.0
+        target_interval = 8 if self._zoom <= 2.0 else 12 if self._zoom <= 4.0 else 16
+        self._pan_apply_timer.setInterval(target_interval)
+        if not self._pan_apply_timer.isActive():
+            self._pan_apply_timer.start()
         self._pan_last_pos = event.globalPosition()
         self.scroll_area.viewport().setCursor(Qt.CursorShape.ClosedHandCursor)
 
@@ -1930,15 +2267,36 @@ class PreviewPane(QWidget):
             return
         delta = event.globalPosition() - self._pan_last_pos
         self._pan_last_pos = event.globalPosition()
+        self._pan_pending_dx += float(delta.x())
+        self._pan_pending_dy += float(delta.y())
+
+    def _flush_pan_delta(self) -> None:
+        if not self._pan_active:
+            if self._pan_apply_timer.isActive():
+                self._pan_apply_timer.stop()
+            return
+        dx = int(self._pan_pending_dx)
+        dy = int(self._pan_pending_dy)
+        if dx == 0 and dy == 0:
+            return
+        self._pan_pending_dx -= float(dx)
+        self._pan_pending_dy -= float(dy)
         hbar = self.scroll_area.horizontalScrollBar()
         vbar = self.scroll_area.verticalScrollBar()
-        hbar.setValue(int(max(hbar.minimum(), min(hbar.maximum(), hbar.value() - delta.x()))))
-        vbar.setValue(int(max(vbar.minimum(), min(vbar.maximum(), vbar.value() - delta.y()))))
+        if dx:
+            hbar.setValue(int(max(hbar.minimum(), min(hbar.maximum(), hbar.value() - dx))))
+        if dy:
+            vbar.setValue(int(max(vbar.minimum(), min(vbar.maximum(), vbar.value() - dy))))
 
     def _end_pan(self) -> None:
         if not self._pan_active:
             return
+        self._flush_pan_delta()
+        self._pan_apply_timer.stop()
+        self._pan_pending_dx = 0.0
+        self._pan_pending_dy = 0.0
         self._pan_active = False
+        self.panning_changed.emit(False)
         self.scroll_area.viewport().unsetCursor()
 
 
@@ -1946,10 +2304,11 @@ class LoadedImagesPanel(QWidget):
     def __init__(self, on_selection_change, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(6, 6, 6, 6)
-        layout.setSpacing(6)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(4)
 
         mode_row = QHBoxLayout()
+        mode_row.setSpacing(4)
         mode_row.addWidget(QLabel("Load Mode:"))
         self.load_mode_combo = QComboBox()
         self.load_mode_combo.addItem("Detect Indexes", "detect")
@@ -1962,10 +2321,15 @@ class LoadedImagesPanel(QWidget):
         mode_row.addWidget(self.load_mode_combo, 1)
         layout.addLayout(mode_row)
         
-        self.load_button = QPushButton("Load Images")
-        self.clear_button = QPushButton("Clear All")
+        self.clear_button = QPushButton("Clear Sprites")
+        self.clear_button.setToolTip("Remove all currently loaded sprites from the workspace")
+        self.clear_button.setMaximumHeight(24)
         self.count_label = QLabel("No files loaded")
         self.count_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.project_info_label = QLabel("Workspace: Unsaved")
+        self.project_info_label.setWordWrap(True)
+        self.project_info_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self.project_info_label.setToolTip("No active project")
 
         group_label = QLabel("Groups")
         group_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -1992,8 +2356,8 @@ class LoadedImagesPanel(QWidget):
 
         self.list_widget = QListWidget()
         self.list_widget.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
-        layout.addWidget(self.load_button)
         layout.addWidget(self.clear_button)
+        layout.addWidget(self.project_info_label)
         layout.addWidget(self.count_label)
         layout.addWidget(group_label)
         layout.addWidget(self.group_list, 1)
@@ -2010,6 +2374,34 @@ class LoadedImagesPanel(QWidget):
     def selected_load_mode(self) -> Literal["detect", "preserve"]:
         data = self.load_mode_combo.currentData()
         return "preserve" if data == "preserve" else "detect"
+
+    def set_project_info(
+        self,
+        *,
+        name: str | None,
+        mode: str | None,
+        root: Path | None,
+        dirty: bool = False,
+        last_saved_text: str | None = None,
+        last_saved_kind: str | None = None,
+        recovery_source_text: str | None = None,
+    ) -> None:
+        if not name or root is None:
+            self.project_info_label.setText("Workspace: Unsaved")
+            self.project_info_label.setToolTip("No active project")
+            return
+        mode_text = (mode or "managed").strip().lower()
+        friendly_mode = "Managed" if mode_text == "managed" else ("Linked" if mode_text == "linked" else mode_text.title())
+        root_name = root.name or root.as_posix()
+        state_text = "Unsaved changes" if dirty else "Saved"
+        self.project_info_label.setText(f"Project: {name} ({friendly_mode})\nState: {state_text} • Folder: {root_name}")
+        tooltip = f"{root}\nState: {state_text}"
+        if last_saved_text:
+            kind = (last_saved_kind or "Saved").strip()
+            tooltip += f"\n{kind}: {last_saved_text}"
+        if recovery_source_text:
+            tooltip += f"\nRecovery source: {recovery_source_text}"
+        self.project_info_label.setToolTip(tooltip)
 
 
 class FloatingPaletteWindow(QWidget):
@@ -2148,12 +2540,23 @@ class FloatingPaletteWindow(QWidget):
             self.force_columns_check.setChecked(self._get_pref_bool("force_columns", self.force_columns_check.isChecked()))
             self.show_indices_check.setChecked(self._get_pref_bool("show_indices", self.show_indices_check.isChecked()))
             self.grid_lines_check.setChecked(self._get_pref_bool("show_grid", self.grid_lines_check.isChecked()))
+            mode_value = str(self._settings.value(self._settings_key("load_mode"), self.mode_combo.currentData() or "detect")).strip().lower()
+            mode_index = self.mode_combo.findData("preserve" if mode_value == "preserve" else "detect")
+            self.mode_combo.setCurrentIndex(mode_index if mode_index >= 0 else 0)
         finally:
             for control, blocked in zip(controls, blocked_states):
                 control.blockSignals(blocked)
             self._is_loading_settings = False
+
+        geometry = self._settings.value(self._settings_key("geometry"))
+        if geometry is not None:
+            try:
+                self.restoreGeometry(geometry)
+            except Exception:  # noqa: BLE001
+                logger.debug("Floating palette failed to restore geometry window=%s", self._window_index, exc_info=True)
+
         logger.debug(
-            "Floating palette settings loaded window=%s cols=%s zoom=%s gap=%s force=%s idx=%s grid=%s",
+            "Floating palette settings loaded window=%s cols=%s zoom=%s gap=%s force=%s idx=%s grid=%s mode=%s",
             self._window_index,
             self.columns_spin.value(),
             self.zoom_spin.value(),
@@ -2161,6 +2564,7 @@ class FloatingPaletteWindow(QWidget):
             self.force_columns_check.isChecked(),
             self.show_indices_check.isChecked(),
             self.grid_lines_check.isChecked(),
+            self.mode_combo.currentData(),
         )
 
     def _save_view_settings(self) -> None:
@@ -2170,6 +2574,8 @@ class FloatingPaletteWindow(QWidget):
         self._settings.setValue(self._settings_key("force_columns"), bool(self.force_columns_check.isChecked()))
         self._settings.setValue(self._settings_key("show_indices"), bool(self.show_indices_check.isChecked()))
         self._settings.setValue(self._settings_key("show_grid"), bool(self.grid_lines_check.isChecked()))
+        self._settings.setValue(self._settings_key("load_mode"), str(self.mode_combo.currentData() or "detect"))
+        self._settings.setValue(self._settings_key("geometry"), self.saveGeometry())
 
     def _selected_mode(self) -> Literal["detect", "preserve"]:
         return "preserve" if self.mode_combo.currentData() == "preserve" else "detect"
@@ -2320,6 +2726,10 @@ class FloatingPaletteWindow(QWidget):
         if not self._shown_once:
             self._shown_once = True
             self._layout_timer.start(0)
+
+    def closeEvent(self, event) -> None:  # type: ignore[override]
+        self._save_view_settings()
+        super().closeEvent(event)
 
     def dragEnterEvent(self, event) -> None:  # type: ignore[override]
         urls = event.mimeData().urls() if event.mimeData().hasUrls() else []
@@ -2562,6 +2972,42 @@ class MergeOperationDialog(QDialog):
 
         binding_map: Dict[str, tuple[str, Callable[[], None]]] = {
             "merge.apply": (self._owner._get_key_binding("merge.apply", "A"), self._on_apply_shortcut),
+            "merge.tag_source": (
+                self._owner._get_key_binding("merge.tag_source", "S"),
+                self._on_tag_source_shortcut,
+            ),
+            "merge.tag_destination": (
+                self._owner._get_key_binding("merge.tag_destination", "D"),
+                self._on_tag_destination_shortcut,
+            ),
+            "merge.clear_roles": (
+                self._owner._get_key_binding("merge.clear_roles", "C"),
+                self._on_clear_roles_shortcut,
+            ),
+            "merge.clear_all": (
+                self._owner._get_key_binding("merge.clear_all", "Shift+C"),
+                self._on_clear_all_shortcut,
+            ),
+            "merge.scope_global": (
+                self._owner._get_key_binding("merge.scope_global", "Alt+1"),
+                self._on_scope_global_shortcut,
+            ),
+            "merge.scope_group": (
+                self._owner._get_key_binding("merge.scope_group", "Alt+2"),
+                self._on_scope_group_shortcut,
+            ),
+            "merge.scope_local": (
+                self._owner._get_key_binding("merge.scope_local", "Alt+3"),
+                self._on_scope_local_shortcut,
+            ),
+            "merge.view_settings": (
+                self._owner._get_key_binding("merge.view_settings", "V"),
+                self._on_view_settings_shortcut,
+            ),
+            "merge.close": (
+                self._owner._get_key_binding("merge.close", "Escape"),
+                self._on_close_shortcut,
+            ),
         }
         for action, (sequence, callback) in binding_map.items():
             shortcut = QShortcut(QKeySequence(sequence), self)
@@ -2573,6 +3019,38 @@ class MergeOperationDialog(QDialog):
     def _on_apply_shortcut(self) -> None:
         if self.apply_button.isEnabled():
             self._apply_merge()
+
+    def _on_tag_source_shortcut(self) -> None:
+        self._mark_selected_as_sources()
+
+    def _on_tag_destination_shortcut(self) -> None:
+        self._set_current_as_destination()
+
+    def _on_clear_roles_shortcut(self) -> None:
+        self._clear_source_destination()
+
+    def _on_clear_all_shortcut(self) -> None:
+        self._clear_all_selections()
+
+    def _set_scope_by_key(self, scope_key: str) -> None:
+        index = self.scope_combo.findData(scope_key)
+        if index >= 0 and index != self.scope_combo.currentIndex():
+            self.scope_combo.setCurrentIndex(index)
+
+    def _on_scope_global_shortcut(self) -> None:
+        self._set_scope_by_key("global")
+
+    def _on_scope_group_shortcut(self) -> None:
+        self._set_scope_by_key("group")
+
+    def _on_scope_local_shortcut(self) -> None:
+        self._set_scope_by_key("local")
+
+    def _on_view_settings_shortcut(self) -> None:
+        self._open_view_settings()
+
+    def _on_close_shortcut(self) -> None:
+        self.reject()
 
     def _scope(self) -> Literal["global", "group", "local"]:
         data = self.scope_combo.currentData()
@@ -3106,7 +3584,354 @@ class MergeOperationDialog(QDialog):
         self.preview_sprite_list.blockSignals(False)
 
 
+class KeybindingsDialog(QDialog):
+    def __init__(self, entries: Sequence[Dict[str, str]], parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Keyboard Shortcuts")
+        self.resize(720, 520)
+
+        self._rows: List[Dict[str, str]] = [dict(item) for item in entries]
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(8, 8, 8, 8)
+        root.setSpacing(6)
+
+        root.addWidget(QLabel("Configure keyboard shortcuts. Conflicting shortcuts are blocked."))
+
+        self.table = QTableWidget(0, 2, self)
+        self.table.setHorizontalHeaderLabels(["Action", "Shortcut"])
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.verticalHeader().setVisible(False)
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        root.addWidget(self.table, 1)
+
+        assign_row = QHBoxLayout()
+        assign_row.addWidget(QLabel("Press shortcut:"))
+        self.sequence_edit = QKeySequenceEdit(self)
+        self.assign_button = QPushButton("Assign to Selected")
+        self.clear_button = QPushButton("Clear")
+        assign_row.addWidget(self.sequence_edit, 1)
+        assign_row.addWidget(self.assign_button)
+        assign_row.addWidget(self.clear_button)
+        root.addLayout(assign_row)
+
+        self.capture_status_label = QLabel("")
+        root.addWidget(self.capture_status_label)
+
+        actions_row = QHBoxLayout()
+        self.import_button = QPushButton("Import...")
+        self.export_button = QPushButton("Export...")
+        self.reset_button = QPushButton("Reset Selected")
+        self.reset_all_button = QPushButton("Reset All")
+        actions_row.addWidget(self.import_button)
+        actions_row.addWidget(self.export_button)
+        actions_row.addWidget(self.reset_button)
+        actions_row.addWidget(self.reset_all_button)
+        actions_row.addStretch(1)
+        root.addLayout(actions_row)
+
+        footer_row = QHBoxLayout()
+        self.dirty_status_label = QLabel("")
+        footer_row.addWidget(self.dirty_status_label)
+        footer_row.addStretch(1)
+        self.save_button = QPushButton("Save")
+        self.cancel_button = QPushButton("Cancel")
+        footer_row.addWidget(self.save_button)
+        footer_row.addWidget(self.cancel_button)
+        root.addLayout(footer_row)
+
+        self.table.itemSelectionChanged.connect(self._on_selection_changed)
+        self.sequence_edit.keySequenceChanged.connect(self._on_sequence_changed)
+        self.assign_button.clicked.connect(self._assign_selected)
+        self.clear_button.clicked.connect(self._clear_sequence_edit)
+        self.import_button.clicked.connect(self._import_bindings)
+        self.export_button.clicked.connect(self._export_bindings)
+        self.reset_button.clicked.connect(self._reset_selected)
+        self.reset_all_button.clicked.connect(self._reset_all)
+        self.save_button.clicked.connect(self.accept)
+        self.cancel_button.clicked.connect(self.reject)
+
+        self._initial_bindings = self.bindings()
+        self._has_unsaved_changes = False
+        self._refresh_items()
+
+    def bindings(self) -> Dict[str, str]:
+        output: Dict[str, str] = {}
+        for row in self._rows:
+            action_id = row.get("id", "").strip()
+            if not action_id:
+                continue
+            output[action_id] = row.get("current", "").strip()
+        return output
+
+    def _refresh_items(self) -> None:
+        selected_id = self._selected_action_id()
+        self.table.setRowCount(0)
+        for row_index, row in enumerate(self._rows):
+            label = row.get("label", "")
+            shortcut = row.get("current", "")
+            default = row.get("default", "")
+            self.table.insertRow(row_index)
+
+            action_item = QTableWidgetItem(label)
+            action_item.setData(Qt.ItemDataRole.UserRole, row.get("id", ""))
+            if shortcut != default:
+                action_item.setToolTip("Custom shortcut")
+            self.table.setItem(row_index, 0, action_item)
+
+            shortcut_text = shortcut or "(unassigned)"
+            shortcut_item = QTableWidgetItem(shortcut_text)
+            if shortcut != default:
+                shortcut_item.setToolTip(f"Default: {default}")
+            self.table.setItem(row_index, 1, shortcut_item)
+
+            if selected_id and selected_id == row.get("id", ""):
+                self.table.selectRow(row_index)
+
+        if self.table.rowCount() and not self.table.selectionModel().hasSelection():
+            self.table.selectRow(0)
+        self._on_selection_changed()
+        self._update_dirty_state()
+
+    def _update_dirty_state(self) -> None:
+        self._has_unsaved_changes = self.bindings() != self._initial_bindings
+        if self._has_unsaved_changes:
+            self.dirty_status_label.setText("Unsaved shortcut changes")
+            self.save_button.setEnabled(True)
+        else:
+            self.dirty_status_label.setText("No unsaved shortcut changes")
+            self.save_button.setEnabled(False)
+
+    def reject(self) -> None:
+        if not self._has_unsaved_changes:
+            super().reject()
+            return
+
+        reply = QMessageBox.question(
+            self,
+            "Unsaved Shortcuts",
+            "You have unsaved shortcut changes. Save before closing?",
+            QMessageBox.StandardButton.Save
+            | QMessageBox.StandardButton.Discard
+            | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if reply == QMessageBox.StandardButton.Save:
+            self.accept()
+            return
+        if reply == QMessageBox.StandardButton.Discard:
+            super().reject()
+            return
+
+    def _selected_action_id(self) -> str | None:
+        row = self.table.currentRow()
+        if row < 0:
+            return None
+        item = self.table.item(row, 0)
+        if item is None:
+            return None
+        value = item.data(Qt.ItemDataRole.UserRole)
+        if not isinstance(value, str):
+            return None
+        value = value.strip()
+        return value if value else None
+
+    def _selected_row(self) -> Dict[str, str] | None:
+        action_id = self._selected_action_id()
+        if not action_id:
+            return None
+        for row in self._rows:
+            if row.get("id", "") == action_id:
+                return row
+        return None
+
+    def _on_selection_changed(self) -> None:
+        row = self._selected_row()
+        has_row = row is not None
+        self.assign_button.setEnabled(has_row)
+        self.reset_button.setEnabled(has_row)
+        self.clear_button.setEnabled(True)
+        if row is None:
+            self.capture_status_label.setText("")
+            self.sequence_edit.clear()
+            return
+        self.capture_status_label.setText("")
+        current = row.get("current", "").strip()
+        self.sequence_edit.blockSignals(True)
+        self.sequence_edit.setKeySequence(QKeySequence(current) if current else QKeySequence())
+        self.sequence_edit.blockSignals(False)
+
+    def _clear_sequence_edit(self) -> None:
+        self.sequence_edit.clear()
+
+    @staticmethod
+    def _normalize_shortcut_text(value: str) -> str:
+        sequence = QKeySequence(str(value).strip())
+        return sequence.toString(QKeySequence.SequenceFormat.NativeText).strip()
+
+    def _label_for_action(self, action_id: str) -> str:
+        for row in self._rows:
+            if row.get("id", "") == action_id:
+                return row.get("label", action_id)
+        return action_id
+
+    def _export_bindings(self) -> None:
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export Keyboard Shortcuts",
+            "spritetools-shortcuts.json",
+            "JSON Files (*.json)",
+        )
+        if not path:
+            return
+        payload = {
+            "version": 1,
+            "app": "SpriteTools",
+            "bindings": self.bindings(),
+        }
+        try:
+            Path(path).write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, "Export Shortcuts", f"Failed to export bindings:\n{exc}")
+            return
+        self.capture_status_label.setText(f"Exported shortcuts to {Path(path).name}.")
+
+    def _import_bindings(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Import Keyboard Shortcuts",
+            "",
+            "JSON Files (*.json)",
+        )
+        if not path:
+            return
+
+        try:
+            loaded = json.loads(Path(path).read_text(encoding="utf-8"))
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, "Import Shortcuts", f"Failed to read bindings file:\n{exc}")
+            return
+
+        source: Dict[str, Any]
+        if isinstance(loaded, dict) and isinstance(loaded.get("bindings"), dict):
+            source = loaded.get("bindings", {})
+        elif isinstance(loaded, dict):
+            source = loaded
+        else:
+            QMessageBox.warning(self, "Import Shortcuts", "Invalid file format.")
+            return
+
+        known_ids = {row.get("id", "") for row in self._rows}
+        updates: Dict[str, str] = {}
+        for action_id, raw_value in source.items():
+            action_key = str(action_id).strip()
+            if not action_key or action_key not in known_ids:
+                continue
+            normalized = self._normalize_shortcut_text(str(raw_value))
+            if not normalized:
+                continue
+            updates[action_key] = normalized
+
+        if not updates:
+            QMessageBox.information(self, "Import Shortcuts", "No matching valid bindings were found.")
+            return
+
+        proposed: Dict[str, str] = {row.get("id", ""): row.get("current", "") for row in self._rows}
+        proposed.update(updates)
+        used: Dict[str, str] = {}
+        for action_id, sequence in proposed.items():
+            key = str(sequence).strip().lower()
+            if not key:
+                continue
+            existing = used.get(key)
+            if existing and existing != action_id:
+                lhs = self._label_for_action(existing)
+                rhs = self._label_for_action(action_id)
+                QMessageBox.warning(
+                    self,
+                    "Import Shortcuts",
+                    f"Conflict detected: '{sequence}' is assigned to both {lhs} and {rhs}.",
+                )
+                return
+            used[key] = action_id
+
+        for row in self._rows:
+            action_id = row.get("id", "")
+            if action_id in updates:
+                row["current"] = updates[action_id]
+
+        self._refresh_items()
+        self.capture_status_label.setText(
+            f"Imported {len(updates)} shortcut{'s' if len(updates) != 1 else ''} from {Path(path).name}."
+        )
+
+    def _on_sequence_changed(self, _: QKeySequence) -> None:
+        if not self.isVisible():
+            return
+        self._assign_selected(show_warnings=False)
+
+    def _assign_selected(self, *, show_warnings: bool = True) -> None:
+        row = self._selected_row()
+        if row is None:
+            return
+
+        sequence = self.sequence_edit.keySequence()
+        normalized = self._normalize_shortcut_text(sequence.toString(QKeySequence.SequenceFormat.NativeText))
+        if not normalized:
+            self.capture_status_label.setText("Press a key combination to assign.")
+            if show_warnings:
+                QMessageBox.warning(self, "Shortcut", "Shortcut cannot be empty.")
+            return
+
+        current_id = row.get("id", "")
+        for other in self._rows:
+            other_id = other.get("id", "")
+            if other_id == current_id:
+                continue
+            if other.get("current", "").strip().lower() == normalized.lower():
+                self.capture_status_label.setText(
+                    f"Conflict: {normalized} is already used by {other.get('label', other_id)}."
+                )
+                if show_warnings:
+                    QMessageBox.warning(
+                        self,
+                        "Shortcut Conflict",
+                        f"'{normalized}' is already assigned to {other.get('label', other_id)}.",
+                    )
+                return
+
+        row["current"] = normalized
+        self.capture_status_label.setText(f"Assigned {normalized} to {row.get('label', 'Action')}.")
+        self._refresh_items()
+
+    def _reset_selected(self) -> None:
+        row = self._selected_row()
+        if row is None:
+            return
+        row["current"] = row.get("default", "")
+        self._refresh_items()
+
+    def _reset_all(self) -> None:
+        reply = QMessageBox.question(
+            self,
+            "Reset All Shortcuts",
+            "Reset all shortcuts to default values?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        for row in self._rows:
+            row["current"] = row.get("default", "")
+        self._refresh_items()
+
+
 class SpriteToolsWindow(QMainWindow):
+    previewFutureDone = Signal()
+
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("SpriteTools GUI (prototype)")
@@ -3126,6 +3951,50 @@ class SpriteToolsWindow(QMainWindow):
         self._preview_timer = QTimer(self)
         self._preview_timer.setSingleShot(True)
         self._preview_timer.timeout.connect(self._render_preview)
+        self._preview_executor: ThreadPoolExecutor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="spritetools-preview")
+        self._preview_future: Future[tuple[Image.Image, PaletteInfo]] | None = None
+        self._preview_pending_request: Dict[str, Any] | None = None
+        self._preview_active_request: Dict[str, Any] | None = None
+        self._preview_request_serial = 0
+        self.previewFutureDone.connect(self._drain_preview_result)
+        self._preview_pixmap_timer = QTimer(self)
+        self._preview_pixmap_timer.setSingleShot(True)
+        self._preview_pixmap_timer.timeout.connect(self._flush_preview_pixmap_update)
+        self._load_queue: deque[Path] = deque()
+        self._load_mode_in_progress: Literal["detect", "preserve"] | None = None
+        self._load_mode_overrides: Dict[str, Literal["detect", "preserve"]] = {}
+        self._load_added_count = 0
+        self._load_failed_count = 0
+        self._load_total_count = 0
+        self._load_had_selection = False
+        self._load_starting_count = 0
+        self._load_selected_key_before: str | None = None
+        self._is_loading_sprites = False
+        self._detect_batch_queue: deque[tuple[str, str, Any]] = deque()
+        self._detect_batch_total = 0
+        self._detect_batch_done = 0
+        self._detect_batch_timer = QTimer(self)
+        self._detect_batch_timer.setInterval(0)
+        self._detect_batch_timer.timeout.connect(self._process_detect_batch_tick)
+        self._load_timer = QTimer(self)
+        self._load_timer.setInterval(0)
+        self._load_timer.timeout.connect(self._process_load_queue_tick)
+        self._autosave_debounce_timer = QTimer(self)
+        self._autosave_debounce_timer.setSingleShot(True)
+        self._autosave_debounce_timer.timeout.connect(self._perform_autosave)
+        self._autosave_periodic_timer = QTimer(self)
+        self._autosave_periodic_timer.setInterval(60_000)
+        self._autosave_periodic_timer.timeout.connect(self._perform_autosave)
+        self._autosave_periodic_timer.start()
+        self._autosave_dirty = False
+        self._autosave_enabled = True
+        self._autosave_recovery_mode = False
+        self._autosave_last_error_ts = 0.0
+        self._autosave_last_status_ts = 0.0
+        self._autosave_roll_limit = 12
+        self._last_project_saved_text: str | None = None
+        self._last_project_saved_kind: str | None = None
+        self._recovery_source_text: str | None = None
         self._main_palette_layout_timer = QTimer(self)
         self._main_palette_layout_timer.setSingleShot(True)
         self._main_palette_layout_timer.timeout.connect(self._apply_main_palette_layout_options)
@@ -3135,13 +4004,33 @@ class SpriteToolsWindow(QMainWindow):
         self._highlight_animation_timer.setInterval(30)  # ~33 FPS for smooth animation
         self._highlight_animation_timer.timeout.connect(self._update_highlight_animation)
         self._highlight_animation_phase = 0.0
+        self._overlay_timer_interval_ms = 30
         
         # Customizable overlay settings
-        self._overlay_color = (255, 255, 255)  # Default white for maximum visibility
-        self._overlay_alpha_min = 77  # Minimum opacity (30%)
-        self._overlay_alpha_max = 255  # Maximum opacity (100%)
-        self._animation_speed = 0.15  # Animation speed increment per frame
+        self._selected_overlay_color = (255, 255, 255)
+        self._selected_overlay_alpha_min = 77
+        self._selected_overlay_alpha_max = 255
+        self._selected_animation_speed = 0.15
+        self._selected_highlight_animation_phase = 0.0
+
+        self._hover_overlay_color = (255, 255, 255)
+        self._hover_overlay_alpha_min = 77
+        self._hover_overlay_alpha_max = 255
+        self._hover_animation_speed = 0.15
+        self._hover_highlight_animation_phase = 0.0
+
+        self._overlay_show_both = False
+
+        # Legacy aliases (used by merge preview and older helper paths)
+        self._overlay_color = self._selected_overlay_color
+        self._overlay_alpha_min = self._selected_overlay_alpha_min
+        self._overlay_alpha_max = self._selected_overlay_alpha_max
+        self._animation_speed = self._selected_animation_speed
+        self._preview_hover_palette_row: int | None = None
+        self._preview_bg_transparent_enabled = False
+        self._preview_background_indices: set[int] = set()
         self._active_offset_drag_mode: Literal["none", "global", "group", "individual"] = "none"
+        self._offset_drag_live = False
         self._floating_palette_windows: List[FloatingPaletteWindow] = []
         self._floating_palette_window_counter = 0
         self._main_palette_columns = 8
@@ -3150,28 +4039,61 @@ class SpriteToolsWindow(QMainWindow):
         self._main_palette_gap = 6
         self._main_palette_show_indices = True
         self._main_palette_show_grid = False
+        self._main_palette_show_usage_badge = False
         self._main_palette_layout_in_progress = False
         self._last_main_palette_layout_signature: tuple[Any, ...] | None = None
         self._merge_dialog: MergeOperationDialog | None = None
         self._used_index_cache: Dict[str, set[int]] = {}
         self._settings = QSettings("SpriteTools", "SpriteTools")
+        self._project_service = ProjectService()
+        self._project_paths: ProjectPaths | None = None
+        self._project_manifest: ProjectManifest | None = None
+        self._pending_project_sprite_metadata: Dict[str, Dict[str, Any]] | None = None
         
         self._history_manager: HistoryManager | None = None
         self._pending_palette_index_remap: Dict[int, int] | None = None
         self.setAcceptDrops(True)
 
-        splitter = QSplitter()
+        self._main_splitter = QSplitter()
 
         self.images_panel = LoadedImagesPanel(self._on_selection_changed)
         self.images_panel.list_widget.installEventFilter(self)
-        self.images_panel.load_button.clicked.connect(self._prompt_and_load)
         self.images_panel.clear_button.clicked.connect(self._clear_all_sprites)
+
+        self.action_import_sprites = QAction("Import Sprites...", self)
+        self.action_new_project = QAction("New Project...", self)
+        self.action_open_project = QAction("Open Project...", self)
+        self.action_save_project = QAction("Save", self)
+        self.action_save_project_as = QAction("Save Project As...", self)
+        self.action_keyboard_shortcuts = QAction("Keyboard Shortcuts...", self)
+        self.action_exit = QAction("Exit", self)
+        self._recent_projects_menu = None
+        self._action_shortcut_registry: List[tuple[str, QAction, str]] = [
+            ("file/import_sprites", self.action_import_sprites, "Ctrl+I"),
+            ("file/new_project", self.action_new_project, "Ctrl+N"),
+            ("file/open_project", self.action_open_project, "Ctrl+O"),
+            ("file/save_project", self.action_save_project, "Ctrl+S"),
+            ("file/save_project_as", self.action_save_project_as, "Ctrl+Shift+S"),
+            ("edit/keyboard_shortcuts", self.action_keyboard_shortcuts, "Ctrl+Alt+K"),
+            ("file/exit", self.action_exit, "Ctrl+Q"),
+        ]
+
+        self.action_import_sprites.triggered.connect(self._prompt_and_load)
+        self.action_new_project.triggered.connect(self._new_project)
+        self.action_open_project.triggered.connect(self._open_project)
+        self.action_save_project.triggered.connect(self._save_project)
+        self.action_save_project_as.triggered.connect(self._save_project_as)
+        self.action_keyboard_shortcuts.triggered.connect(self._open_keybindings_dialog)
+        self.action_exit.triggered.connect(self.close)
+
         self.images_panel.load_mode_combo.currentIndexChanged.connect(self._on_load_mode_changed)
         self.images_panel.new_group_button.clicked.connect(self._create_group_from_selected_sprites)
         self.images_panel.assign_group_button.clicked.connect(self._assign_selected_sprites_to_selected_group)
         self.images_panel.group_color_button.clicked.connect(self._set_selected_group_color)
         self.images_panel.detach_group_button.clicked.connect(self._detach_selected_sprites_to_individual_groups)
         self.images_panel.auto_group_button.clicked.connect(self._auto_assign_selected_sprites_to_signature_groups)
+        self._refresh_project_info_banner()
+        self._update_project_action_buttons()
 
         self.palette_panel = QWidget()
         palette_layout = QVBoxLayout(self.palette_panel)
@@ -3200,6 +4122,8 @@ class SpriteToolsWindow(QMainWindow):
         self.palette_list.palette_changed.connect(self._on_palette_changed)
         self.palette_list.selection_changed.connect(self._on_palette_selection_changed)
         self.palette_list.viewport().installEventFilter(self)
+        self.palette_list.setMouseTracking(True)
+        self.palette_list.viewport().setMouseTracking(True)
         self._apply_main_palette_layout_options()
         palette_layout.addWidget(palette_label)
         palette_layout.addWidget(self.selected_color_label)
@@ -3356,6 +4280,10 @@ class SpriteToolsWindow(QMainWindow):
         self.fill_preview_label = QLabel("—")
         self.fill_preview_label.setMinimumWidth(80)
         fill_layout.addRow("Preview", self.fill_preview_label)
+        self.background_indices_btn = QPushButton("Background Indexes...")
+        self.background_indices_btn.setToolTip("Select palette indexes treated as background for preview options")
+        self.background_indices_btn.clicked.connect(self._open_background_index_selector)
+        fill_layout.addRow("Background", self.background_indices_btn)
         palette_layout.addWidget(fill_group)
         
         # Global sprite offset controls
@@ -3466,10 +4394,22 @@ class SpriteToolsWindow(QMainWindow):
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self._last_processed_indexed: Image.Image | None = None
         self._last_index_data: List[int] | None = None
+        self._overlay_region_by_index: Dict[int, QRegion] = {}
+        self._overlay_region_cache_shape: tuple[int, int] | None = None
         self._last_preview_rgba: Image.Image | None = None
+        self._preview_base_pixmap: QPixmap | None = None
         self._last_palette_info: PaletteInfo | None = None
         self._reset_zoom_next = True
         self._palette_index_lookup: Dict[ColorTuple, List[int]] = {}
+        self._preview_pan_active = False
+        self._last_pan_overlay_refresh_ts = 0.0
+        self._pan_overlay_refresh_interval_s = 0.033
+        self._overlay_compose_ms_ema = 0.0
+        self._overlay_compose_samples = 0
+        self._overlay_perf_log_every = 30
+        self._overlay_alpha_quantum = 8
+        self._last_overlay_alpha_signature: tuple[Any, ...] | None = None
+        self._last_preview_render_signature: tuple[Any, ...] | None = None
 
         self.preview_container = QWidget()
         preview_layout = QVBoxLayout(self.preview_container)
@@ -3477,6 +4417,9 @@ class SpriteToolsWindow(QMainWindow):
         preview_layout.setSpacing(6)
         self.preview_panel = PreviewPane()
         self.preview_panel.drag_offset_changed.connect(self._handle_drag_offset_changed)
+        self.preview_panel.drag_started.connect(self._handle_drag_started)
+        self.preview_panel.drag_finished.connect(self._handle_drag_finished)
+        self.preview_panel.panning_changed.connect(self._handle_preview_panning_changed)
         preview_layout.addWidget(self.preview_panel, 1)
 
         # Single controls row: highlight checkbox, overlay settings button, and scaling
@@ -3485,6 +4428,10 @@ class SpriteToolsWindow(QMainWindow):
         self.highlight_checkbox.setChecked(True)
         self.highlight_checkbox.toggled.connect(self._on_highlight_checkbox_toggled)
         controls_row.addWidget(self.highlight_checkbox)
+        self.hover_highlight_checkbox = QCheckBox("Highlight hover color")
+        self.hover_highlight_checkbox.setChecked(True)
+        self.hover_highlight_checkbox.toggled.connect(self._on_hover_highlight_checkbox_toggled)
+        controls_row.addWidget(self.hover_highlight_checkbox)
         
         self.overlay_settings_btn = QPushButton("Overlay Settings...")
         self.overlay_settings_btn.clicked.connect(self._open_overlay_settings)
@@ -3521,15 +4468,18 @@ class SpriteToolsWindow(QMainWindow):
         export_row.addWidget(self.export_palette_btn)
         preview_layout.addLayout(export_row)
 
-        splitter.addWidget(self.images_panel)
-        splitter.addWidget(self.palette_panel)
-        splitter.addWidget(self.preview_container)
-        splitter.setSizes([250, 500, 450])
+        self._main_splitter.addWidget(self.images_panel)
+        self._main_splitter.addWidget(self.palette_panel)
+        self._main_splitter.addWidget(self.preview_container)
+        self._main_splitter.setSizes([250, 500, 450])
 
         container = QWidget()
         layout = QHBoxLayout(container)
-        layout.addWidget(splitter)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        layout.addWidget(self._main_splitter)
         self.setCentralWidget(container)
+        self._build_menu_bar()
         self.statusBar().showMessage("Ready")
         if DEBUG_LOG_PATH:
             self.statusBar().showMessage(f"Debug log: {DEBUG_LOG_PATH}", 5000)
@@ -3537,7 +4487,7 @@ class SpriteToolsWindow(QMainWindow):
         self._update_loaded_count()
         self._setup_history_manager()
         self._install_shortcuts()
-        self._load_ui_settings()
+        self._load_persistent_ui_state()
         self._reset_history()
 
     def _get_pref_bool(self, key: str, default: bool) -> bool:
@@ -3565,6 +4515,241 @@ class SpriteToolsWindow(QMainWindow):
     def _set_pref(self, key: str, value: Any) -> None:
         self._settings.setValue(key, value)
 
+    def _build_menu_bar(self) -> None:
+        menu_bar = self.menuBar()
+        menu_bar.clear()
+        menu_bar.setStyleSheet(
+            "QMenuBar { padding: 0px 0px 0px 6px; margin: 0px; }"
+            "QMenuBar::item { padding: 1px 7px; margin: 0px; }"
+        )
+        file_menu = menu_bar.addMenu("&File")
+        file_menu.addAction(self.action_import_sprites)
+        file_menu.addSeparator()
+        file_menu.addAction(self.action_new_project)
+        file_menu.addAction(self.action_open_project)
+        self._recent_projects_menu = file_menu.addMenu("Open &Recent")
+        self._recent_projects_menu.aboutToShow.connect(self._populate_recent_projects_menu)
+        file_menu.addSeparator()
+        file_menu.addAction(self.action_save_project)
+        file_menu.addAction(self.action_save_project_as)
+        file_menu.addSeparator()
+        file_menu.addAction(self.action_exit)
+
+        edit_menu = menu_bar.addMenu("&Edit")
+        edit_menu.addAction(self.action_keyboard_shortcuts)
+
+    def _populate_recent_projects_menu(self) -> None:
+        menu = self._recent_projects_menu
+        if menu is None:
+            return
+        menu.clear()
+        recent_paths = self._recent_project_manifest_paths()
+        if not recent_paths:
+            empty_action = menu.addAction("(No Recent Projects)")
+            empty_action.setEnabled(False)
+            clear_action = menu.addAction("Clear Recent List")
+            clear_action.setEnabled(False)
+            return
+        for manifest_path in recent_paths:
+            root = manifest_path.parent
+            label = f"{root.name} — {manifest_path.as_posix()}"
+            action = menu.addAction(label)
+            action.triggered.connect(lambda checked=False, value=manifest_path: self._open_project_from_path(value))
+        menu.addSeparator()
+        clear_action = menu.addAction("Clear Recent List")
+        clear_action.triggered.connect(self._clear_recent_projects)
+
+    def _clear_recent_projects(self) -> None:
+        self._set_recent_project_manifest_paths([])
+        self.statusBar().showMessage("Cleared recent project list", 2500)
+        self._update_project_action_buttons()
+
+    def _binding_entries_for_dialog(self) -> List[Dict[str, str]]:
+        entries: List[Dict[str, str]] = []
+        for binding_key, action, default_shortcut in self._action_shortcut_registry:
+            entries.append(
+                {
+                    "id": binding_key,
+                    "label": action.text().replace("&", ""),
+                    "default": default_shortcut,
+                    "current": self._get_key_binding(binding_key, default_shortcut),
+                }
+            )
+
+        undo_default = QKeySequence(QKeySequence.StandardKey.Undo).toString() or "Ctrl+Z"
+        redo_default = QKeySequence(QKeySequence.StandardKey.Redo).toString() or "Ctrl+Y"
+        entries.append(
+            {
+                "id": "edit/undo",
+                "label": "Undo",
+                "default": undo_default,
+                "current": self._get_key_binding("edit/undo", undo_default),
+            }
+        )
+        entries.append(
+            {
+                "id": "edit/redo",
+                "label": "Redo",
+                "default": redo_default,
+                "current": self._get_key_binding("edit/redo", redo_default),
+            }
+        )
+        entries.append(
+            {
+                "id": "merge.apply",
+                "label": "Merge Mode: Apply Merge",
+                "default": "A",
+                "current": self._get_key_binding("merge.apply", "A"),
+            }
+        )
+        entries.append(
+            {
+                "id": "merge.tag_source",
+                "label": "Merge Mode: Tag Selected as Source",
+                "default": "S",
+                "current": self._get_key_binding("merge.tag_source", "S"),
+            }
+        )
+        entries.append(
+            {
+                "id": "merge.tag_destination",
+                "label": "Merge Mode: Tag Current as Destination",
+                "default": "D",
+                "current": self._get_key_binding("merge.tag_destination", "D"),
+            }
+        )
+        entries.append(
+            {
+                "id": "merge.clear_roles",
+                "label": "Merge Mode: Clear Source/Destination",
+                "default": "C",
+                "current": self._get_key_binding("merge.clear_roles", "C"),
+            }
+        )
+        entries.append(
+            {
+                "id": "merge.clear_all",
+                "label": "Merge Mode: Clear All Selections",
+                "default": "Shift+C",
+                "current": self._get_key_binding("merge.clear_all", "Shift+C"),
+            }
+        )
+        entries.append(
+            {
+                "id": "merge.scope_global",
+                "label": "Merge Mode: Scope Global",
+                "default": "Alt+1",
+                "current": self._get_key_binding("merge.scope_global", "Alt+1"),
+            }
+        )
+        entries.append(
+            {
+                "id": "merge.scope_group",
+                "label": "Merge Mode: Scope Group",
+                "default": "Alt+2",
+                "current": self._get_key_binding("merge.scope_group", "Alt+2"),
+            }
+        )
+        entries.append(
+            {
+                "id": "merge.scope_local",
+                "label": "Merge Mode: Scope Local",
+                "default": "Alt+3",
+                "current": self._get_key_binding("merge.scope_local", "Alt+3"),
+            }
+        )
+        entries.append(
+            {
+                "id": "merge.view_settings",
+                "label": "Merge Mode: Open View Settings",
+                "default": "V",
+                "current": self._get_key_binding("merge.view_settings", "V"),
+            }
+        )
+        entries.append(
+            {
+                "id": "merge.close",
+                "label": "Merge Mode: Close Dialog",
+                "default": "Escape",
+                "current": self._get_key_binding("merge.close", "Escape"),
+            }
+        )
+        return entries
+
+    def _open_keybindings_dialog(self) -> None:
+        dialog = KeybindingsDialog(self._binding_entries_for_dialog(), self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        for binding_key, sequence in dialog.bindings().items():
+            self._set_pref(f"bindings/{binding_key}", sequence)
+        self._settings.sync()
+        self._apply_configured_shortcuts()
+        self.statusBar().showMessage("Keyboard shortcuts updated", 2500)
+
+    def _save_window_ui_settings(self) -> None:
+        self._set_pref("window/geometry", self.saveGeometry())
+        self._set_pref("window/state", self.saveState())
+        self._set_pref("window/maximized", bool(self.isMaximized()))
+        if hasattr(self, "_main_splitter"):
+            sizes = self._main_splitter.sizes()
+            self._set_pref("window/main_splitter_sizes", ",".join(str(int(value)) for value in sizes))
+
+    def _load_window_ui_settings(self) -> None:
+        geometry = self._settings.value("window/geometry")
+        if geometry is not None:
+            try:
+                self.restoreGeometry(geometry)
+            except Exception:  # noqa: BLE001
+                logger.debug("Failed to restore main window geometry", exc_info=True)
+
+        state = self._settings.value("window/state")
+        if state is not None:
+            try:
+                self.restoreState(state)
+            except Exception:  # noqa: BLE001
+                logger.debug("Failed to restore main window state", exc_info=True)
+
+        splitter_raw = str(self._settings.value("window/main_splitter_sizes", "")).strip()
+        if splitter_raw and hasattr(self, "_main_splitter"):
+            parsed_sizes: List[int] = []
+            for token in splitter_raw.split(","):
+                try:
+                    parsed_sizes.append(max(0, int(token.strip())))
+                except ValueError:
+                    parsed_sizes.clear()
+                    break
+            if len(parsed_sizes) == self._main_splitter.count():
+                self._main_splitter.setSizes(parsed_sizes)
+
+        if self._get_pref_bool("window/maximized", False):
+            self.showMaximized()
+
+    def _save_load_mode_setting(self) -> None:
+        self._set_pref("import/load_mode", self.images_panel.selected_load_mode())
+
+    def _load_load_mode_setting(self) -> None:
+        mode_value = str(self._settings.value("import/load_mode", "detect")).strip().lower()
+        desired_mode: Literal["detect", "preserve"] = "preserve" if mode_value == "preserve" else "detect"
+        combo = self.images_panel.load_mode_combo
+        idx = combo.findData(desired_mode)
+        if idx < 0:
+            idx = 0
+        was_blocked = combo.blockSignals(True)
+        combo.setCurrentIndex(idx)
+        combo.blockSignals(was_blocked)
+        logger.debug("Loaded import mode setting mode=%s index=%s", desired_mode, idx)
+
+    def _save_persistent_ui_state(self) -> None:
+        self._save_preview_ui_settings()
+        self._save_load_mode_setting()
+        self._save_window_ui_settings()
+        self._settings.sync()
+
+    def _load_persistent_ui_state(self) -> None:
+        self._load_ui_settings()
+        self._load_load_mode_setting()
+        self._load_window_ui_settings()
+
     def _get_key_binding(self, action: str, default: str) -> str:
         value = self._settings.value(f"bindings/{action}", default)
         text = str(value).strip()
@@ -3572,10 +4757,25 @@ class SpriteToolsWindow(QMainWindow):
 
     def _save_preview_ui_settings(self) -> None:
         self._set_pref("preview/highlight_enabled", bool(self.highlight_checkbox.isChecked()))
-        self._set_pref("preview/overlay_color", f"{self._overlay_color[0]},{self._overlay_color[1]},{self._overlay_color[2]}")
-        self._set_pref("preview/overlay_alpha_min", int(self._overlay_alpha_min))
-        self._set_pref("preview/overlay_alpha_max", int(self._overlay_alpha_max))
-        self._set_pref("preview/animation_speed", float(self._animation_speed))
+        self._set_pref("preview/highlight_hover_enabled", bool(self.hover_highlight_checkbox.isChecked()))
+        self._set_pref("preview/overlay_selected_color", f"{self._selected_overlay_color[0]},{self._selected_overlay_color[1]},{self._selected_overlay_color[2]}")
+        self._set_pref("preview/overlay_selected_alpha_min", int(self._selected_overlay_alpha_min))
+        self._set_pref("preview/overlay_selected_alpha_max", int(self._selected_overlay_alpha_max))
+        self._set_pref("preview/overlay_selected_speed", float(self._selected_animation_speed))
+        self._set_pref("preview/overlay_hover_color", f"{self._hover_overlay_color[0]},{self._hover_overlay_color[1]},{self._hover_overlay_color[2]}")
+        self._set_pref("preview/overlay_hover_alpha_min", int(self._hover_overlay_alpha_min))
+        self._set_pref("preview/overlay_hover_alpha_max", int(self._hover_overlay_alpha_max))
+        self._set_pref("preview/overlay_hover_speed", float(self._hover_animation_speed))
+        self._set_pref("preview/overlay_show_both", bool(self._overlay_show_both))
+
+        # Legacy keys for backward compatibility with older builds/features.
+        self._set_pref("preview/overlay_color", f"{self._selected_overlay_color[0]},{self._selected_overlay_color[1]},{self._selected_overlay_color[2]}")
+        self._set_pref("preview/overlay_alpha_min", int(self._selected_overlay_alpha_min))
+        self._set_pref("preview/overlay_alpha_max", int(self._selected_overlay_alpha_max))
+        self._set_pref("preview/animation_speed", float(self._selected_animation_speed))
+        self._set_pref("preview/bg_transparent_enabled", bool(self._preview_bg_transparent_enabled))
+        indices_text = ",".join(str(idx) for idx in sorted(self._preview_background_indices))
+        self._set_pref("preview/bg_indices", indices_text)
 
     def _load_ui_settings(self) -> None:
         self._main_palette_columns = max(1, min(32, self._get_pref_int("palette/main_columns", self._main_palette_columns)))
@@ -3584,35 +4784,99 @@ class SpriteToolsWindow(QMainWindow):
         self._main_palette_gap = max(-8, min(20, self._get_pref_int("palette/main_gap", self._main_palette_gap)))
         self._main_palette_show_indices = self._get_pref_bool("palette/main_show_indices", self._main_palette_show_indices)
         self._main_palette_show_grid = self._get_pref_bool("palette/main_show_grid", self._main_palette_show_grid)
+        self._main_palette_show_usage_badge = self._get_pref_bool("palette/main_show_usage_badge", self._main_palette_show_usage_badge)
         self._apply_main_palette_layout_options()
 
-        color_raw = str(self._settings.value("preview/overlay_color", "255,255,255"))
-        parts = [part.strip() for part in color_raw.split(",")]
-        if len(parts) == 3:
+        legacy_color_raw = str(self._settings.value("preview/overlay_color", "255,255,255"))
+
+        def _parse_rgb(raw: str, fallback: tuple[int, int, int]) -> tuple[int, int, int]:
+            parts = [part.strip() for part in str(raw).split(",")]
+            if len(parts) != 3:
+                return fallback
             try:
                 parsed = tuple(max(0, min(255, int(part))) for part in parts)
-                if len(parsed) == 3:
-                    self._overlay_color = (parsed[0], parsed[1], parsed[2])
+                return (parsed[0], parsed[1], parsed[2])
             except ValueError:
-                pass
-        self._overlay_alpha_min = max(0, min(255, self._get_pref_int("preview/overlay_alpha_min", self._overlay_alpha_min)))
-        self._overlay_alpha_max = max(self._overlay_alpha_min, min(255, self._get_pref_int("preview/overlay_alpha_max", self._overlay_alpha_max)))
-        self._animation_speed = max(0.01, min(0.50, self._get_pref_float("preview/animation_speed", self._animation_speed)))
+                return fallback
+
+        legacy_color = _parse_rgb(legacy_color_raw, self._selected_overlay_color)
+        self._selected_overlay_color = _parse_rgb(
+            str(self._settings.value("preview/overlay_selected_color", f"{legacy_color[0]},{legacy_color[1]},{legacy_color[2]}")),
+            legacy_color,
+        )
+        self._hover_overlay_color = _parse_rgb(
+            str(self._settings.value("preview/overlay_hover_color", f"{self._selected_overlay_color[0]},{self._selected_overlay_color[1]},{self._selected_overlay_color[2]}")),
+            self._selected_overlay_color,
+        )
+
+        legacy_alpha_min = max(0, min(255, self._get_pref_int("preview/overlay_alpha_min", self._selected_overlay_alpha_min)))
+        legacy_alpha_max = max(legacy_alpha_min, min(255, self._get_pref_int("preview/overlay_alpha_max", self._selected_overlay_alpha_max)))
+        legacy_speed = max(0.01, min(0.50, self._get_pref_float("preview/animation_speed", self._selected_animation_speed)))
+
+        self._selected_overlay_alpha_min = max(0, min(255, self._get_pref_int("preview/overlay_selected_alpha_min", legacy_alpha_min)))
+        self._selected_overlay_alpha_max = max(
+            self._selected_overlay_alpha_min,
+            min(255, self._get_pref_int("preview/overlay_selected_alpha_max", legacy_alpha_max)),
+        )
+        self._selected_animation_speed = max(0.01, min(0.50, self._get_pref_float("preview/overlay_selected_speed", legacy_speed)))
+
+        self._hover_overlay_alpha_min = max(0, min(255, self._get_pref_int("preview/overlay_hover_alpha_min", self._selected_overlay_alpha_min)))
+        self._hover_overlay_alpha_max = max(
+            self._hover_overlay_alpha_min,
+            min(255, self._get_pref_int("preview/overlay_hover_alpha_max", self._selected_overlay_alpha_max)),
+        )
+        self._hover_animation_speed = max(0.01, min(0.50, self._get_pref_float("preview/overlay_hover_speed", self._selected_animation_speed)))
+
+        self._overlay_show_both = self._get_pref_bool("preview/overlay_show_both", self._overlay_show_both)
+
+        # Keep legacy aliases synced.
+        self._overlay_color = self._selected_overlay_color
+        self._overlay_alpha_min = self._selected_overlay_alpha_min
+        self._overlay_alpha_max = self._selected_overlay_alpha_max
+        self._animation_speed = self._selected_animation_speed
+        self._preview_bg_transparent_enabled = self._get_pref_bool(
+            "preview/bg_transparent_enabled",
+            self._preview_bg_transparent_enabled,
+        )
+        bg_indices_raw = str(self._settings.value("preview/bg_indices", ""))
+        parsed_indices: set[int] = set()
+        for token in re.split(r"[\s,;]+", bg_indices_raw.strip()):
+            if not token:
+                continue
+            try:
+                idx = int(token)
+            except ValueError:
+                continue
+            if 0 <= idx <= 255:
+                parsed_indices.add(idx)
+        self._preview_background_indices = parsed_indices
 
         highlight_enabled = self._get_pref_bool("preview/highlight_enabled", self.highlight_checkbox.isChecked())
+        hover_highlight_enabled = self._get_pref_bool("preview/highlight_hover_enabled", self.hover_highlight_checkbox.isChecked())
         self.highlight_checkbox.setChecked(highlight_enabled)
+        self.hover_highlight_checkbox.setChecked(hover_highlight_enabled)
         logger.debug(
-            "UI settings loaded main_cols=%s main_force=%s main_zoom=%s main_gap=%s highlight=%s overlay_color=%s alpha_min=%s alpha_max=%s speed=%.2f",
+            "UI settings loaded main_cols=%s main_force=%s main_zoom=%s main_gap=%s highlight_sel=%s highlight_hover=%s selected_overlay=%s/%s-%s@%.2f hover_overlay=%s/%s-%s@%.2f show_both=%s bg_transparent=%s bg_indices=%s",
             self._main_palette_columns,
             self._main_palette_force_columns,
             self._main_palette_zoom,
             self._main_palette_gap,
             highlight_enabled,
-            self._overlay_color,
-            self._overlay_alpha_min,
-            self._overlay_alpha_max,
-            self._animation_speed,
+            hover_highlight_enabled,
+            self._selected_overlay_color,
+            self._selected_overlay_alpha_min,
+            self._selected_overlay_alpha_max,
+            self._selected_animation_speed,
+            self._hover_overlay_color,
+            self._hover_overlay_alpha_min,
+            self._hover_overlay_alpha_max,
+            self._hover_animation_speed,
+            self._overlay_show_both,
+            self._preview_bg_transparent_enabled,
+            sorted(self._preview_background_indices)[:16],
         )
+        if hasattr(self, "background_indices_btn"):
+            self._update_background_indices_button_text()
 
     def _clear_all_sprites(self) -> None:
         """Clear all loaded sprites and reset palette."""
@@ -3629,8 +4893,13 @@ class SpriteToolsWindow(QMainWindow):
         
         if reply != QMessageBox.StandardButton.Yes:
             return
-        
+
+        self._reset_loaded_workspace()
+        logger.info("Cleared all sprites")
+
+    def _reset_loaded_workspace(self) -> None:
         self.sprite_records.clear()
+        self._load_mode_overrides.clear()
         self.images_panel.list_widget.clear()
         self.images_panel.group_list.clear()
         self.images_panel.set_loaded_count(0)
@@ -3649,10 +4918,9 @@ class SpriteToolsWindow(QMainWindow):
         self._sync_palette_model()
         self._refresh_group_overview()
         self.preview_panel.set_pixmap(None, reset_zoom=True)
-        self.status_label.setText("")
+        self.statusBar().clearMessage()
         self._update_export_buttons()
         self._reset_history()
-        logger.info("Cleared all sprites")
 
     def _prompt_and_load(self) -> None:
         file_dialog = QFileDialog(self, "Select sprite images")
@@ -3663,51 +4931,1043 @@ class SpriteToolsWindow(QMainWindow):
         paths = [Path(p) for p in file_dialog.selectedFiles()]
         self._load_images(paths)
 
+    def _new_project(self) -> None:
+        default_file = Path.cwd() / f"NewProject{_PROJECT_FOLDER_SUFFIX}"
+        target_text, _ = QFileDialog.getSaveFileName(
+            self,
+            "New Project",
+            str(default_file),
+            f"SpriteTools Project Folder (*{_PROJECT_FOLDER_SUFFIX});;Legacy Project Folder (*{_PROJECT_LEGACY_FOLDER_SUFFIX})",
+        )
+        if not target_text:
+            return
+        project_root = self._normalize_project_root(Path(target_text), selected_is_parent=False)
+        if project_root.exists() and any(project_root.iterdir()):
+            QMessageBox.warning(
+                self,
+                "Create Project",
+                (
+                    "New Project requires an empty target folder for a clean workspace.\n\n"
+                    f"Selected folder is not empty:\n{project_root}"
+                ),
+            )
+            return
+        if self.sprite_records:
+            reply = QMessageBox.question(
+                self,
+                "Create Project",
+                "Creating a new project will clear currently loaded sprites and start clean. Continue?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+        self._reset_loaded_workspace()
+        try:
+            paths, manifest = self._project_service.create_project(project_root, project_name=project_root.stem, mode="managed")
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, "Create Project", f"Failed to create project:\n{exc}")
+            return
+        self._activate_project(paths, manifest)
+        self._remember_recent_project(paths.manifest)
+        self._update_project_action_buttons()
+        self.statusBar().showMessage(f"Created project: {manifest.project_name}", 5000)
+
+    def _open_project(self) -> None:
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Open SpriteTools Project",
+            str(Path.cwd()),
+            f"SpriteTools Project ({PROJECT_MANIFEST_NAME})",
+        )
+        if not file_path:
+            return
+        self._open_project_from_path(Path(file_path))
+
+    def _open_recent_project(self) -> None:
+        recent_paths = self._recent_project_manifest_paths()
+        if not recent_paths:
+            QMessageBox.information(self, "Open Recent", "No recent projects found.")
+            return
+
+        display_items: List[str] = []
+        display_to_path: Dict[str, Path] = {}
+        for manifest_path in recent_paths:
+            root = manifest_path.parent
+            label = f"{root.name} — {manifest_path.as_posix()}"
+            display_items.append(label)
+            display_to_path[label] = manifest_path
+
+        selected, accepted = QInputDialog.getItem(
+            self,
+            "Open Recent Project",
+            "Recent projects:",
+            display_items,
+            0,
+            False,
+        )
+        if not accepted or not selected:
+            return
+        chosen_path = display_to_path.get(selected)
+        if chosen_path is None:
+            return
+        self._open_project_from_path(chosen_path)
+
+    def _open_project_from_path(self, manifest_path: Path) -> None:
+        if self.sprite_records:
+            reply = QMessageBox.question(
+                self,
+                "Open Project",
+                "Opening a project will clear currently loaded sprites. Continue?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+        try:
+            paths, manifest = self._project_service.open_project(manifest_path)
+            sprite_meta = self._project_service.load_sprite_metadata(paths)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, "Open Project", f"Failed to open project:\n{exc}")
+            return
+
+        self._recovery_source_text = None
+        manifest, sprite_meta = self._maybe_apply_autosave_recovery(paths, manifest, sprite_meta)
+
+        self._reset_loaded_workspace()
+        self._activate_project(paths, manifest)
+        self._pending_project_sprite_metadata = sprite_meta
+        self._autosave_dirty = False
+
+        resolved_entries, missing_count, relinked_count = self._resolve_project_sources_on_open(paths, manifest)
+        existing_paths: List[Path] = []
+        for entry, candidate in resolved_entries:
+            existing_paths.append(candidate)
+            self._load_mode_overrides[candidate.as_posix()] = entry.load_mode
+        if existing_paths:
+            self._load_images(existing_paths)
+        if missing_count:
+            suffix = f" (relinked {relinked_count})" if relinked_count else ""
+            self.statusBar().showMessage(f"Opened project with {missing_count} missing sprite source(s){suffix}", 5000)
+        elif relinked_count:
+            self.statusBar().showMessage(f"Opened project and relinked {relinked_count} sprite source(s)", 5000)
+        elif not existing_paths:
+            self.statusBar().showMessage("Opened project (no sprites indexed yet)", 4000)
+        self._autosave_recovery_mode = False
+        self._remember_recent_project(paths.manifest)
+        self._update_project_action_buttons()
+
+    def _resolve_project_sources_on_open(
+        self,
+        paths: ProjectPaths,
+        manifest: ProjectManifest,
+    ) -> tuple[List[tuple[ProjectSpriteEntry, Path]], int, int]:
+        resolved_entries: List[tuple[ProjectSpriteEntry, Path]] = []
+        missing_entries: List[ProjectSpriteEntry] = []
+        for entry in manifest.sprites:
+            candidate = self._project_service.source_path_for_entry(paths, entry, manifest.project_mode)
+            if candidate.exists() and candidate.is_file():
+                resolved_entries.append((entry, candidate))
+            else:
+                missing_entries.append(entry)
+        if not missing_entries:
+            return resolved_entries, 0, 0
+
+        relinked_entries, unresolved_count = self._prompt_relink_missing_sources(paths, manifest, missing_entries)
+        if relinked_entries:
+            resolved_entries.extend(relinked_entries)
+            try:
+                self._project_service.save_manifest(paths, manifest)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Failed to persist relinked project entries: %s", exc)
+        return resolved_entries, unresolved_count, len(relinked_entries)
+
+    def _prompt_relink_missing_sources(
+        self,
+        paths: ProjectPaths,
+        manifest: ProjectManifest,
+        missing_entries: Sequence[ProjectSpriteEntry],
+    ) -> tuple[List[tuple[ProjectSpriteEntry, Path]], int]:
+        reply = QMessageBox.question(
+            self,
+            "Missing Sources",
+            (
+                f"{len(missing_entries)} source sprite(s) are missing.\n"
+                "Attempt to relink by scanning a folder for matching filenames?"
+            ),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return [], len(missing_entries)
+
+        folder = QFileDialog.getExistingDirectory(self, "Select folder to scan for missing sources", str(Path.cwd()))
+        if not folder:
+            return [], len(missing_entries)
+
+        relink_map = self._build_relink_filename_index(Path(folder))
+        relinked_entries: List[tuple[ProjectSpriteEntry, Path]] = []
+        unresolved = 0
+        for entry in missing_entries:
+            source_name = Path(entry.source_path).name.lower()
+            candidates = relink_map.get(source_name, [])
+            if not candidates:
+                unresolved += 1
+                continue
+            selected = sorted(candidates, key=lambda value: (len(value.parts), str(value).lower()))[0]
+            if manifest.project_mode == "managed":
+                imported = self._project_service.import_managed_sprite(paths, selected)
+                resolved_path = imported.resolve()
+                entry.source_path = resolved_path.relative_to(paths.root).as_posix()
+            else:
+                resolved_path = selected.resolve()
+                entry.source_path = resolved_path.as_posix()
+            try:
+                entry.source_hash = self._project_service.hash_file(resolved_path)
+            except Exception:  # noqa: BLE001
+                entry.source_hash = ""
+            relinked_entries.append((entry, resolved_path))
+        return relinked_entries, unresolved
+
+    def _build_relink_filename_index(self, root: Path) -> Dict[str, List[Path]]:
+        index: Dict[str, List[Path]] = {}
+        for dir_path, _dir_names, file_names in os.walk(root):
+            for file_name in file_names:
+                candidate = Path(dir_path) / file_name
+                if not is_supported_image(candidate):
+                    continue
+                key = file_name.lower()
+                bucket = index.setdefault(key, [])
+                if len(bucket) < 8:
+                    bucket.append(candidate)
+        logger.debug("Built relink index root=%s names=%s", root, len(index))
+        return index
+
+    def _save_project(self) -> None:
+        if self._project_paths is None or self._project_manifest is None:
+            QMessageBox.information(
+                self,
+                "Save Project",
+                "No active project. Create or open a project first.",
+            )
+            return
+        if self._write_project_state(self._project_paths, self._project_manifest, context="Save Project"):
+            self.statusBar().showMessage(f"Saved project: {self._project_manifest.project_name}", 4000)
+
+    def _save_project_as(self) -> None:
+        default_file = (
+            self._project_paths.root.with_suffix(_PROJECT_FOLDER_SUFFIX)
+            if self._project_paths is not None
+            else (Path.cwd() / f"NewProject{_PROJECT_FOLDER_SUFFIX}")
+        )
+        target_text, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Project As",
+            str(default_file),
+            f"SpriteTools Project Folder (*{_PROJECT_FOLDER_SUFFIX});;Legacy Project Folder (*{_PROJECT_LEGACY_FOLDER_SUFFIX})",
+        )
+        if not target_text:
+            return
+        target_root = self._normalize_project_root(Path(target_text), selected_is_parent=False)
+        if self._project_paths is not None and target_root.resolve() == self._project_paths.root.resolve():
+            self._save_project()
+            return
+        if target_root.exists() and any(target_root.iterdir()):
+            reply = QMessageBox.question(
+                self,
+                "Save Project As",
+                f"Target folder already exists and is not empty:\n{target_root}\n\nContinue and overwrite project files?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+
+        active_manifest = self._project_manifest
+        mode: Literal["managed", "linked"] = (
+            active_manifest.project_mode if active_manifest is not None else "managed"
+        )
+        name = (active_manifest.project_name if active_manifest is not None else target_root.stem)
+        try:
+            target_paths, target_manifest = self._project_service.create_project(target_root, project_name=name, mode=mode)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, "Save Project As", f"Failed to initialize target project:\n{exc}")
+            return
+
+        if not self._write_project_state(target_paths, target_manifest, context="Save Project As"):
+            return
+
+        self._activate_project(target_paths, target_manifest)
+        self._remember_recent_project(target_paths.manifest)
+        self._update_project_action_buttons()
+        self.statusBar().showMessage(f"Saved project copy: {target_manifest.project_name}", 5000)
+
+    def _write_project_state(self, paths: ProjectPaths, manifest: ProjectManifest, context: str) -> bool:
+        snapshot = self._build_project_state_snapshot_payload(paths, manifest)
+        manifest_payload = snapshot.get("manifest", {})
+        sprite_metadata = snapshot.get("sprite_metadata", {})
+        try:
+            rebuilt_manifest = ProjectManifest.from_dict(manifest_payload if isinstance(manifest_payload, dict) else {})
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, context, f"Failed to build project state:\n{exc}")
+            return False
+
+        manifest.sprites = rebuilt_manifest.sprites
+        manifest.settings = dict(rebuilt_manifest.settings)
+
+        try:
+            self._project_service.save_manifest(paths, manifest)
+            if isinstance(sprite_metadata, dict):
+                self._project_service.save_sprite_metadata(paths, sprite_metadata)
+            else:
+                self._project_service.save_sprite_metadata(paths, {})
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, context, f"Failed to save project:\n{exc}")
+            return False
+        self._autosave_dirty = False
+        self._last_project_saved_text = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")
+        self._last_project_saved_kind = "Saved"
+        self._refresh_project_info_banner()
+        return True
+
+    def _normalize_project_root(self, selected_dir: Path, *, selected_is_parent: bool = True) -> Path:
+        candidate = selected_dir
+        lower_name = candidate.name.lower()
+        has_known_suffix = lower_name.endswith(_PROJECT_FOLDER_SUFFIX) or lower_name.endswith(_PROJECT_LEGACY_FOLDER_SUFFIX)
+        if selected_is_parent:
+            if has_known_suffix:
+                return candidate
+            return candidate / f"{candidate.name}{_PROJECT_FOLDER_SUFFIX}"
+        if has_known_suffix:
+            return candidate
+        return candidate.with_name(f"{candidate.name}{_PROJECT_FOLDER_SUFFIX}")
+
+    def _activate_project(self, paths: ProjectPaths, manifest: ProjectManifest) -> None:
+        self._project_paths = paths
+        self._project_manifest = manifest
+        self._autosave_dirty = False
+        self._autosave_last_status_ts = 0.0
+        updated_dt = self._parse_iso_utc(manifest.updated_at)
+        if updated_dt is not None:
+            self._last_project_saved_text = updated_dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")
+            self._last_project_saved_kind = "Saved"
+        else:
+            self._last_project_saved_text = None
+            self._last_project_saved_kind = None
+        output_value = str(manifest.settings.get("output_dir", "exports/renders")).strip()
+        output_candidate = (paths.root / output_value).resolve()
+        if not output_candidate.exists():
+            output_candidate.mkdir(parents=True, exist_ok=True)
+        self.output_dir = output_candidate
+        self.output_dir_label.setText(str(self.output_dir))
+        load_mode_value = str(manifest.settings.get("load_mode", "detect")).strip().lower()
+        mode = "preserve" if load_mode_value == "preserve" else "detect"
+        mode_index = self.images_panel.load_mode_combo.findData(mode)
+        if mode_index >= 0:
+            blocked = self.images_panel.load_mode_combo.blockSignals(True)
+            self.images_panel.load_mode_combo.setCurrentIndex(mode_index)
+            self.images_panel.load_mode_combo.blockSignals(blocked)
+        title = f"SpriteTools GUI (prototype) - {manifest.project_name}"
+        self.setWindowTitle(title)
+        self._refresh_project_info_banner()
+        self._update_project_action_buttons()
+        self.statusBar().showMessage(f"Active project: {manifest.project_name}", 3000)
+
+    def _refresh_project_info_banner(self) -> None:
+        manifest = self._project_manifest
+        paths = self._project_paths
+        self.images_panel.set_project_info(
+            name=(manifest.project_name if manifest is not None else None),
+            mode=(manifest.project_mode if manifest is not None else None),
+            root=(paths.root if paths is not None else None),
+            dirty=bool(self._autosave_dirty),
+            last_saved_text=self._last_project_saved_text,
+            last_saved_kind=self._last_project_saved_kind,
+            recovery_source_text=self._recovery_source_text,
+        )
+
+    def _update_project_action_buttons(self) -> None:
+        has_project = (self._project_paths is not None) and (self._project_manifest is not None)
+        enabled = not self._is_loading_sprites
+        self.action_import_sprites.setEnabled(enabled)
+        self.action_new_project.setEnabled(enabled)
+        self.action_open_project.setEnabled(enabled)
+        if self._recent_projects_menu is not None:
+            self._recent_projects_menu.setEnabled(enabled)
+        self.action_save_project.setEnabled(enabled and has_project)
+        self.action_save_project_as.setEnabled(enabled)
+
+    def _recent_project_manifest_paths(self) -> List[Path]:
+        raw = self._settings.value("projects/recent_manifests", "")
+        text = str(raw or "").strip()
+        if not text:
+            return []
+        parsed: List[Path] = []
+        seen: set[str] = set()
+        for token in text.split("|"):
+            candidate = Path(token.strip())
+            if not candidate:
+                continue
+            key = candidate.as_posix().lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            if candidate.exists() and candidate.is_file() and candidate.name == PROJECT_MANIFEST_NAME:
+                parsed.append(candidate)
+        if len(parsed) < len([token for token in text.split("|") if token.strip()]):
+            self._set_recent_project_manifest_paths(parsed)
+        return parsed[:_RECENT_PROJECTS_LIMIT]
+
+    def _set_recent_project_manifest_paths(self, manifests: Sequence[Path]) -> None:
+        normalized: List[str] = []
+        seen: set[str] = set()
+        for path in manifests:
+            key = path.as_posix().lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            normalized.append(path.as_posix())
+            if len(normalized) >= _RECENT_PROJECTS_LIMIT:
+                break
+        self._set_pref("projects/recent_manifests", "|".join(normalized))
+
+    def _remember_recent_project(self, manifest_path: Path) -> None:
+        if not manifest_path.exists() or manifest_path.name != PROJECT_MANIFEST_NAME:
+            return
+        recent = self._recent_project_manifest_paths()
+        fresh: List[Path] = [manifest_path]
+        for existing in recent:
+            if existing.resolve() == manifest_path.resolve():
+                continue
+            fresh.append(existing)
+        self._set_recent_project_manifest_paths(fresh)
+
+    def _ordered_sprite_keys(self) -> List[str]:
+        keys: List[str] = []
+        for row in range(self.images_panel.list_widget.count()):
+            item = self.images_panel.list_widget.item(row)
+            if item is None:
+                continue
+            key = item.data(Qt.ItemDataRole.UserRole)
+            if isinstance(key, str) and key:
+                keys.append(key)
+        return keys
+
+    def _is_path_within(self, path: Path, parent: Path) -> bool:
+        try:
+            path.resolve().relative_to(parent.resolve())
+            return True
+        except ValueError:
+            return False
+
+    def _replace_record_path(self, old_path: Path, new_path: Path) -> None:
+        old_key = old_path.as_posix()
+        new_key = new_path.as_posix()
+        if old_key == new_key:
+            return
+        record = self.sprite_records.pop(old_key, None)
+        if record is None:
+            return
+        self.sprite_records[new_key] = record
+        if old_key in self._used_index_cache:
+            self._used_index_cache[new_key] = self._used_index_cache.pop(old_key)
+        if record.group_id:
+            group = self._palette_groups.get(record.group_id)
+            if group is not None:
+                if old_key in group.member_keys:
+                    group.member_keys.remove(old_key)
+                group.member_keys.add(new_key)
+        list_widget = self.images_panel.list_widget
+        for row in range(list_widget.count()):
+            item = list_widget.item(row)
+            if item is None:
+                continue
+            if item.data(Qt.ItemDataRole.UserRole) == old_key:
+                item.setData(Qt.ItemDataRole.UserRole, new_key)
+                item.setData(_SPRITE_BASE_NAME_ROLE, new_path.name)
+                item.setText(new_path.name)
+                break
+
+    def _project_output_dir_setting(self, paths: ProjectPaths) -> str:
+        try:
+            return self.output_dir.resolve().relative_to(paths.root).as_posix()
+        except ValueError:
+            return self.output_dir.resolve().as_posix()
+
+    def _mark_project_dirty(self, reason: str, *, debounce_ms: int = 1800) -> None:
+        if not self._autosave_enabled or self._autosave_recovery_mode:
+            return
+        if self._project_paths is None or self._project_manifest is None:
+            return
+        self._autosave_dirty = True
+        self._refresh_project_info_banner()
+        logger.debug("Project marked dirty reason=%s", reason)
+        if debounce_ms <= 0:
+            self._perform_autosave()
+            return
+        self._autosave_debounce_timer.start(max(200, int(debounce_ms)))
+
+    def _show_autosave_status(self, message: str, *, is_error: bool = False) -> None:
+        now = time.perf_counter()
+        min_interval = 5.0 if is_error else 20.0
+        if (now - self._autosave_last_status_ts) < min_interval:
+            return
+        self._autosave_last_status_ts = now
+        self.statusBar().showMessage(message, 2500 if not is_error else 4500)
+
+    def _autosave_snapshot_path(self, paths: ProjectPaths) -> Path:
+        return paths.backups / "autosave" / "autosave_latest.json"
+
+    def _autosave_snapshot_timestamp_path(self, paths: ProjectPaths) -> Path:
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        return paths.backups / "autosave" / f"autosave_{stamp}.json"
+
+    def _perform_autosave(self) -> None:
+        if not self._autosave_enabled or self._autosave_recovery_mode:
+            return
+        if not self._autosave_dirty:
+            return
+        if self._is_loading_sprites:
+            return
+        if self._project_paths is None or self._project_manifest is None:
+            return
+        try:
+            snapshot_payload = self._build_project_state_snapshot_payload(self._project_paths, self._project_manifest)
+            autosave_dir = self._project_paths.backups / "autosave"
+            autosave_dir.mkdir(parents=True, exist_ok=True)
+            latest_path = self._autosave_snapshot_path(self._project_paths)
+            latest_path.write_text(json.dumps(snapshot_payload, indent=2), encoding="utf-8")
+            rolling_path = self._autosave_snapshot_timestamp_path(self._project_paths)
+            rolling_path.write_text(json.dumps(snapshot_payload, indent=2), encoding="utf-8")
+            self._prune_autosave_snapshots(autosave_dir)
+            self._autosave_dirty = False
+            self._last_project_saved_text = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")
+            self._last_project_saved_kind = "Autosaved"
+            self._refresh_project_info_banner()
+            logger.debug("Autosave snapshot written path=%s", latest_path)
+            self._show_autosave_status("Project autosaved")
+        except Exception as exc:  # noqa: BLE001
+            now = time.perf_counter()
+            if now - self._autosave_last_error_ts > 5.0:
+                self._autosave_last_error_ts = now
+                logger.warning("Autosave failed: %s", exc)
+                self._show_autosave_status("Autosave failed (see log)", is_error=True)
+
+    def _prune_autosave_snapshots(self, autosave_dir: Path) -> None:
+        snapshots = sorted(autosave_dir.glob("autosave_*.json"), key=lambda path: path.stat().st_mtime, reverse=True)
+        for extra in snapshots[self._autosave_roll_limit :]:
+            try:
+                extra.unlink(missing_ok=True)
+            except Exception:  # noqa: BLE001
+                continue
+
+    def _build_project_state_snapshot_payload(self, paths: ProjectPaths, manifest: ProjectManifest) -> Dict[str, Any]:
+        entries: List[ProjectSpriteEntry] = []
+        metadata_payload: Dict[str, Dict[str, Any]] = {}
+        for key in self._ordered_sprite_keys():
+            record = self.sprite_records.get(key)
+            if record is None:
+                continue
+            source_path = record.path
+            if manifest.project_mode == "managed" and not self._is_path_within(source_path, paths.sources_sprites):
+                source_path = self._project_service.import_managed_sprite(paths, source_path)
+                self._replace_record_path(record.path, source_path)
+                record.path = source_path
+            if manifest.project_mode == "managed":
+                relative_source = source_path.resolve().relative_to(paths.root).as_posix()
+            else:
+                relative_source = source_path.resolve().as_posix()
+            source_hash = ""
+            try:
+                source_hash = self._project_service.hash_file(source_path)
+            except Exception:  # noqa: BLE001
+                source_hash = ""
+            entries.append(
+                ProjectSpriteEntry(
+                    sprite_id=relative_source,
+                    source_path=relative_source,
+                    load_mode=record.load_mode,
+                    source_hash=source_hash,
+                )
+            )
+            metadata_payload[relative_source] = self._sprite_metadata_from_record(record)
+
+        manifest_payload = {
+            "schema_version": int(manifest.schema_version),
+            "project_name": str(manifest.project_name),
+            "project_mode": str(manifest.project_mode),
+            "created_at": str(manifest.created_at),
+            "updated_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+            "source_index": [entry.to_dict() for entry in entries],
+            "settings": {
+                **dict(manifest.settings),
+                "load_mode": self.images_panel.selected_load_mode(),
+                "output_dir": self._project_output_dir_setting(paths),
+            },
+        }
+        return {
+            "autosave_schema": 1,
+            "saved_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+            "project_root": paths.root.as_posix(),
+            "manifest": manifest_payload,
+            "sprite_metadata": metadata_payload,
+        }
+
+    def _load_latest_autosave_payload(self, paths: ProjectPaths) -> Dict[str, Any] | None:
+        latest_path = self._autosave_snapshot_path(paths)
+        if not latest_path.exists():
+            return None
+        try:
+            payload = json.loads(latest_path.read_text(encoding="utf-8"))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to read autosave payload: %s", exc)
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    def _parse_iso_utc(self, raw: str) -> datetime | None:
+        text = str(raw).strip()
+        if not text:
+            return None
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        try:
+            return datetime.fromisoformat(text)
+        except ValueError:
+            return None
+
+    def _maybe_apply_autosave_recovery(
+        self,
+        paths: ProjectPaths,
+        manifest: ProjectManifest,
+        sprite_meta: Dict[str, Dict[str, Any]],
+    ) -> tuple[ProjectManifest, Dict[str, Dict[str, Any]]]:
+        payload = self._load_latest_autosave_payload(paths)
+        if payload is None:
+            return manifest, sprite_meta
+        manifest_payload = payload.get("manifest")
+        autosave_meta = payload.get("sprite_metadata")
+        if not isinstance(manifest_payload, dict) or not isinstance(autosave_meta, dict):
+            return manifest, sprite_meta
+
+        autosave_dt = self._parse_iso_utc(payload.get("saved_at", ""))
+        manifest_dt = self._parse_iso_utc(manifest.updated_at)
+        if autosave_dt is None:
+            return manifest, sprite_meta
+        if manifest_dt is not None and autosave_dt <= manifest_dt:
+            return manifest, sprite_meta
+
+        autosave_sources = manifest_payload.get("source_index", []) if isinstance(manifest_payload, dict) else []
+        autosave_count = len(autosave_sources) if isinstance(autosave_sources, list) else 0
+        current_count = len(manifest.sprites)
+        autosave_text = autosave_dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")
+        manifest_text = (
+            manifest_dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")
+            if manifest_dt is not None
+            else "unknown"
+        )
+
+        reply = QMessageBox.question(
+            self,
+            "Autosave Recovery",
+            (
+                "A newer autosave snapshot was found for this project.\n\n"
+                f"Autosave: {autosave_text} (sprites: {autosave_count})\n"
+                f"Project file: {manifest_text} (sprites: {current_count})\n\n"
+                "Restore autosave state now?"
+            ),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return manifest, sprite_meta
+
+        try:
+            recovered_manifest = ProjectManifest.from_dict(manifest_payload)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Autosave manifest recovery failed: %s", exc)
+            return manifest, sprite_meta
+
+        self._recovery_source_text = f"Autosave snapshot ({autosave_text})"
+
+        normalized_meta: Dict[str, Dict[str, Any]] = {}
+        for key, value in autosave_meta.items():
+            if isinstance(key, str) and isinstance(value, dict):
+                normalized_meta[key] = value
+        self._autosave_recovery_mode = True
+        return recovered_manifest, normalized_meta
+
+    def _sprite_metadata_from_record(self, record: SpriteRecord) -> Dict[str, Any]:
+        local_overrides: Dict[str, Dict[str, Any]] = {}
+        for idx, payload in record.local_overrides.items():
+            color, alpha = payload
+            local_overrides[str(int(idx))] = {
+                "color": [int(color[0]), int(color[1]), int(color[2])],
+                "alpha": int(alpha),
+            }
+        return {
+            "offset_x": int(record.offset_x),
+            "offset_y": int(record.offset_y),
+            "canvas_width": int(record.canvas_width),
+            "canvas_height": int(record.canvas_height),
+            "canvas_override_enabled": bool(record.canvas_override_enabled),
+            "local_overrides": local_overrides,
+        }
+
+    def _apply_project_metadata_to_loaded_records(self) -> None:
+        if not self._pending_project_sprite_metadata:
+            return
+        metadata = self._pending_project_sprite_metadata
+        self._pending_project_sprite_metadata = None
+        if self._project_paths is None:
+            return
+        applied = 0
+        for key, record in self.sprite_records.items():
+            try:
+                rel = record.path.resolve().relative_to(self._project_paths.root).as_posix()
+            except ValueError:
+                rel = record.path.resolve().as_posix()
+            payload = metadata.get(rel)
+            if not isinstance(payload, dict):
+                continue
+            record.offset_x = int(payload.get("offset_x", record.offset_x))
+            record.offset_y = int(payload.get("offset_y", record.offset_y))
+            record.canvas_width = int(payload.get("canvas_width", record.canvas_width))
+            record.canvas_height = int(payload.get("canvas_height", record.canvas_height))
+            record.canvas_override_enabled = bool(payload.get("canvas_override_enabled", record.canvas_override_enabled))
+            local_overrides = payload.get("local_overrides", {})
+            parsed_overrides: Dict[int, Tuple[ColorTuple, int]] = {}
+            if isinstance(local_overrides, dict):
+                for idx_text, value in local_overrides.items():
+                    if not isinstance(value, dict):
+                        continue
+                    try:
+                        idx = int(idx_text)
+                        color_raw = value.get("color", [0, 0, 0])
+                        if not isinstance(color_raw, (list, tuple)) or len(color_raw) < 3:
+                            continue
+                        color: ColorTuple = (
+                            max(0, min(255, int(color_raw[0]))),
+                            max(0, min(255, int(color_raw[1]))),
+                            max(0, min(255, int(color_raw[2]))),
+                        )
+                        alpha = max(0, min(255, int(value.get("alpha", 255))))
+                        parsed_overrides[idx] = (color, alpha)
+                    except (TypeError, ValueError):
+                        continue
+            record.local_overrides = parsed_overrides
+            applied += 1
+        if applied:
+            self._refresh_palette_for_current_selection()
+            self._update_canvas_inputs()
+            self._update_sprite_offset_controls(self._current_record())
+            self._schedule_preview_update()
+
     def _on_load_mode_changed(self, _index: int) -> None:
         mode = self.images_panel.selected_load_mode()
+        self._save_load_mode_setting()
         logger.info("Load mode changed to %s (applies to future imports only)", mode)
         self.statusBar().showMessage(f"Load mode set to {mode} (next imports)", 2500)
 
     def _load_images(self, paths: Sequence[Path]) -> None:
-        added = 0
-        list_widget = self.images_panel.list_widget
-        had_selection = list_widget.currentRow() >= 0
-        starting_count = list_widget.count()
-        load_mode = self.images_panel.selected_load_mode()
-        logger.debug("Load images mode=%s count=%s", load_mode, len(paths))
-        for path in paths:
-            if path.as_posix() in self.sprite_records:
-                continue
-            record = self._create_record(path, load_mode=load_mode)
-            if record is None:
-                continue
-            key = path.as_posix()
-            self.sprite_records[key] = record
-            self._assign_record_group(key, record)
-            self._merge_record_palette(record)
-            item = QListWidgetItem(path.name)
-            icon_pixmap = record.pixmap.scaled(
-                QSize(48, 48), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation
+        prepared_paths = self._prepare_paths_for_load(paths)
+        queue_candidates = [path for path in prepared_paths if path.as_posix() not in self.sprite_records]
+        if not queue_candidates:
+            self.statusBar().showMessage("No new images loaded", 3000)
+            return
+
+        if self._load_timer.isActive():
+            for path in queue_candidates:
+                self._load_queue.append(path)
+            self._load_total_count += len(queue_candidates)
+            self.statusBar().showMessage(
+                f"Queued {len(queue_candidates)} more image(s) ({self._load_added_count}/{self._load_total_count} loaded)",
+                3000,
             )
-            item.setIcon(QIcon(icon_pixmap))
-            item.setData(Qt.ItemDataRole.UserRole, path.as_posix())
-            item.setData(_SPRITE_BASE_NAME_ROLE, path.name)
-            list_widget.addItem(item)
-            added += 1
+            logger.debug("Extended active load queue added=%s total=%s", len(queue_candidates), self._load_total_count)
+            return
+
+        list_widget = self.images_panel.list_widget
+        self._load_had_selection = list_widget.currentRow() >= 0
+        self._load_starting_count = list_widget.count()
+        current_item = list_widget.currentItem()
+        self._load_selected_key_before = (
+            str(current_item.data(Qt.ItemDataRole.UserRole))
+            if current_item is not None and current_item.data(Qt.ItemDataRole.UserRole)
+            else None
+        )
+        self._load_mode_in_progress = self.images_panel.selected_load_mode()
+        self._load_added_count = 0
+        self._load_failed_count = 0
+        self._load_total_count = len(queue_candidates)
+        self._load_queue.clear()
+        for path in queue_candidates:
+            self._load_queue.append(path)
+
+        logger.debug("Load images queued mode=%s count=%s", self._load_mode_in_progress, self._load_total_count)
+        self._set_loading_state(True)
+        self.statusBar().showMessage(
+            f"Loading {self._load_total_count} image(s) in background-safe batches...",
+            3000,
+        )
+        self._load_timer.start()
+
+    def _prepare_paths_for_load(self, paths: Sequence[Path]) -> List[Path]:
+        normalized: List[Path] = []
+        seen: set[str] = set()
+        managed_project_active = (
+            self._project_paths is not None
+            and self._project_manifest is not None
+            and self._project_manifest.project_mode == "managed"
+        )
+        copied_count = 0
+
+        for raw_path in paths:
+            path = Path(raw_path)
+            candidate = path
+            if managed_project_active and self._project_paths is not None:
+                if not self._is_path_within(path, self._project_paths.sources_sprites):
+                    try:
+                        imported = self._project_service.import_managed_sprite(self._project_paths, path)
+                        candidate = imported
+                        copied_count += 1
+                    except Exception as exc:  # noqa: BLE001
+                        QMessageBox.warning(
+                            self,
+                            "Import Sprite",
+                            f"Failed to copy {path.name} into project sources:\n{exc}",
+                        )
+                        continue
+            key = candidate.as_posix()
+            if key in seen:
+                continue
+            seen.add(key)
+            normalized.append(candidate)
+
+        if copied_count:
+            self.statusBar().showMessage(
+                f"Copied {copied_count} sprite(s) into project sources",
+                3500,
+            )
+        return normalized
+
+    def _process_load_queue_tick(self) -> None:
+        if not self._load_queue:
+            self._load_timer.stop()
+            self._finalize_load_batch()
+            return
+
+        load_mode = self._load_mode_in_progress or self.images_panel.selected_load_mode()
+        chunk_size = 6 if load_mode == "detect" else 16
+        list_widget = self.images_panel.list_widget
+        processed_this_tick = 0
+        blocked = list_widget.blockSignals(True)
+
+        try:
+            while processed_this_tick < chunk_size and self._load_queue:
+                path = self._load_queue.popleft()
+                processed_this_tick += 1
+                item_mode = self._load_mode_overrides.pop(path.as_posix(), None)
+                effective_mode = item_mode or load_mode
+                record = self._create_record(path, load_mode=effective_mode)
+                if record is None:
+                    self._load_failed_count += 1
+                    continue
+                key = path.as_posix()
+                self.sprite_records[key] = record
+                self._assign_record_group(key, record)
+                self._merge_record_palette(record)
+                item = QListWidgetItem(path.name)
+                icon_pixmap = record.pixmap.scaled(
+                    QSize(48, 48), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation
+                )
+                item.setIcon(QIcon(icon_pixmap))
+                item.setData(Qt.ItemDataRole.UserRole, path.as_posix())
+                item.setData(_SPRITE_BASE_NAME_ROLE, path.name)
+                list_widget.addItem(item)
+                self._load_added_count += 1
+        finally:
+            list_widget.blockSignals(blocked)
+
+        done = self._load_total_count - len(self._load_queue)
+        self.statusBar().showMessage(
+            f"Loading sprites... {done}/{self._load_total_count} (added {self._load_added_count})",
+            1000,
+        )
+
+    def _finalize_load_batch(self) -> None:
+        list_widget = self.images_panel.list_widget
+        added = self._load_added_count
+        failed = self._load_failed_count
+
         if added:
             self._invalidate_used_index_cache("load-images")
-            self.statusBar().showMessage(f"Loaded {added} image(s)", 3000)
-            if not had_selection and list_widget.count():
-                first_new_row = max(0, starting_count)
-                list_widget.setCurrentRow(first_new_row)
+            if self._load_selected_key_before:
+                for row in range(list_widget.count()):
+                    item = list_widget.item(row)
+                    if item and item.data(Qt.ItemDataRole.UserRole) == self._load_selected_key_before:
+                        list_widget.setCurrentItem(item)
+                        break
             self._refresh_palette_for_current_selection()
-        else:
-            self.statusBar().showMessage("No new images loaded", 3000)
+
+        if added and self._pending_project_sprite_metadata:
+            self._apply_project_metadata_to_loaded_records()
+
         self._update_export_buttons()
         self._update_loaded_count()
         self._refresh_group_overview()
+
         if added:
+            message = f"Loaded {added} image(s)"
+            if failed:
+                message += f" ({failed} failed)"
+            self.statusBar().showMessage(message, 5000)
             self._reset_history()
+            self._mark_project_dirty("load-images")
+        else:
+            self.statusBar().showMessage("No new images loaded", 3000)
+
+        logger.debug(
+            "Load batch complete total=%s added=%s failed=%s mode=%s",
+            self._load_total_count,
+            added,
+            failed,
+            self._load_mode_in_progress,
+        )
+
+        self._load_mode_in_progress = None
+        self._load_mode_overrides.clear()
+        self._load_total_count = 0
+        self._load_added_count = 0
+        self._load_failed_count = 0
+        self._load_selected_key_before = None
+        self._set_loading_state(False)
+
+    def _set_loading_state(self, loading: bool) -> None:
+        if self._is_loading_sprites == loading:
+            return
+        self._is_loading_sprites = loading
+        self.images_panel.list_widget.setEnabled(not loading)
+        self.images_panel.clear_button.setEnabled(not loading)
+        self._update_project_action_buttons()
+        self.palette_list.setEnabled(not loading)
+        self.merge_button.setEnabled(not loading)
+        self.set_local_override_btn.setEnabled(not loading)
+        self.clear_local_override_btn.setEnabled(not loading)
+        self.shift_steps_spin.setEnabled(not loading)
+        self.shift_left_button.setEnabled(not loading)
+        self.shift_right_button.setEnabled(not loading)
+        if loading:
+            self.preview_panel.set_drag_mode(False)
+            self._active_offset_drag_mode = "none"
+        self._update_sprite_offset_controls(self._current_record())
+        self._update_export_buttons()
+        logger.debug("Loading state updated loading=%s", loading)
+
+    def _clear_detect_batch_jobs(self, reason: str) -> None:
+        if self._detect_batch_timer.isActive():
+            self._detect_batch_timer.stop()
+        if self._detect_batch_queue:
+            logger.debug(
+                "Cleared detect batch jobs reason=%s pending=%s done=%s total=%s",
+                reason,
+                len(self._detect_batch_queue),
+                self._detect_batch_done,
+                self._detect_batch_total,
+            )
+        self._detect_batch_queue.clear()
+        self._detect_batch_total = 0
+        self._detect_batch_done = 0
+
+    def _enqueue_detect_slot_batch_updates(
+        self,
+        records: Sequence[SpriteRecord],
+        changed_slots: Sequence[int],
+        new_color_by_slot: Dict[int, ColorTuple],
+        new_alpha_by_slot: Dict[int, int],
+        *,
+        reason: str,
+        anchor_key: str,
+    ) -> None:
+        batch_slots = [int(slot) for slot in changed_slots]
+        batch_colors = dict(new_color_by_slot)
+        batch_alphas = {int(slot): int(alpha) for slot, alpha in new_alpha_by_slot.items()}
+        for record in records:
+            key = record.path.as_posix()
+            if key == anchor_key:
+                continue
+            self._detect_batch_queue.append(
+                (
+                    "slot",
+                    key,
+                    {
+                        "slots": batch_slots,
+                        "colors": batch_colors,
+                        "alphas": batch_alphas,
+                    },
+                )
+            )
+        queued = len(self._detect_batch_queue)
+        if queued == 0:
+            return
+        self._detect_batch_total = queued
+        self._detect_batch_done = 0
+        self._detect_batch_timer.start()
+        self.statusBar().showMessage(f"Applying detect batch updates... 0/{self._detect_batch_total}", 1000)
+        logger.debug("Queued detect slot batch reason=%s jobs=%s", reason, queued)
+
+    def _enqueue_detect_remap_batch_updates(
+        self,
+        records: Sequence[SpriteRecord],
+        pixel_remap: Dict[int, int],
+        *,
+        reason: str,
+        anchor_key: str,
+    ) -> None:
+        batch_remap = {int(src): int(dst) for src, dst in pixel_remap.items()}
+        for record in records:
+            key = record.path.as_posix()
+            if key == anchor_key:
+                continue
+            self._detect_batch_queue.append(("remap", key, {"remap": batch_remap}))
+        queued = len(self._detect_batch_queue)
+        if queued == 0:
+            return
+        self._detect_batch_total = queued
+        self._detect_batch_done = 0
+        self._detect_batch_timer.start()
+        self.statusBar().showMessage(f"Applying detect batch updates... 0/{self._detect_batch_total}", 1000)
+        logger.debug("Queued detect remap batch reason=%s jobs=%s", reason, queued)
+
+    def _process_detect_batch_tick(self) -> None:
+        if not self._detect_batch_queue:
+            self._detect_batch_timer.stop()
+            self.statusBar().showMessage("Detect batch updates complete", 1200)
+            return
+
+        jobs_this_tick = 6
+        while jobs_this_tick > 0 and self._detect_batch_queue:
+            job_type, path_key, payload = self._detect_batch_queue.popleft()
+            record = self.sprite_records.get(path_key)
+            if record is None:
+                self._detect_batch_done += 1
+                jobs_this_tick -= 1
+                continue
+            if job_type == "slot":
+                self._apply_detect_slot_deltas_to_record(
+                    record,
+                    payload["slots"],
+                    payload["colors"],
+                    payload["alphas"],
+                )
+            elif job_type == "remap":
+                self._apply_detect_remap_to_record(record, payload["remap"])
+            self._detect_batch_done += 1
+            jobs_this_tick -= 1
+
+        self.statusBar().showMessage(
+            f"Applying detect batch updates... {self._detect_batch_done}/{self._detect_batch_total}",
+            1000,
+        )
 
     def _merge_record_palette(self, record: SpriteRecord) -> None:
         """Merge a sprite's palette into the unified palette and remap sprite to use unified palette."""
@@ -3878,6 +6138,7 @@ class SpriteToolsWindow(QMainWindow):
             self._palette_slot_ids = []
             self._slot_color_lookup = {}
             self.palette_list.set_colors([], emit_signal=False)
+            self._refresh_main_palette_usage_badges()
             self._update_fill_preview()
             return
         if len(self._palette_slot_ids) != len(self.palette_colors):
@@ -3896,6 +6157,7 @@ class SpriteToolsWindow(QMainWindow):
             alphas=self.palette_alphas,
             emit_signal=False,
         )
+        self._refresh_main_palette_usage_badges()
         self._rebuild_slot_color_lookup()
         self._log_palette_stats("sync")
         self._update_fill_preview()
@@ -4004,6 +6266,26 @@ class SpriteToolsWindow(QMainWindow):
             self.palette_list.set_colors([], emit_signal=False)
             self._update_fill_preview()
             return
+        group = self._palette_groups.get(record.group_id) if record.group_id else None
+        if (
+            group is not None
+            and group.mode == "detect"
+            and group.detect_palette_colors
+            and len(group.detect_palette_slot_ids) == len(group.detect_palette_colors)
+        ):
+            self._load_detect_group_palette_state(group, "sync-current-selection")
+            if len(self.palette_alphas) < len(self.palette_colors):
+                self.palette_alphas.extend([255] * (len(self.palette_colors) - len(self.palette_alphas)))
+            elif len(self.palette_alphas) > len(self.palette_colors):
+                self.palette_alphas = self.palette_alphas[: len(self.palette_colors)]
+            logger.debug(
+                "Sync detect palette from cached group state record=%s group=%s colors=%s",
+                record.path.name,
+                record.group_id,
+                len(self.palette_colors),
+            )
+            self._sync_palette_model()
+            return
         palette_info = extract_palette(record.indexed_image, include_unused=False)
         self.palette_colors = list(palette_info.colors[:256])
         self.palette_alphas = self._extract_palette_alphas_from_image(record.indexed_image, len(self.palette_colors))
@@ -4016,6 +6298,8 @@ class SpriteToolsWindow(QMainWindow):
             (len(record.indexed_image.getpalette() or []) // 3),
         )
         self._sync_palette_model()
+        if group is not None and group.mode == "detect":
+            self._store_detect_group_palette_state(group, "sync-current-selection-fallback")
 
     def _record_group_key(self, record: SpriteRecord) -> str:
         if record.load_mode == "detect":
@@ -4366,7 +6650,11 @@ class SpriteToolsWindow(QMainWindow):
             return
         dialog = MergeOperationDialog(self)
         self._merge_dialog = dialog
-        dialog.exec()
+        try:
+            dialog.exec()
+        finally:
+            if self._merge_dialog is dialog:
+                self._merge_dialog = None
 
     def _selected_group_id(self) -> str | None:
         item = self.images_panel.group_list.currentItem()
@@ -4924,6 +7212,7 @@ class SpriteToolsWindow(QMainWindow):
         self._update_loaded_count()
         self._reset_history()
         self._schedule_preview_update()
+        self._mark_project_dirty("remove-images")
 
     def _create_record(self, path: Path, load_mode: Literal["detect", "preserve"] = "detect") -> SpriteRecord | None:
         try:
@@ -4978,10 +7267,10 @@ class SpriteToolsWindow(QMainWindow):
             return working.copy(), palette.colors[:256]
 
         rgba = working.convert("RGBA")
-        ordered_colors, overflow = self._collect_unique_colors(rgba, max_colors=256)
-        if not overflow and ordered_colors:
-            logger.debug("Building exact indexed image unique_colors=%s", len(ordered_colors))
-            indexed, palette_colors = self._build_exact_indexed_image(rgba, ordered_colors)
+        ordered_entries, overflow = self._collect_unique_colors(rgba, max_colors=256)
+        if not overflow and ordered_entries:
+            logger.debug("Building exact indexed image unique_entries=%s", len(ordered_entries))
+            indexed, palette_colors = self._build_exact_indexed_image(rgba, ordered_entries)
             return indexed, palette_colors
 
         limit = self._estimate_color_budget(rgba)
@@ -5004,15 +7293,20 @@ class SpriteToolsWindow(QMainWindow):
         logger.debug("Estimated color budget unique=%s (limit=%s)", len(unique), budget)
         return budget
 
-    def _collect_unique_colors(self, image: Image.Image, max_colors: int) -> tuple[List[ColorTuple], bool]:
-        seen: Dict[ColorTuple, int] = {}
-        order: List[ColorTuple] = []
+    def _collect_unique_colors(self, image: Image.Image, max_colors: int) -> tuple[List[tuple[int, int, int, int]], bool]:
+        seen: Dict[tuple[int, int, int, int], int] = {}
+        order: List[tuple[int, int, int, int]] = []
         for pixel in image.getdata():
-            rgb = pixel[:3]
-            if rgb in seen:
+            rgba = (
+                int(pixel[0]),
+                int(pixel[1]),
+                int(pixel[2]),
+                int(pixel[3]) if len(pixel) > 3 else 255,
+            )
+            if rgba in seen:
                 continue
-            seen[rgb] = 1
-            order.append(rgb)
+            seen[rgba] = 1
+            order.append(rgba)
             if len(order) > max_colors:
                 return order, True
         return order, False
@@ -5020,21 +7314,38 @@ class SpriteToolsWindow(QMainWindow):
     def _build_exact_indexed_image(
         self,
         rgba: Image.Image,
-        palette_colors: List[ColorTuple],
+        palette_entries: List[tuple[int, int, int, int]],
     ) -> tuple[Image.Image, List[ColorTuple]]:
-        color_to_index: Dict[ColorTuple, int] = {color: idx for idx, color in enumerate(palette_colors)}
-        data = [color_to_index[pixel[:3]] for pixel in rgba.getdata()]
+        color_to_index: Dict[tuple[int, int, int, int], int] = {
+            entry: idx for idx, entry in enumerate(palette_entries)
+        }
+        data = [
+            color_to_index[(
+                int(pixel[0]),
+                int(pixel[1]),
+                int(pixel[2]),
+                int(pixel[3]) if len(pixel) > 3 else 255,
+            )]
+            for pixel in rgba.getdata()
+        ]
         indexed = Image.new("P", rgba.size)
         indexed.putdata(data)
+        palette_colors = [(entry[0], entry[1], entry[2]) for entry in palette_entries]
+        palette_alphas = [entry[3] for entry in palette_entries]
         flat_palette: List[int] = []
         for color in palette_colors:
             flat_palette.extend(color)
         if len(flat_palette) < 768:
             flat_palette.extend([0] * (768 - len(flat_palette)))
         indexed.putpalette(flat_palette)
+        if any(alpha < 255 for alpha in palette_alphas):
+            padded_alphas = palette_alphas[:256] + [255] * max(0, 256 - len(palette_alphas))
+            indexed.info["transparency"] = bytes(padded_alphas[:256])
         return indexed, palette_colors
 
     def _on_selection_changed(self, current: QListWidgetItem | None, previous: QListWidgetItem | None) -> None:
+        if self._is_loading_sprites:
+            return
         self._update_export_buttons()
         record = self._current_record()
         if record is None:
@@ -5112,6 +7423,9 @@ class SpriteToolsWindow(QMainWindow):
         self._update_canvas_inputs()
 
     def _on_palette_changed(self, colors: List[ColorTuple]) -> None:
+        if self._is_loading_sprites:
+            return
+        self._clear_detect_batch_jobs("new-palette-change")
         anchor = self._current_record()
         if anchor is not None and anchor.load_mode == "preserve":
             self._on_palette_changed_preserve(colors)
@@ -5166,8 +7480,14 @@ class SpriteToolsWindow(QMainWindow):
             if any(old_idx != new_idx for old_idx, new_idx in pixel_remap.items()):
                 logger.debug(f"Remapping pixels due to palette {reason}: {pixel_remap}")
                 targets = [member for member in self._iter_group_records(anchor) if member.load_mode == "detect"]
-                for record in targets:
-                    self._apply_detect_remap_to_record(record, pixel_remap)
+                anchor_key = anchor.path.as_posix()
+                self._apply_detect_remap_to_record(anchor, pixel_remap)
+                self._enqueue_detect_remap_batch_updates(
+                    targets,
+                    pixel_remap,
+                    reason=reason,
+                    anchor_key=anchor_key,
+                )
                 self._invalidate_used_index_cache(f"palette-remap-detect:{reason}")
 
                 logger.debug(
@@ -5201,14 +7521,22 @@ class SpriteToolsWindow(QMainWindow):
                     self._set_local_override(anchor, slot, color, alpha)
 
                 targets = [member for member in self._iter_group_records(anchor) if member.load_mode == "detect"]
+                anchor_key = anchor.path.as_posix()
                 if group_slots:
-                    for record in targets:
-                        self._apply_detect_slot_deltas_to_record(
-                            record,
-                            group_slots,
-                            new_color_by_slot,
-                            new_alpha_by_slot,
-                        )
+                    self._apply_detect_slot_deltas_to_record(
+                        anchor,
+                        group_slots,
+                        new_color_by_slot,
+                        new_alpha_by_slot,
+                    )
+                    self._enqueue_detect_slot_batch_updates(
+                        targets,
+                        group_slots,
+                        new_color_by_slot,
+                        new_alpha_by_slot,
+                        reason=reason,
+                        anchor_key=anchor_key,
+                    )
                 if local_only_slots:
                     self._apply_detect_slot_deltas_to_record(
                         anchor,
@@ -5354,12 +7682,14 @@ class SpriteToolsWindow(QMainWindow):
             self._record_history(f"palette:{reason}:preserve", force=True)
 
     def _schedule_preview_update(self, delay_ms: int = 0) -> None:
-        if delay_ms <= 0:
-            if self._preview_timer.isActive():
-                self._preview_timer.stop()
-            self._render_preview()
-        else:
-            self._preview_timer.start(delay_ms)
+        self._preview_request_serial += 1
+        effective_delay = 12 if delay_ms <= 0 else delay_ms
+        if self._preview_timer.isActive():
+            remaining = self._preview_timer.remainingTime()
+            if remaining >= 0 and remaining <= effective_delay:
+                return
+            self._preview_timer.stop()
+        self._preview_timer.start(effective_delay)
 
     def _render_preview(self) -> None:
         record = self._current_record()
@@ -5373,20 +7703,95 @@ class SpriteToolsWindow(QMainWindow):
             preserve_palette=True,
         )
         self._log_process_options("preview", options, record)
-        try:
-            processed, palette = self._process_record_image(record, options)
-        except (OSError, ValueError) as exc:
-            self.statusBar().showMessage(f"Preview failed: {exc}", 3000)
-            self.preview_panel.set_pixmap(record.pixmap, reset_zoom=True)
-            self._clear_preview_cache()
+        source = record.indexed_image.copy()
+        if record.local_overrides:
+            self._apply_overrides_to_indexed_image(source, record.local_overrides)
+        request = {
+            "id": self._preview_request_serial,
+            "record_key": record.path.as_posix(),
+            "record_name": record.path.name,
+            "source": source,
+            "options": options,
+            "started_at": time.perf_counter(),
+        }
+        self._preview_pending_request = request
+        self._kick_preview_worker()
+
+    def _kick_preview_worker(self) -> None:
+        if self._preview_future is not None and not self._preview_future.done():
             return
-        self._last_processed_indexed = processed.copy()
-        self._last_index_data = list(self._last_processed_indexed.getdata())
-        self._last_preview_rgba = processed.convert("RGBA")
-        self._last_palette_info = palette
-        self._palette_index_lookup = self._build_palette_lookup(palette)
-        self._log_palette_debug_info(palette)
-        self._update_preview_pixmap()
+        if self._preview_pending_request is None:
+            return
+        request = self._preview_pending_request
+        self._preview_pending_request = None
+        self._preview_active_request = request
+        self._preview_future = self._preview_executor.submit(
+            _process_preview_request,
+            request["source"],
+            request["options"],
+        )
+
+        def _notify_preview_done(_future: Future[tuple[Image.Image, PaletteInfo]]) -> None:
+            try:
+                self.previewFutureDone.emit()
+            except RuntimeError:
+                return
+
+        self._preview_future.add_done_callback(_notify_preview_done)
+
+    def _drain_preview_result(self) -> None:
+        future = self._preview_future
+        if future is None:
+            if self._preview_pending_request is not None:
+                self._kick_preview_worker()
+            return
+        if not future.done():
+            return
+
+        self._preview_future = None
+        request = self._preview_active_request
+        self._preview_active_request = None
+
+        try:
+            processed, palette = future.result()
+        except (OSError, ValueError) as exc:
+            if request and request.get("id") == self._preview_request_serial:
+                self.statusBar().showMessage(f"Preview failed: {exc}", 3000)
+                record = self._current_record()
+                if record is not None:
+                    self.preview_panel.set_pixmap(record.pixmap, reset_zoom=False)
+                self._clear_preview_cache()
+        else:
+            is_latest = bool(request and request.get("id") == self._preview_request_serial)
+            current = self._current_record()
+            is_current_record = bool(
+                request
+                and current is not None
+                and request.get("record_key") == current.path.as_posix()
+            )
+            if request is not None:
+                elapsed_ms = (time.perf_counter() - float(request.get("started_at", time.perf_counter()))) * 1000.0
+                logger.debug(
+                    "Preview worker result request_id=%s latest=%s current=%s elapsed_ms=%.2f",
+                    request.get("id"),
+                    is_latest,
+                    is_current_record,
+                    elapsed_ms,
+                )
+            if is_latest and is_current_record:
+                self._last_processed_indexed = processed.copy()
+                self._last_index_data = list(self._last_processed_indexed.getdata())
+                self._overlay_region_by_index = {}
+                self._overlay_region_cache_shape = None
+                self._last_preview_rgba = processed.convert("RGBA")
+                self._preview_base_pixmap = None
+                self._last_palette_info = palette
+                self._palette_index_lookup = self._build_palette_lookup(palette)
+                self._log_palette_debug_info(palette)
+                self._update_preview_pixmap()
+
+        if self._preview_pending_request is not None:
+            self._kick_preview_worker()
 
     def _current_record(self) -> SpriteRecord | None:
         current_item = self.images_panel.list_widget.currentItem()
@@ -5692,6 +8097,7 @@ class SpriteToolsWindow(QMainWindow):
             self.palette_list.set_swatch_inset(max(1, 6 - tightness))
             self.palette_list.set_show_index_labels(bool(self._main_palette_show_indices))
             self.palette_list.set_show_grid_lines(bool(self._main_palette_show_grid))
+            self._refresh_main_palette_usage_badges()
             if force_columns:
                 self.palette_list.setMinimumWidth(260)
             else:
@@ -5748,6 +8154,9 @@ class SpriteToolsWindow(QMainWindow):
         show_grid = QCheckBox("Grid")
         show_grid.setChecked(self._main_palette_show_grid)
         toggles.addWidget(show_grid)
+        show_usage = QCheckBox("Usage badge")
+        show_usage.setChecked(self._main_palette_show_usage_badge)
+        toggles.addWidget(show_usage)
         force_columns_check = QCheckBox("Force palette view columns")
         force_columns_check.setChecked(self._main_palette_force_columns)
         toggles.addWidget(force_columns_check)
@@ -5761,6 +8170,7 @@ class SpriteToolsWindow(QMainWindow):
             self._main_palette_gap = gap_spin.value()
             self._main_palette_show_indices = show_indices.isChecked()
             self._main_palette_show_grid = show_grid.isChecked()
+            self._main_palette_show_usage_badge = show_usage.isChecked()
             zoom_spin.setEnabled(not self._main_palette_force_columns)
             self._set_pref("palette/main_columns", int(self._main_palette_columns))
             self._set_pref("palette/main_force_columns", bool(self._main_palette_force_columns))
@@ -5768,6 +8178,7 @@ class SpriteToolsWindow(QMainWindow):
             self._set_pref("palette/main_gap", int(self._main_palette_gap))
             self._set_pref("palette/main_show_indices", bool(self._main_palette_show_indices))
             self._set_pref("palette/main_show_grid", bool(self._main_palette_show_grid))
+            self._set_pref("palette/main_show_usage_badge", bool(self._main_palette_show_usage_badge))
             self._apply_main_palette_layout_options()
             if self._main_palette_force_columns:
                 zoom_spin.blockSignals(True)
@@ -5779,6 +8190,7 @@ class SpriteToolsWindow(QMainWindow):
         gap_spin.valueChanged.connect(lambda _v: apply_settings())
         show_indices.toggled.connect(lambda _v: apply_settings())
         show_grid.toggled.connect(lambda _v: apply_settings())
+        show_usage.toggled.connect(lambda _v: apply_settings())
         force_columns_check.toggled.connect(lambda _v: apply_settings())
 
         close_btn = QPushButton("Close")
@@ -5792,20 +8204,41 @@ class SpriteToolsWindow(QMainWindow):
         has_records = bool(self.sprite_records)
         has_palette = bool(self.palette_colors)
         current = self._current_record()
-        self.export_selected_btn.setEnabled(current is not None)
-        self.export_all_btn.setEnabled(has_records)
-        self.export_palette_btn.setEnabled(has_palette)
-        self.output_dir_button.setEnabled(True)
+        locked = self._is_loading_sprites
+        self.export_selected_btn.setEnabled((current is not None) and not locked)
+        self.export_all_btn.setEnabled(has_records and not locked)
+        self.export_palette_btn.setEnabled(has_palette and not locked)
+        self.output_dir_button.setEnabled(not locked)
 
     def _update_loaded_count(self) -> None:
         if hasattr(self, "images_panel"):
             self.images_panel.set_loaded_count(len(self.sprite_records))
 
     def _install_shortcuts(self) -> None:
-        self._undo_shortcut = QShortcut(QKeySequence.StandardKey.Undo, self)
-        self._undo_shortcut.activated.connect(self._undo_history)
-        self._redo_shortcut = QShortcut(QKeySequence.StandardKey.Redo, self)
-        self._redo_shortcut.activated.connect(self._redo_history)
+        self._apply_configured_shortcuts()
+
+    def _apply_configured_shortcuts(self) -> None:
+        for binding_key, action, default_shortcut in self._action_shortcut_registry:
+            shortcut_text = self._get_key_binding(binding_key, default_shortcut)
+            action.setShortcut(QKeySequence(shortcut_text))
+            action.setShortcutContext(Qt.ShortcutContext.WindowShortcut)
+
+        undo_default = QKeySequence(QKeySequence.StandardKey.Undo).toString() or "Ctrl+Z"
+        redo_default = QKeySequence(QKeySequence.StandardKey.Redo).toString() or "Ctrl+Y"
+        undo_shortcut_text = self._get_key_binding("edit/undo", undo_default)
+        redo_shortcut_text = self._get_key_binding("edit/redo", redo_default)
+
+        if hasattr(self, "_undo_shortcut") and self._undo_shortcut is not None:
+            self._undo_shortcut.setKey(QKeySequence(undo_shortcut_text))
+        else:
+            self._undo_shortcut = QShortcut(QKeySequence(undo_shortcut_text), self)
+            self._undo_shortcut.activated.connect(self._undo_history)
+
+        if hasattr(self, "_redo_shortcut") and self._redo_shortcut is not None:
+            self._redo_shortcut.setKey(QKeySequence(redo_shortcut_text))
+        else:
+            self._redo_shortcut = QShortcut(QKeySequence(redo_shortcut_text), self)
+            self._redo_shortcut.activated.connect(self._redo_history)
 
     def _setup_history_manager(self) -> None:
         manager = HistoryManager()
@@ -6037,10 +8470,31 @@ class SpriteToolsWindow(QMainWindow):
         if self._history_manager is not None:
             self._history_manager.reset()
 
-    def _record_history(self, label: str, *, force: bool = False) -> None:
+    def _record_history(
+        self,
+        label: str,
+        *,
+        force: bool = False,
+        include_fields: Sequence[str] | None = None,
+    ) -> None:
         if self._history_manager is not None:
-            recorded = self._history_manager.record(label, force=force)
-            logger.debug("Record history label=%s force=%s recorded=%s", label, force, recorded)
+            started = time.perf_counter()
+            recorded = self._history_manager.record(
+                label,
+                force=force,
+                include_fields=include_fields,
+            )
+            elapsed_ms = (time.perf_counter() - started) * 1000.0
+            logger.debug(
+                "Record history label=%s force=%s fields=%s recorded=%s elapsed_ms=%.2f",
+                label,
+                force,
+                list(include_fields) if include_fields is not None else "all",
+                recorded,
+                elapsed_ms,
+            )
+            if recorded:
+                self._mark_project_dirty(f"history:{label}")
 
     def _set_combo_data(self, combo: QComboBox, data: str) -> None:
         blocked = combo.blockSignals(True)
@@ -6127,11 +8581,11 @@ class SpriteToolsWindow(QMainWindow):
     def _handle_offset_scope_change(self, _index: int) -> None:
         self._update_sprite_offset_controls(self._current_record())
         self._schedule_preview_update()
-        self._record_history("offset-scope")
+        self._record_history("offset-scope", include_fields=["offsets"])
 
     def _handle_global_offset_change(self, _value: int) -> None:
         self._schedule_preview_update()
-        self._record_history("offset-global")
+        self._record_history("offset-global", include_fields=["offsets"])
         logger.debug(
             "Updated global offset -> (%s, %s)",
             self.global_offset_x_spin.value(),
@@ -6156,7 +8610,7 @@ class SpriteToolsWindow(QMainWindow):
         record.offset_x = self.sprite_offset_x_spin.value()
         record.offset_y = self.sprite_offset_y_spin.value()
         self._schedule_preview_update()
-        self._record_history("offset-local")
+        self._record_history("offset-local", include_fields=["offsets"])
         logger.debug(f"Updated sprite offset: {record.path.name} -> ({record.offset_x}, {record.offset_y})")
 
     def _handle_group_offset_change(self, _value: int) -> None:
@@ -6167,7 +8621,7 @@ class SpriteToolsWindow(QMainWindow):
         group.offset_x = self.group_offset_x_spin.value()
         group.offset_y = self.group_offset_y_spin.value()
         self._schedule_preview_update()
-        self._record_history("offset-group")
+        self._record_history("offset-group", include_fields=["offsets"])
         logger.debug(
             "Updated group offset group=%s -> (%s, %s)",
             group.group_id,
@@ -6202,9 +8656,39 @@ class SpriteToolsWindow(QMainWindow):
         self._active_offset_drag_mode = mode
         self.preview_panel.set_drag_mode(True)
         logger.debug("Offset drag mode enabled via click mode=%s", mode)
+
+    def _handle_drag_started(self) -> None:
+        self._offset_drag_live = True
+
+    def _handle_drag_finished(self, total_dx: int, total_dy: int) -> None:
+        was_live = self._offset_drag_live
+        self._offset_drag_live = False
+        if not was_live:
+            return
+        if total_dx == 0 and total_dy == 0:
+            return
+        mode = self._active_offset_drag_mode
+        label = {
+            "global": "offset-global",
+            "group": "offset-group",
+            "individual": "offset-local",
+        }.get(mode)
+        if label is not None:
+            self._record_history(label, include_fields=["offsets"])
+        self._schedule_preview_update(delay_ms=0)
+        logger.debug(
+            "Drag finished mode=%s total_delta=(%s,%s) history_label=%s",
+            mode,
+            total_dx,
+            total_dy,
+            label,
+        )
     
     def _handle_drag_offset_changed(self, dx: int, dy: int) -> None:
         """Handle offset changes from viewport dragging."""
+        started = time.perf_counter()
+        if self._is_loading_sprites:
+            return
         if self._active_offset_drag_mode == "none":
             return
 
@@ -6217,8 +8701,11 @@ class SpriteToolsWindow(QMainWindow):
             self.global_offset_y_spin.setValue(new_y)
             self.global_offset_x_spin.blockSignals(bx)
             self.global_offset_y_spin.blockSignals(by)
-            self._handle_global_offset_change(0)
+            self._schedule_preview_update(delay_ms=16 if self._offset_drag_live else 0)
+            if not self._offset_drag_live:
+                self._record_history("offset-global", include_fields=["offsets"])
             logger.debug("Drag offset global -> (%s, %s) delta=(%s,%s) history=offset-global", new_x, new_y, dx, dy)
+            logger.debug("Drag offset commit mode=global elapsed_ms=%.2f", (time.perf_counter() - started) * 1000.0)
             return
 
         if self._active_offset_drag_mode == "group":
@@ -6234,8 +8721,11 @@ class SpriteToolsWindow(QMainWindow):
             self.group_offset_y_spin.setValue(new_y)
             self.group_offset_x_spin.blockSignals(bx)
             self.group_offset_y_spin.blockSignals(by)
-            self._handle_group_offset_change(0)
+            self._schedule_preview_update(delay_ms=16 if self._offset_drag_live else 0)
+            if not self._offset_drag_live:
+                self._record_history("offset-group", include_fields=["offsets"])
             logger.debug("Drag offset group=%s -> (%s, %s) delta=(%s,%s) history=offset-group", group.group_id, new_x, new_y, dx, dy)
+            logger.debug("Drag offset commit mode=group elapsed_ms=%.2f", (time.perf_counter() - started) * 1000.0)
             return
 
         record = self._current_record()
@@ -6254,8 +8744,9 @@ class SpriteToolsWindow(QMainWindow):
         self.sprite_offset_x_spin.blockSignals(False)
         self.sprite_offset_y_spin.blockSignals(False)
         
-        self._schedule_preview_update()
-        self._record_history("offset-local")
+        self._schedule_preview_update(delay_ms=16 if self._offset_drag_live else 0)
+        if not self._offset_drag_live:
+            self._record_history("offset-local", include_fields=["offsets"])
         logger.debug(
             "Drag offset individual record=%s -> (%s, %s) delta=(%s,%s) history=offset-local",
             record.path.name,
@@ -6264,6 +8755,7 @@ class SpriteToolsWindow(QMainWindow):
             dx,
             dy,
         )
+        logger.debug("Drag offset commit mode=individual elapsed_ms=%.2f", (time.perf_counter() - started) * 1000.0)
 
     def _update_canvas_inputs(self) -> None:
         if not hasattr(self, "canvas_width_spin"):
@@ -6331,6 +8823,164 @@ class SpriteToolsWindow(QMainWindow):
             self.fill_preview_label.setText(f"{index}: #{color[0]:02X}{color[1]:02X}{color[2]:02X}")
         else:
             self.fill_preview_label.setText(f"{index}: —")
+        self._update_background_indices_button_text()
+
+    def _refresh_main_palette_usage_badges(self) -> None:
+        if not hasattr(self, "palette_list"):
+            return
+        if self._main_palette_show_usage_badge:
+            counts = self._usage_counts_for_records(list(self.sprite_records.values()))
+            self.palette_list.set_usage_counts(counts, show_badge=True)
+        else:
+            self.palette_list.set_usage_counts({}, show_badge=False)
+
+    def _update_background_indices_button_text(self) -> None:
+        if not hasattr(self, "background_indices_btn"):
+            return
+        count = len(self._preview_background_indices)
+        if count == 0:
+            self.background_indices_btn.setText("Background Indexes...")
+        else:
+            self.background_indices_btn.setText(f"Background Indexes ({count})")
+
+    def _open_background_index_selector(self) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Background Indexes")
+        dialog.setModal(True)
+        layout = QVBoxLayout(dialog)
+
+        hint = QLabel("Select palette indexes used as background in preview options.")
+        layout.addWidget(hint)
+
+        palette_view = PaletteListView(dialog)
+        palette_view.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        palette_view.setDragDropMode(QAbstractItemView.DragDropMode.NoDragDrop)
+        palette_view.setDragEnabled(False)
+        palette_view.setAcceptDrops(False)
+        palette_view.setSpacing(max(0, self._main_palette_gap))
+        palette_view.set_cell_size(max(16, min(96, self._main_palette_zoom)))
+        palette_view.set_show_index_labels(bool(self._main_palette_show_indices))
+        palette_view.set_show_grid_lines(bool(self._main_palette_show_grid))
+        palette_view.set_usage_counts({}, show_badge=bool(self._main_palette_show_usage_badge))
+        palette_view.set_colors(
+            self.palette_colors,
+            slots=self._palette_slot_ids,
+            alphas=self.palette_alphas,
+            emit_signal=False,
+        )
+        layout.addWidget(palette_view, 1)
+
+        selection = palette_view.selectionModel()
+        if selection is not None:
+            for row in sorted(self._preview_background_indices):
+                if 0 <= row < 256:
+                    index = palette_view.model_obj.index(row)
+                    if index.isValid():
+                        selection.select(index, QItemSelectionModel.SelectionFlag.Select)
+
+        action_row = QHBoxLayout()
+        select_none_btn = QPushButton("Clear")
+        select_fill_btn = QPushButton("Use Fill Index")
+        set_selected_btn = QPushButton("Set Selected")
+        clear_selected_btn = QPushButton("Clear Selected")
+        action_row.addWidget(select_none_btn)
+        action_row.addWidget(select_fill_btn)
+        action_row.addWidget(set_selected_btn)
+        action_row.addWidget(clear_selected_btn)
+        action_row.addStretch(1)
+        layout.addLayout(action_row)
+
+        def clear_checks() -> None:
+            palette_view.clearSelection()
+
+        def apply_fill_index() -> None:
+            fill_index = self.fill_index_spin.value()
+            if not (0 <= fill_index < 256):
+                return
+            index = palette_view.model_obj.index(fill_index)
+            if not index.isValid() or palette_view.selectionModel() is None:
+                return
+            palette_view.clearSelection()
+            palette_view.selectionModel().select(index, QItemSelectionModel.SelectionFlag.Select)
+            palette_view.setCurrentIndex(index)
+
+        def set_selected() -> None:
+            selected_rows = {
+                idx.row()
+                for idx in palette_view.selectedIndexes()
+                if idx.isValid() and 0 <= idx.row() < 256
+            }
+            if not selected_rows:
+                return
+            self._preview_background_indices |= selected_rows
+            if palette_view.selectionModel() is not None:
+                palette_view.clearSelection()
+                for row in sorted(self._preview_background_indices):
+                    index = palette_view.model_obj.index(row)
+                    if index.isValid():
+                        palette_view.selectionModel().select(index, QItemSelectionModel.SelectionFlag.Select)
+
+        def clear_selected() -> None:
+            selected_rows = {
+                idx.row()
+                for idx in palette_view.selectedIndexes()
+                if idx.isValid() and 0 <= idx.row() < 256
+            }
+            if not selected_rows:
+                return
+            self._preview_background_indices -= selected_rows
+            if palette_view.selectionModel() is not None:
+                palette_view.clearSelection()
+                for row in sorted(self._preview_background_indices):
+                    index = palette_view.model_obj.index(row)
+                    if index.isValid():
+                        palette_view.selectionModel().select(index, QItemSelectionModel.SelectionFlag.Select)
+
+        select_none_btn.clicked.connect(clear_checks)
+        select_fill_btn.clicked.connect(apply_fill_index)
+        set_selected_btn.clicked.connect(set_selected)
+        clear_selected_btn.clicked.connect(clear_selected)
+
+        buttons = QHBoxLayout()
+        ok_btn = QPushButton("OK")
+        cancel_btn = QPushButton("Cancel")
+        buttons.addStretch(1)
+        buttons.addWidget(ok_btn)
+        buttons.addWidget(cancel_btn)
+        layout.addLayout(buttons)
+
+        ok_btn.clicked.connect(dialog.accept)
+        cancel_btn.clicked.connect(dialog.reject)
+
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        selected = {
+            index.row()
+            for index in palette_view.selectedIndexes()
+            if index.isValid() and 0 <= index.row() <= 255
+        }
+        self._preview_background_indices = {int(value) for value in selected}
+        self._update_background_indices_button_text()
+        self._save_preview_ui_settings()
+        self._preview_base_pixmap = None
+        self._update_preview_pixmap()
+
+    def _resolve_drag_backdrop_rgba(self) -> tuple[int, int, int, int] | None:
+        fill_mode = self._selected_fill_mode()
+        if fill_mode == "transparent":
+            return None
+        fill_index = self.fill_index_spin.value()
+        if self._preview_bg_transparent_enabled and fill_index in self._preview_background_indices:
+            return None
+        if fill_index < 0 or fill_index >= len(self.palette_colors):
+            return None
+        color = self.palette_colors[fill_index]
+        alpha = self.palette_alphas[fill_index] if 0 <= fill_index < len(self.palette_alphas) else 255
+        alpha = max(0, min(255, int(alpha)))
+        if alpha < 255:
+            return None
+        return (int(color[0]), int(color[1]), int(color[2]), alpha)
 
     def _selected_fill_mode(self) -> Literal["palette", "transparent"]:
         mode = self.fill_mode_combo.currentData()
@@ -6364,14 +9014,104 @@ class SpriteToolsWindow(QMainWindow):
         )
 
     def _invalidate_preview_cache(self, reset_zoom: bool, reason: str = "unspecified") -> None:
+        self._preview_request_serial += 1
         self._last_processed_indexed = None
         self._last_index_data = None
+        self._overlay_region_by_index = {}
+        self._overlay_region_cache_shape = None
         self._last_preview_rgba = None
+        self._preview_base_pixmap = None
+        self._last_preview_render_signature = None
         self._last_palette_info = None
         self._palette_index_lookup = {}
         if reset_zoom:
             self._reset_zoom_next = True
         logger.debug("Preview cache invalidated reset_zoom=%s reason=%s", reset_zoom, reason)
+
+    def _handle_preview_panning_changed(self, active: bool) -> None:
+        self._preview_pan_active = bool(active)
+        if self._preview_pan_active:
+            self._last_pan_overlay_refresh_ts = 0.0
+        if not self._preview_pan_active and self._preview_highlight_targets():
+            self._request_preview_pixmap_update(0)
+
+    def _request_preview_pixmap_update(self, delay_ms: int = 8) -> None:
+        delay = max(0, int(delay_ms))
+        if self._preview_pixmap_timer.isActive():
+            remaining = self._preview_pixmap_timer.remainingTime()
+            if remaining >= 0 and remaining <= delay:
+                return
+            self._preview_pixmap_timer.stop()
+        self._preview_pixmap_timer.start(delay)
+
+    def _flush_preview_pixmap_update(self) -> None:
+        self._update_preview_pixmap()
+
+    def _pan_pulse_refresh_interval(self) -> float:
+        interval = self._pan_overlay_refresh_interval_s
+        if self._last_processed_indexed is None:
+            return interval
+
+        width, height = self._last_processed_indexed.size
+        zoom = max(0.1, float(self.preview_panel.current_zoom())) if hasattr(self, "preview_panel") else 1.0
+        effective_area = int(width * zoom) * int(height * zoom)
+        if effective_area <= 256 * 256:
+            interval = 0.02
+        elif effective_area <= 512 * 512:
+            interval = 0.033
+        elif effective_area <= 1024 * 1024:
+            interval = 0.05
+        elif effective_area <= 2048 * 2048:
+            interval = 0.066
+        else:
+            interval = 0.1
+
+        if zoom >= 8.0:
+            interval = max(interval, 0.12)
+        elif zoom >= 6.0:
+            interval = max(interval, 0.085)
+
+        if self._overlay_compose_ms_ema > 0.0:
+            # Keep pulse alive but bound redraw pressure from real measured compose cost.
+            # Rough target: refresh no faster than ~2x measured compose duration.
+            interval = max(interval, min(0.2, (self._overlay_compose_ms_ema * 2.0) / 1000.0))
+        return interval
+
+    def _overlay_region_for_index(self, target_index: int, width: int, height: int, index_data: Sequence[int]) -> QRegion:
+        if target_index < 0 or width <= 0 or height <= 0:
+            return QRegion()
+
+        shape = (int(width), int(height))
+        if self._overlay_region_cache_shape != shape:
+            self._overlay_region_by_index = {}
+            self._overlay_region_cache_shape = shape
+
+        cached = self._overlay_region_by_index.get(target_index)
+        if cached is not None:
+            return cached
+
+        total = min(len(index_data), width * height)
+        region = QRegion()
+        for y in range(height):
+            row_start = y * width
+            if row_start >= total:
+                break
+            row_end = min(total, row_start + width)
+            x = row_start
+            while x < row_end:
+                if index_data[x] != target_index:
+                    x += 1
+                    continue
+                run_start = x
+                x += 1
+                while x < row_end and index_data[x] == target_index:
+                    x += 1
+                run_len = x - run_start
+                if run_len > 0:
+                    region = region.united(QRegion(run_start - row_start, y, run_len, 1))
+
+        self._overlay_region_by_index[target_index] = region
+        return region
 
     def _clear_preview_cache(self) -> None:
         self._invalidate_preview_cache(reset_zoom=True, reason="full-clear")
@@ -6379,41 +9119,178 @@ class SpriteToolsWindow(QMainWindow):
     def _on_palette_selection_changed(self, *_args) -> None:
         # Start/stop fade animation based on selection
         selected_indexes = self.palette_list.selectedIndexes()
-        logger.debug(f"Palette selection changed: {len(selected_indexes)} selected, highlight_enabled={self.highlight_checkbox.isChecked()}")
-        if selected_indexes and self.highlight_checkbox.isChecked():
-            if not self._highlight_animation_timer.isActive():
-                self._highlight_animation_phase = 0.0
-                self._highlight_animation_timer.start()
-                logger.debug("Started animation timer")
-        else:
-            self._highlight_animation_timer.stop()
-            logger.debug("Stopped animation timer")
+        logger.debug(
+            "Palette selection changed selected=%s selected_highlight=%s hover_highlight=%s",
+            len(selected_indexes),
+            self.highlight_checkbox.isChecked(),
+            self.hover_highlight_checkbox.isChecked(),
+        )
+        self._update_preview_highlight_animation_state()
+        self._last_overlay_alpha_signature = None
         
-        self._update_preview_pixmap()
+        self._request_preview_pixmap_update(0)
         self._update_selected_color_label()
         self._update_merge_button_state()
         self._highlight_sprites_for_palette_index(self._current_selected_palette_index())
 
     def _on_highlight_checkbox_toggled(self, checked: bool) -> None:
         self._set_pref("preview/highlight_enabled", bool(checked))
-        if not checked:
-            self._highlight_animation_timer.stop()
-        else:
-            if self.palette_list.selectedIndexes() and not self._highlight_animation_timer.isActive():
+        self._update_preview_highlight_animation_state()
+        self._last_overlay_alpha_signature = None
+        self._save_preview_ui_settings()
+        self._request_preview_pixmap_update(0)
+
+    def _on_hover_highlight_checkbox_toggled(self, checked: bool) -> None:
+        self._set_pref("preview/highlight_hover_enabled", bool(checked))
+        self._update_preview_highlight_animation_state()
+        self._last_overlay_alpha_signature = None
+        self._save_preview_ui_settings()
+        self._request_preview_pixmap_update(0)
+
+    def _set_preview_hover_palette_row(self, row: int | None) -> None:
+        if self._preview_hover_palette_row == row:
+            return
+        self._preview_hover_palette_row = row
+        self._update_preview_highlight_animation_state()
+        self._last_overlay_alpha_signature = None
+        self._request_preview_pixmap_update(0)
+
+    def _update_preview_highlight_animation_state(self) -> None:
+        if self._preview_highlight_targets():
+            if not self._highlight_animation_timer.isActive():
+                self._selected_highlight_animation_phase = 0.0
+                self._hover_highlight_animation_phase = 0.0
                 self._highlight_animation_phase = 0.0
+                self._last_overlay_alpha_signature = None
+                self._overlay_timer_interval_ms = self._target_overlay_timer_interval_ms()
+                self._highlight_animation_timer.setInterval(self._overlay_timer_interval_ms)
                 self._highlight_animation_timer.start()
-        self._update_preview_pixmap()
+        else:
+            self._highlight_animation_timer.stop()
+            self._last_overlay_alpha_signature = None
+
+    def _overlay_alpha_signature(self) -> tuple[Any, ...]:
+        import math
+
+        targets = self._preview_highlight_targets()
+        if not targets:
+            return ()
+
+        signature: List[tuple[str, int, int]] = []
+        quantum = max(1, int(self._overlay_alpha_quantum))
+        for mode, index, _color in targets:
+            if mode == "hover":
+                alpha_min = self._hover_overlay_alpha_min
+                alpha_max = self._hover_overlay_alpha_max
+                phase = self._hover_highlight_animation_phase
+            else:
+                alpha_min = self._selected_overlay_alpha_min
+                alpha_max = self._selected_overlay_alpha_max
+                phase = self._selected_highlight_animation_phase
+
+            fade = (math.sin(phase) + 1) / 2
+            alpha_range = max(0, int(alpha_max) - int(alpha_min))
+            animated_alpha = int(int(alpha_min) + alpha_range * fade)
+            animated_alpha = int(round(animated_alpha / quantum) * quantum)
+            animated_alpha = max(0, min(255, animated_alpha))
+            signature.append((str(mode), int(index), int(animated_alpha)))
+
+        return tuple(signature)
+
+    def _target_overlay_timer_interval_ms(self) -> int:
+        base_ms = 30
+        if self._overlay_compose_ms_ema > 0.0:
+            base_ms = max(base_ms, int(self._overlay_compose_ms_ema * 1.35))
+
+        zoom = max(0.1, float(self.preview_panel.current_zoom())) if hasattr(self, "preview_panel") else 1.0
+        if zoom >= 8.0:
+            base_ms = max(base_ms, 80)
+        elif zoom >= 6.0:
+            base_ms = max(base_ms, 66)
+        elif zoom >= 4.0:
+            base_ms = max(base_ms, 50)
+
+        if self._preview_pan_active and zoom >= 8.0:
+            base_ms = max(base_ms, 90)
+        elif self._preview_pan_active and zoom >= 6.0:
+            base_ms = max(base_ms, 75)
+        elif self._preview_pan_active and zoom >= 4.0:
+            base_ms = max(base_ms, 60)
+
+        if self._overlay_show_both and zoom >= 6.0:
+            base_ms = max(base_ms, 85)
+
+        if self._preview_pan_active:
+            base_ms = max(base_ms, int(self._pan_pulse_refresh_interval() * 1000.0))
+
+        return max(20, min(120, int(base_ms)))
     
     def _update_highlight_animation(self) -> None:
         """Update smooth fade animation for highlight."""
         import math
-        self._highlight_animation_phase += self._animation_speed  # Use configurable speed
-        if self._highlight_animation_phase > 2 * math.pi:
-            self._highlight_animation_phase -= 2 * math.pi
-        logger.debug(f"Animation phase: {self._highlight_animation_phase:.2f}")
-        self._update_preview_pixmap()
-        # Force palette view to repaint so swatches show animation
-        self.palette_list.viewport().update()
+        self._selected_highlight_animation_phase += self._selected_animation_speed
+        if self._selected_highlight_animation_phase > 2 * math.pi:
+            self._selected_highlight_animation_phase -= 2 * math.pi
+        self._hover_highlight_animation_phase += self._hover_animation_speed
+        if self._hover_highlight_animation_phase > 2 * math.pi:
+            self._hover_highlight_animation_phase -= 2 * math.pi
+        self._highlight_animation_phase = self._selected_highlight_animation_phase
+
+        new_interval = self._target_overlay_timer_interval_ms()
+        if new_interval != self._overlay_timer_interval_ms:
+            self._overlay_timer_interval_ms = new_interval
+            self._highlight_animation_timer.setInterval(new_interval)
+
+        alpha_signature = self._overlay_alpha_signature()
+        if alpha_signature == self._last_overlay_alpha_signature:
+            return
+        self._last_overlay_alpha_signature = alpha_signature
+
+        if self._preview_pan_active:
+            now = time.perf_counter()
+            if now - self._last_pan_overlay_refresh_ts >= self._pan_pulse_refresh_interval():
+                self._last_pan_overlay_refresh_ts = now
+                self._request_preview_pixmap_update(0)
+            return
+        self._request_preview_pixmap_update(0)
+
+    def _preview_highlight_targets(self) -> List[tuple[Literal["hover", "selected"], int, ColorTuple]]:
+        model = self.palette_list.model_obj
+
+        hover_target: tuple[Literal["hover", "selected"], int, ColorTuple] | None = None
+        if self.hover_highlight_checkbox.isChecked() and self._preview_hover_palette_row is not None:
+            hover_row = int(self._preview_hover_palette_row)
+            if 0 <= hover_row < 256:
+                hover_color = model.colors[hover_row]
+                if hover_color is not None:
+                    actual_hover = self.palette_colors[hover_row] if hover_row < len(self.palette_colors) else hover_color
+                    hover_target = ("hover", hover_row, actual_hover)
+
+        selected_target: tuple[Literal["hover", "selected"], int, ColorTuple] | None = None
+        if self.highlight_checkbox.isChecked():
+            index = self.palette_list.currentIndex()
+            if index.isValid() and 0 <= index.row() < 256:
+                slot_index = index.row()
+                color = model.colors[slot_index]
+                if color is not None:
+                    actual_color = self.palette_colors[slot_index] if slot_index < len(self.palette_colors) else color
+                    selected_target = ("selected", slot_index, actual_color)
+
+        if self._overlay_show_both:
+            targets: List[tuple[Literal["hover", "selected"], int, ColorTuple]] = []
+            if hover_target is not None:
+                targets.append(hover_target)
+            if selected_target is not None and (
+                hover_target is None or selected_target[1] != hover_target[1]
+            ):
+                targets.append(selected_target)
+            return targets
+
+        if hover_target is not None:
+            return [hover_target]
+        if selected_target is not None:
+            return [selected_target]
+        return []
     
     
     def _open_overlay_settings(self) -> None:
@@ -6422,90 +9299,187 @@ class SpriteToolsWindow(QMainWindow):
         dialog.setWindowTitle("Overlay Settings")
         dialog.setModal(True)
         layout = QVBoxLayout(dialog)
-        
-        # Color picker
-        color_layout = QHBoxLayout()
-        color_layout.addWidget(QLabel("Overlay Color:"))
-        color_button = QPushButton()
-        color_button.setFixedSize(60, 30)
-        color_button.setStyleSheet(f"background-color: rgb({self._overlay_color[0]}, {self._overlay_color[1]}, {self._overlay_color[2]}); border: 1px solid #888;")
-        
-        def choose_color():
-            current = QColor(*self._overlay_color)
-            result = QColorDialog.getColor(current, dialog, "Choose Overlay Color")
-            if result.isValid():
-                self._overlay_color = (result.red(), result.green(), result.blue())
-                color_button.setStyleSheet(f"background-color: rgb({result.red()}, {result.green()}, {result.blue()}); border: 1px solid #888;")
+
+        def build_overlay_group(
+            title: str,
+            color_attr: str,
+            min_attr: str,
+            max_attr: str,
+            speed_attr: str,
+        ) -> QGroupBox:
+            group = QGroupBox(title)
+            group_layout = QVBoxLayout(group)
+
+            color_layout = QHBoxLayout()
+            color_layout.addWidget(QLabel("Overlay Color:"))
+            color_button = QPushButton()
+            color_button.setFixedSize(60, 30)
+
+            def _refresh_color_button() -> None:
+                current_color = getattr(self, color_attr)
+                color_button.setStyleSheet(
+                    f"background-color: rgb({current_color[0]}, {current_color[1]}, {current_color[2]}); border: 1px solid #888;"
+                )
+
+            def _choose_color() -> None:
+                current_color = getattr(self, color_attr)
+                result = QColorDialog.getColor(QColor(*current_color), dialog, f"Choose {title} Color")
+                if not result.isValid():
+                    return
+                setattr(self, color_attr, (result.red(), result.green(), result.blue()))
+                if color_attr == "_selected_overlay_color":
+                    self._overlay_color = self._selected_overlay_color
+                _refresh_color_button()
                 self._save_preview_ui_settings()
                 self._update_preview_pixmap()
-        
-        color_button.clicked.connect(choose_color)
-        color_layout.addWidget(color_button)
-        color_layout.addStretch()
-        layout.addLayout(color_layout)
-        
-        # Min opacity
-        min_layout = QHBoxLayout()
-        min_layout.addWidget(QLabel("Min Opacity:"))
-        min_slider = QSlider(Qt.Orientation.Horizontal)
-        min_slider.setRange(0, 255)
-        min_slider.setValue(self._overlay_alpha_min)
-        min_label = QLabel(f"{int(self._overlay_alpha_min / 2.55)}%")
-        
-        def update_min(value):
-            if value > self._overlay_alpha_max:
-                value = self._overlay_alpha_max
-                min_slider.setValue(value)
-            self._overlay_alpha_min = value
-            min_label.setText(f"{int(value / 2.55)}%")
+
+            _refresh_color_button()
+            color_button.clicked.connect(_choose_color)
+            color_layout.addWidget(color_button)
+            color_layout.addStretch(1)
+            group_layout.addLayout(color_layout)
+
+            min_layout = QHBoxLayout()
+            min_layout.addWidget(QLabel("Min Opacity:"))
+            min_slider = QSlider(Qt.Orientation.Horizontal)
+            min_slider.setRange(0, 255)
+            min_slider.setValue(int(getattr(self, min_attr)))
+            min_label = QLabel(f"{int(getattr(self, min_attr) / 2.55)}%")
+
+            def _update_min(value: int) -> None:
+                max_value = int(getattr(self, max_attr))
+                if value > max_value:
+                    value = max_value
+                    min_slider.setValue(value)
+                setattr(self, min_attr, int(value))
+                min_label.setText(f"{int(value / 2.55)}%")
+                if min_attr == "_selected_overlay_alpha_min":
+                    self._overlay_alpha_min = self._selected_overlay_alpha_min
+                self._save_preview_ui_settings()
+                self._update_preview_pixmap()
+
+            min_slider.valueChanged.connect(_update_min)
+            min_layout.addWidget(min_slider)
+            min_layout.addWidget(min_label)
+            group_layout.addLayout(min_layout)
+
+            max_layout = QHBoxLayout()
+            max_layout.addWidget(QLabel("Max Opacity:"))
+            max_slider = QSlider(Qt.Orientation.Horizontal)
+            max_slider.setRange(0, 255)
+            max_slider.setValue(int(getattr(self, max_attr)))
+            max_label = QLabel(f"{int(getattr(self, max_attr) / 2.55)}%")
+
+            def _update_max(value: int) -> None:
+                min_value = int(getattr(self, min_attr))
+                if value < min_value:
+                    value = min_value
+                    max_slider.setValue(value)
+                setattr(self, max_attr, int(value))
+                max_label.setText(f"{int(value / 2.55)}%")
+                if max_attr == "_selected_overlay_alpha_max":
+                    self._overlay_alpha_max = self._selected_overlay_alpha_max
+                self._save_preview_ui_settings()
+                self._update_preview_pixmap()
+
+            max_slider.valueChanged.connect(_update_max)
+            max_layout.addWidget(max_slider)
+            max_layout.addWidget(max_label)
+            group_layout.addLayout(max_layout)
+
+            speed_layout = QHBoxLayout()
+            speed_layout.addWidget(QLabel("Animation Speed:"))
+            speed_slider = QSlider(Qt.Orientation.Horizontal)
+            speed_slider.setRange(1, 50)
+            speed_slider.setValue(int(float(getattr(self, speed_attr)) * 100))
+            speed_label = QLabel(f"{float(getattr(self, speed_attr)):.2f}x")
+
+            def _update_speed(value: int) -> None:
+                speed = max(0.01, min(0.50, value / 100.0))
+                setattr(self, speed_attr, float(speed))
+                if speed_attr == "_selected_animation_speed":
+                    self._animation_speed = self._selected_animation_speed
+                speed_label.setText(f"{speed:.2f}x")
+                self._save_preview_ui_settings()
+
+            speed_slider.valueChanged.connect(_update_speed)
+            speed_layout.addWidget(speed_slider)
+            speed_layout.addWidget(speed_label)
+            group_layout.addLayout(speed_layout)
+
+            return group
+
+        layout.addWidget(
+            build_overlay_group(
+                "Selected Overlay",
+                "_selected_overlay_color",
+                "_selected_overlay_alpha_min",
+                "_selected_overlay_alpha_max",
+                "_selected_animation_speed",
+            )
+        )
+        layout.addWidget(
+            build_overlay_group(
+                "Hover Overlay",
+                "_hover_overlay_color",
+                "_hover_overlay_alpha_min",
+                "_hover_overlay_alpha_max",
+                "_hover_animation_speed",
+            )
+        )
+
+        highlight_row = QHBoxLayout()
+        selected_toggle = QCheckBox("Highlight selected")
+        selected_toggle.setChecked(self.highlight_checkbox.isChecked())
+        hover_toggle = QCheckBox("Highlight hover")
+        hover_toggle.setChecked(self.hover_highlight_checkbox.isChecked())
+
+        def update_selected_toggle(checked: bool) -> None:
+            self.highlight_checkbox.setChecked(bool(checked))
+
+        def update_hover_toggle(checked: bool) -> None:
+            self.hover_highlight_checkbox.setChecked(bool(checked))
+
+        selected_toggle.toggled.connect(update_selected_toggle)
+        hover_toggle.toggled.connect(update_hover_toggle)
+        highlight_row.addWidget(selected_toggle)
+        highlight_row.addWidget(hover_toggle)
+        highlight_row.addStretch(1)
+        layout.addLayout(highlight_row)
+
+        show_both_toggle = QCheckBox("Show both overlays simultaneously")
+        show_both_toggle.setChecked(bool(self._overlay_show_both))
+
+        highlight_hint = QLabel()
+
+        def update_show_both(checked: bool) -> None:
+            self._overlay_show_both = bool(checked)
+            if checked:
+                highlight_hint.setText("Both enabled overlays are rendered at once (hover + selected).")
+            else:
+                highlight_hint.setText("Rule mode: hover highlight first; if not hovering, selected highlight is used.")
             self._save_preview_ui_settings()
+            self._update_preview_highlight_animation_state()
             self._update_preview_pixmap()
-        
-        min_slider.valueChanged.connect(update_min)
-        min_layout.addWidget(min_slider)
-        min_layout.addWidget(min_label)
-        layout.addLayout(min_layout)
-        
-        # Max opacity
-        max_layout = QHBoxLayout()
-        max_layout.addWidget(QLabel("Max Opacity:"))
-        max_slider = QSlider(Qt.Orientation.Horizontal)
-        max_slider.setRange(0, 255)
-        max_slider.setValue(self._overlay_alpha_max)
-        max_label = QLabel(f"{int(self._overlay_alpha_max / 2.55)}%")
-        
-        def update_max(value):
-            if value < self._overlay_alpha_min:
-                value = self._overlay_alpha_min
-                max_slider.setValue(value)
-            self._overlay_alpha_max = value
-            max_label.setText(f"{int(value / 2.55)}%")
+
+        show_both_toggle.toggled.connect(update_show_both)
+        layout.addWidget(show_both_toggle)
+
+        update_show_both(bool(self._overlay_show_both))
+
+        layout.addWidget(highlight_hint)
+
+        bg_toggle = QCheckBox("Transparent BG indexes in preview")
+        bg_toggle.setChecked(self._preview_bg_transparent_enabled)
+
+        def update_bg_transparency(checked: bool) -> None:
+            self._preview_bg_transparent_enabled = bool(checked)
             self._save_preview_ui_settings()
+            self._preview_base_pixmap = None
             self._update_preview_pixmap()
-        
-        max_slider.valueChanged.connect(update_max)
-        max_layout.addWidget(max_slider)
-        max_layout.addWidget(max_label)
-        layout.addLayout(max_layout)
-        
-        # Animation speed
-        speed_layout = QHBoxLayout()
-        speed_layout.addWidget(QLabel("Animation Speed:"))
-        speed_slider = QSlider(Qt.Orientation.Horizontal)
-        speed_slider.setRange(1, 50)  # 0.01 to 0.50 (much wider range)
-        speed_slider.setValue(int(self._animation_speed * 100))
-        speed_label = QLabel(f"{self._animation_speed:.2f}x")
-        
-        def update_speed(value):
-            self._animation_speed = value / 100.0
-            speed_label.setText(f"{self._animation_speed:.2f}x")
-            logger.debug(f"Animation speed changed: {self._animation_speed:.2f}")
-            self._save_preview_ui_settings()
-        
-        speed_slider.valueChanged.connect(update_speed)
-        speed_layout.addWidget(speed_slider)
-        speed_layout.addWidget(speed_label)
-        layout.addLayout(speed_layout)
+
+        bg_toggle.toggled.connect(update_bg_transparency)
+        layout.addWidget(bg_toggle)
         
         # Close button
         close_btn = QPushButton("Close")
@@ -6579,7 +9553,7 @@ class SpriteToolsWindow(QMainWindow):
         """Enable merge tool button whenever a palette exists."""
         enabled = len(self.palette_colors) > 0
         self.merge_button.setEnabled(enabled)
-        self.merge_button.setText("Merge Sources → Destination")
+        self.merge_button.setText("Merge Mode")
 
     def _resolve_merge_source_destination(self) -> Tuple[List[int], int] | None:
         selected_rows = sorted({idx.row() for idx in self.palette_list.selectedIndexes()})
@@ -7000,33 +9974,24 @@ class SpriteToolsWindow(QMainWindow):
         dialog.exec()
 
     def _selected_highlight_target(self) -> tuple[int, ColorTuple] | None:
-        if not self.highlight_checkbox.isChecked():
-            return None
         model = self.palette_list.model_obj
-        index = self.palette_list.currentIndex()
-        if not index.isValid() or not (0 <= index.row() < 256):
-            return None
-        
-        slot_index = index.row()
-        color = model.colors[slot_index]
-        
-        # If empty slot, nothing to highlight
-        if color is None:
-            return None
-        
-        # Use the unified palette directly instead of _last_palette_info
-        # This ensures we always use the current palette state, even right after a merge
-        if slot_index < len(self.palette_colors):
-            actual_color = self.palette_colors[slot_index]
-            logger.debug(
-                "Highlight slot_index=%s color=%s actual_palette_color=%s",
-                slot_index,
-                color,
-                actual_color,
-            )
-            return slot_index, actual_color
-        
-        # Slot index is beyond current palette, nothing to highlight
+        if self.hover_highlight_checkbox.isChecked() and self._preview_hover_palette_row is not None:
+            hover_row = int(self._preview_hover_palette_row)
+            if 0 <= hover_row < 256:
+                hover_color = model.colors[hover_row]
+                if hover_color is not None:
+                    actual_hover = self.palette_colors[hover_row] if hover_row < len(self.palette_colors) else hover_color
+                    return hover_row, actual_hover
+
+        if self.highlight_checkbox.isChecked():
+            index = self.palette_list.currentIndex()
+            if index.isValid() and 0 <= index.row() < 256:
+                slot_index = index.row()
+                color = model.colors[slot_index]
+                if color is not None:
+                    actual_color = self.palette_colors[slot_index] if slot_index < len(self.palette_colors) else color
+                    return slot_index, actual_color
+
         return None
 
     @staticmethod
@@ -7080,59 +10045,47 @@ class SpriteToolsWindow(QMainWindow):
     def _build_checkerboard_preview_rgba(self) -> Image.Image | None:
         if self._last_preview_rgba is None:
             return None
-        base = self._last_preview_rgba.copy()
-        if self._last_processed_indexed is None:
-            return base
+        preview = self._last_preview_rgba.copy()
+        if not self._preview_bg_transparent_enabled or not self._preview_background_indices:
+            return preview
 
         index_data = self._last_index_data
-        if index_data is None:
+        if index_data is None and self._last_processed_indexed is not None:
             index_data = list(self._last_processed_indexed.getdata())
             self._last_index_data = index_data
+        if index_data is None:
+            return preview
 
-        palette_has_alpha = any(alpha < 255 for alpha in self.palette_alphas)
-        base_data = list(base.getdata())
-        has_transparent_pixels = False
+        bg_indices = self._preview_background_indices
+        data = list(preview.getdata())
+        remapped: List[tuple[int, int, int, int]] = []
+        changed = False
+        for px_idx, (r, g, b, a) in enumerate(data):
+            idx = index_data[px_idx] if px_idx < len(index_data) else -1
+            if idx in bg_indices and a != 0:
+                remapped.append((r, g, b, 0))
+                changed = True
+            else:
+                remapped.append((r, g, b, a))
+        if changed:
+            preview.putdata(remapped)
+        return preview
 
-        if palette_has_alpha:
-            adjusted_data: List[tuple[int, int, int, int]] = []
-            for px_idx, (r, g, b, a) in enumerate(base_data):
-                palette_index = index_data[px_idx] if px_idx < len(index_data) else -1
-                palette_alpha = self.palette_alphas[palette_index] if 0 <= palette_index < len(self.palette_alphas) else 255
-                adjusted_alpha = (a * palette_alpha) // 255
-                if adjusted_alpha < 255:
-                    has_transparent_pixels = True
-                adjusted_data.append((r, g, b, adjusted_alpha))
-            base.putdata(adjusted_data)
-            base_data = adjusted_data
-        else:
-            has_transparent_pixels = any(a < 255 for _r, _g, _b, a in base_data)
-
-        if not has_transparent_pixels:
-            return base
-
-        width, height = base.size
-        checker = Image.new("RGBA", (width, height), (0, 0, 0, 255))
-        tile = 8
-        light = (200, 200, 200, 255)
-        dark = (150, 150, 150, 255)
-        for y in range(0, height, tile):
-            for x in range(0, width, tile):
-                use_light = ((x // tile) + (y // tile)) % 2 == 0
-                checker.paste(
-                    light if use_light else dark,
-                    (x, y, min(x + tile, width), min(y + tile, height)),
-                )
-        checker.alpha_composite(base)
-        logger.debug(
-            "Preview checkerboard composed size=%sx%s palette_has_alpha=%s",
-            width,
-            height,
-            palette_has_alpha,
-        )
-        return checker
+    def _ensure_preview_base_pixmap(self) -> QPixmap | None:
+        if self._preview_base_pixmap is not None:
+            return self._preview_base_pixmap
+        sprite_rgba = self._build_checkerboard_preview_rgba()
+        if sprite_rgba is None:
+            return None
+        qimage = ImageQt(sprite_rgba)
+        self._preview_base_pixmap = QPixmap.fromImage(qimage)
+        return self._preview_base_pixmap
 
     def _update_preview_pixmap(self, *_args) -> None:
+        frame_started = time.perf_counter()
+        self.preview_panel.set_drag_backdrop_rgba(self._resolve_drag_backdrop_rgba())
         if self._last_preview_rgba is None:
+            self.preview_panel.set_overlay_layers([], QSize(0, 0))
             record = self._current_record()
             if record is None:
                 self.preview_panel.set_pixmap(None, reset_zoom=self._reset_zoom_next)
@@ -7141,65 +10094,159 @@ class SpriteToolsWindow(QMainWindow):
             self._reset_zoom_next = False
             return
         
-        # Compose checkerboard + alpha visualization for viewport preview.
-        composed = self._build_checkerboard_preview_rgba()
-        if composed is None:
+        # Compose checkerboard + alpha visualization for viewport preview once and reuse.
+        base_pixmap = self._ensure_preview_base_pixmap()
+        if base_pixmap is None:
             return
+        base_cache_key = int(base_pixmap.cacheKey())
 
-        # Convert base RGBA image to QPixmap
-        qimage = ImageQt(composed)
-        base_pixmap = QPixmap.fromImage(qimage)
-        
-        # Apply overlay using QPainter if needed
-        target = self._selected_highlight_target()
-        if target is not None:
-            index, color = target
+        # Build overlay layers; rendering is done in PreviewPane on cached scaled pixels.
+        targets: List[tuple[Literal["hover", "selected"], int, ColorTuple]] = []
+        if not self.preview_panel.is_dragging():
+            targets = self._preview_highlight_targets()
+        overlay_layers: List[tuple[int, QRegion, QColor]] = []
+        layer_signature: List[tuple[int, int, int, int, int]] = []
+        if targets and self._last_processed_indexed is not None:
+            index_data = self._last_index_data
+            if index_data is None:
+                index_data = list(self._last_processed_indexed.getdata())
+                self._last_index_data = index_data
+
             import math
-            fade = (math.sin(self._highlight_animation_phase) + 1) / 2  # 0 to 1
-            # Interpolate between min and max alpha
-            alpha_range = self._overlay_alpha_max - self._overlay_alpha_min
-            animated_alpha = int(self._overlay_alpha_min + alpha_range * fade)
-            logger.debug(f"Applying QPainter overlay: alpha_min={self._overlay_alpha_min}, alpha_max={self._overlay_alpha_max}, fade={fade:.2f}, animated_alpha={animated_alpha}, color={self._overlay_color}")
-            
-            # Create mask from indexed image
-            if self._last_processed_indexed is not None:
-                index_data = self._last_index_data
-                if index_data is None:
-                    index_data = list(self._last_processed_indexed.getdata())
-                    self._last_index_data = index_data
-                
-                # Create a new pixmap to draw on
-                result_pixmap = QPixmap(base_pixmap)
-                
-                # Use QPainter to draw overlay
-                painter = QPainter(result_pixmap)
-                painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
-                
-                # Create overlay brush
-                overlay_color = QColor(*self._overlay_color, animated_alpha)
-                painter.setBrush(overlay_color)
-                painter.setPen(Qt.PenStyle.NoPen)
-                
-                # Draw overlay on matching pixels
-                width = composed.width
-                height = composed.height
-                for y in range(height):
-                    for x in range(width):
-                        pixel_index = y * width + x
-                        if pixel_index < len(index_data) and index_data[pixel_index] == index:
-                            painter.drawRect(x, y, 1, 1)
-                
-                painter.end()
-                base_pixmap = result_pixmap
-                logger.debug(f"QPainter overlay completed")
-        
+            width = base_pixmap.width()
+            height = base_pixmap.height()
+
+            for mode, index, _color in targets:
+                if mode == "hover":
+                    overlay_rgb = self._hover_overlay_color
+                    alpha_min = self._hover_overlay_alpha_min
+                    alpha_max = self._hover_overlay_alpha_max
+                    phase = self._hover_highlight_animation_phase
+                else:
+                    overlay_rgb = self._selected_overlay_color
+                    alpha_min = self._selected_overlay_alpha_min
+                    alpha_max = self._selected_overlay_alpha_max
+                    phase = self._selected_highlight_animation_phase
+
+                fade = (math.sin(phase) + 1) / 2
+                alpha_range = max(0, int(alpha_max) - int(alpha_min))
+                animated_alpha = int(int(alpha_min) + alpha_range * fade)
+                quantum = max(1, int(self._overlay_alpha_quantum))
+                animated_alpha = int(round(animated_alpha / quantum) * quantum)
+                animated_alpha = max(0, min(255, animated_alpha))
+
+                overlay_qcolor = QColor(int(overlay_rgb[0]), int(overlay_rgb[1]), int(overlay_rgb[2]), animated_alpha)
+                region = self._overlay_region_for_index(index, width, height, index_data)
+                if not region.isEmpty():
+                    layer_key = int(index) if mode == "selected" else int(1000 + index)
+                    overlay_layers.append((layer_key, region, overlay_qcolor))
+                    layer_signature.append((layer_key, int(overlay_rgb[0]), int(overlay_rgb[1]), int(overlay_rgb[2]), int(animated_alpha)))
+
+        render_signature: tuple[Any, ...] = (
+            base_cache_key,
+            bool(self._reset_zoom_next),
+            tuple(layer_signature),
+        )
+        if self._last_preview_render_signature == render_signature:
+            return
+        self._last_preview_render_signature = render_signature
+
+        self.preview_panel.set_overlay_layers(overlay_layers, base_pixmap.size())
         self.preview_panel.set_pixmap(base_pixmap, reset_zoom=self._reset_zoom_next)
         self._reset_zoom_next = False
 
+        elapsed_ms = (time.perf_counter() - frame_started) * 1000.0
+        if self._overlay_compose_samples <= 0:
+            self._overlay_compose_ms_ema = elapsed_ms
+        else:
+            self._overlay_compose_ms_ema = (self._overlay_compose_ms_ema * 0.85) + (elapsed_ms * 0.15)
+        self._overlay_compose_samples += 1
+        if (
+            logger.isEnabledFor(logging.DEBUG)
+            and self._overlay_compose_samples % max(1, int(self._overlay_perf_log_every)) == 0
+        ):
+            logger.debug(
+                "Preview overlay perf samples=%s last_ms=%.2f ema_ms=%.2f pan=%s zoom=%.2f interval=%.3f",
+                self._overlay_compose_samples,
+                elapsed_ms,
+                self._overlay_compose_ms_ema,
+                self._preview_pan_active,
+                float(self.preview_panel.current_zoom()) if hasattr(self, "preview_panel") else 1.0,
+                self._pan_pulse_refresh_interval(),
+            )
+
+    def closeEvent(self, event) -> None:  # type: ignore[override]
+        if not self._confirm_close_with_unsaved_changes():
+            event.ignore()
+            return
+        self._save_persistent_ui_state()
+        self._perform_autosave()
+        if self._preview_timer.isActive():
+            self._preview_timer.stop()
+        if self._preview_pixmap_timer.isActive():
+            self._preview_pixmap_timer.stop()
+        if self._detect_batch_timer.isActive():
+            self._detect_batch_timer.stop()
+        if self._load_timer.isActive():
+            self._load_timer.stop()
+        if self._autosave_debounce_timer.isActive():
+            self._autosave_debounce_timer.stop()
+        if self._autosave_periodic_timer.isActive():
+            self._autosave_periodic_timer.stop()
+        self._preview_pending_request = None
+        self._preview_active_request = None
+        self._detect_batch_queue.clear()
+        self._preview_executor.shutdown(wait=False, cancel_futures=True)
+        super().closeEvent(event)
+
+    def _confirm_close_with_unsaved_changes(self) -> bool:
+        if self._is_loading_sprites:
+            reply_loading = QMessageBox.question(
+                self,
+                "Close",
+                "Sprites are currently loading. Close anyway?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply_loading != QMessageBox.StandardButton.Yes:
+                return False
+
+        if not self._autosave_dirty:
+            return True
+        if self._project_paths is None or self._project_manifest is None:
+            return True
+
+        reply = QMessageBox.question(
+            self,
+            "Unsaved Changes",
+            "There are unsaved project changes. Save before closing?",
+            QMessageBox.StandardButton.Save | QMessageBox.StandardButton.Discard | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Save,
+        )
+        if reply == QMessageBox.StandardButton.Cancel:
+            return False
+        if reply == QMessageBox.StandardButton.Discard:
+            return True
+
+        saved = self._write_project_state(self._project_paths, self._project_manifest, context="Save Project")
+        return bool(saved)
+
     def eventFilter(self, source, event):  # type: ignore[override]
         if hasattr(self, "palette_list") and source is self.palette_list.viewport():
+            if event.type() in (QEvent.Type.MouseMove, QEvent.Type.HoverMove):
+                point = None
+                if isinstance(event, QMouseEvent):
+                    point = event.pos()
+                elif hasattr(event, "position"):
+                    point = event.position().toPoint()
+                if point is None:
+                    return super().eventFilter(source, event)
+                hover_index = self.palette_list.indexAt(point)
+                self._set_preview_hover_palette_row(int(hover_index.row()) if hover_index.isValid() else None)
             if event.type() == QEvent.Type.Resize and self._main_palette_force_columns:
                 self._main_palette_layout_timer.start(24)
+            if event.type() in (QEvent.Type.Leave, QEvent.Type.HoverLeave):
+                self._set_preview_hover_palette_row(None)
         if source is self.images_panel.list_widget:
             if event.type() == QEvent.Type.KeyPress:
                 if event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
