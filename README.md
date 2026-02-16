@@ -131,8 +131,8 @@ After staging/committing locally, push `main` and publish a release tag:
 
 ```pwsh
 git push -u origin main
-git tag -a v0.2.0 -m "SpriteTools v0.2.0"
-git push origin v0.2.0
+git tag -a v0.3.0 -m "SpriteTools v0.3.0"
+git push origin v0.3.0
 ```
 
-Then create a GitHub Release from tag `v0.2.0` (or create it with GitHub CLI if installed).
+Then create a GitHub Release from tag `v0.3.0` (or create it with GitHub CLI if installed).

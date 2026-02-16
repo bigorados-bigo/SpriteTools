@@ -1,6 +1,6 @@
 # SpriteTools Release Notes
 
-## v0.2.1 (Main, in progress)
+## v0.3.0 (Main)
 
 ### Project System
 
@@ -29,6 +29,10 @@
 
 - Fixed project open/reset crash caused by stale `status_label` access.
 - Added and passed manual QA checklist for shortcuts editor + merge-mode shortcut flows (persistence, conflict handling, import/export, unsaved-close prompt, merge dialog bindings).
+
+### Notes
+
+- This release supersedes `v0.2.0` for current `main`.
 
 ## v0.2.0 (Main)
 
