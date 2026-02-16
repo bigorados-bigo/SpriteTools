@@ -1,5 +1,23 @@
 # SpriteTools Release Notes
 
+## v0.3.1 (Main)
+
+### Animation Assist Stabilization
+
+- Fixed group-drag target drift in `animation_assist` by locking the drag target/group for the full drag session.
+- Fixed group-drag accumulation by persisting group offsets on each drag delta update.
+- Improved drag consistency during playback/scrub transitions so active frame movement stays deterministic.
+
+### Reliability + Diagnostics
+
+- Removed temporary assist render telemetry used during stabilization.
+- Reduced high-frequency debug log spam in palette/refresh paths for cleaner troubleshooting logs.
+- Added animation assist regression checklist and reusable debug triage commands.
+
+### Notes
+
+- This release supersedes `v0.3.0` for current `main`.
+
 ## v0.3.0 (Main)
 
 ### Project System

@@ -1,0 +1,5 @@
+$env:SPRITETOOLS_DEBUG='1'; $env:SPRITETOOLS_DEBUG_LOG='sprite_tools_debug.log'; & E:/Dev/SpriteTools/.venv/Scripts/python.exe run_sprite_tools.py
+
+$path='sprite_tools_debug.log'; Get-Content $path | Where-Object { $_ -match 'Traceback|Exception|ERROR|CRITICAL' }
+
+$path='sprite_tools_debug.log'; Get-Content $path | Where-Object { $_ -match ' DEBUG \[sprite_tools\.ui\.main\] ' } | ForEach-Object { if ($_ -match 'DEBUG \[sprite_tools\.ui\.main\] (.*)$') { $matches[1] } } | Group-Object | Sort-Object Count -Descending | Select-Object -First 12 Count,Name | Format-Table -AutoSize | Out-String
