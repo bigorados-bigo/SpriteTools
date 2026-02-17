@@ -2494,12 +2494,43 @@ class LoadedImagesPanel(QWidget):
         self.zoom_value_label = QLabel("64")
         self.zoom_value_label.setMinimumWidth(30)
         browser_row.addWidget(self.zoom_value_label)
+
+        self.float_groups_button = QPushButton("Float Groups")
+        self.float_groups_button.setCheckable(True)
+        self.float_groups_button.setToolTip("Open Groups panel in a floating window")
+        browser_row.addWidget(self.float_groups_button)
+
+        self.float_sprites_button = QPushButton("Float Sprites")
+        self.float_sprites_button.setCheckable(True)
+        self.float_sprites_button.setToolTip("Open Sprites panel in a floating window")
+        browser_row.addWidget(self.float_sprites_button)
+
         browser_row.addStretch(1)
         self._zoom_by_view: Dict[str, int] = {
             "list": int(self.zoom_slider.value()),
             "thumbnails": int(self.zoom_slider.value()),
         }
         self._last_view_mode = "list"
+        self._group_panel_floating = False
+        self._sprite_panel_floating = False
+
+        self.group_float_dialog = QDialog(self)
+        self.group_float_dialog.setWindowTitle("Groups")
+        self.group_float_dialog.setModal(False)
+        self.group_float_dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
+        self.group_float_dialog.installEventFilter(self)
+        self.group_float_dialog_layout = QVBoxLayout(self.group_float_dialog)
+        self.group_float_dialog_layout.setContentsMargins(4, 4, 4, 4)
+        self.group_float_dialog_layout.setSpacing(4)
+
+        self.sprite_float_dialog = QDialog(self)
+        self.sprite_float_dialog.setWindowTitle("Sprites")
+        self.sprite_float_dialog.setModal(False)
+        self.sprite_float_dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
+        self.sprite_float_dialog.installEventFilter(self)
+        self.sprite_float_dialog_layout = QVBoxLayout(self.sprite_float_dialog)
+        self.sprite_float_dialog_layout.setContentsMargins(4, 4, 4, 4)
+        self.sprite_float_dialog_layout.setSpacing(4)
 
         self.browser_settings_dialog = QDialog(self)
         self.browser_settings_dialog.setWindowTitle("Sprite Browser Settings")
@@ -2569,13 +2600,13 @@ class LoadedImagesPanel(QWidget):
         self.list_widget.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
         self.list_widget.setHorizontalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
 
-        group_section = QWidget()
-        group_section_layout = QVBoxLayout(group_section)
+        self.group_section = QWidget()
+        group_section_layout = QVBoxLayout(self.group_section)
         group_section_layout.setContentsMargins(0, 0, 0, 0)
         group_section_layout.setSpacing(4)
 
-        sprite_section = QWidget()
-        sprite_section_layout = QVBoxLayout(sprite_section)
+        self.sprite_section = QWidget()
+        sprite_section_layout = QVBoxLayout(self.sprite_section)
         sprite_section_layout.setContentsMargins(0, 0, 0, 0)
         sprite_section_layout.setSpacing(4)
 
@@ -2591,8 +2622,8 @@ class LoadedImagesPanel(QWidget):
         sprite_section_layout.addWidget(self.list_widget, 1)
 
         self.group_sprite_splitter = QSplitter(Qt.Orientation.Vertical)
-        self.group_sprite_splitter.addWidget(group_section)
-        self.group_sprite_splitter.addWidget(sprite_section)
+        self.group_sprite_splitter.addWidget(self.group_section)
+        self.group_sprite_splitter.addWidget(self.sprite_section)
         self.group_sprite_splitter.setChildrenCollapsible(False)
         self.group_sprite_splitter.setStretchFactor(0, 1)
         self.group_sprite_splitter.setStretchFactor(1, 3)
@@ -2614,6 +2645,8 @@ class LoadedImagesPanel(QWidget):
         self.zoom_slider.valueChanged.connect(self._on_browser_controls_changed)
         self.zoom_slider.sliderPressed.connect(self._on_zoom_slider_pressed)
         self.zoom_slider.sliderReleased.connect(self._on_zoom_slider_released)
+        self.float_groups_button.toggled.connect(self._set_group_panel_floating)
+        self.float_sprites_button.toggled.connect(self._set_sprite_panel_floating)
         self.browser_settings_close_button.clicked.connect(self.browser_settings_dialog.close)
         self._apply_browser_mode()
 
@@ -2795,6 +2828,46 @@ class LoadedImagesPanel(QWidget):
         self.browser_settings_dialog.raise_()
         self.browser_settings_dialog.activateWindow()
 
+    def _set_group_panel_floating(self, enabled: bool) -> None:
+        if enabled:
+            if self._group_panel_floating:
+                return
+            self.group_section.setParent(None)
+            self.group_float_dialog_layout.addWidget(self.group_section)
+            self.group_float_dialog.resize(520, 340)
+            self.group_float_dialog.show()
+            self.group_float_dialog.raise_()
+            self.group_float_dialog.activateWindow()
+            self._group_panel_floating = True
+            return
+
+        if not self._group_panel_floating:
+            return
+        self.group_section.setParent(None)
+        self.group_sprite_splitter.insertWidget(0, self.group_section)
+        self.group_float_dialog.hide()
+        self._group_panel_floating = False
+
+    def _set_sprite_panel_floating(self, enabled: bool) -> None:
+        if enabled:
+            if self._sprite_panel_floating:
+                return
+            self.sprite_section.setParent(None)
+            self.sprite_float_dialog_layout.addWidget(self.sprite_section)
+            self.sprite_float_dialog.resize(620, 460)
+            self.sprite_float_dialog.show()
+            self.sprite_float_dialog.raise_()
+            self.sprite_float_dialog.activateWindow()
+            self._sprite_panel_floating = True
+            return
+
+        if not self._sprite_panel_floating:
+            return
+        self.sprite_section.setParent(None)
+        self.group_sprite_splitter.insertWidget(1, self.sprite_section)
+        self.sprite_float_dialog.hide()
+        self._sprite_panel_floating = False
+
     def _apply_browser_mode(self) -> None:
         zoom = self.browser_zoom()
         self.zoom_value_label.setText(str(zoom))
@@ -2839,6 +2912,22 @@ class LoadedImagesPanel(QWidget):
             self.list_widget.setAlternatingRowColors(True)
 
     def eventFilter(self, watched: object, event: QEvent) -> bool:  # type: ignore[override]
+        if watched is self.group_float_dialog and event.type() == QEvent.Type.Close:
+            if self._group_panel_floating:
+                blocked = self.float_groups_button.blockSignals(True)
+                self.float_groups_button.setChecked(False)
+                self.float_groups_button.blockSignals(blocked)
+                self._set_group_panel_floating(False)
+            return False
+
+        if watched is self.sprite_float_dialog and event.type() == QEvent.Type.Close:
+            if self._sprite_panel_floating:
+                blocked = self.float_sprites_button.blockSignals(True)
+                self.float_sprites_button.setChecked(False)
+                self.float_sprites_button.blockSignals(blocked)
+                self._set_sprite_panel_floating(False)
+            return False
+
         if watched is self.list_widget.viewport() and event.type() == QEvent.Type.Wheel and isinstance(event, QWheelEvent):
             if bool(event.modifiers() & Qt.KeyboardModifier.ControlModifier):
                 delta_y = event.angleDelta().y()
