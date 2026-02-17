@@ -131,8 +131,25 @@ After staging/committing locally, push `main` and publish a release tag:
 
 ```pwsh
 git push -u origin main
-git tag -a v0.3.0 -m "SpriteTools v0.3.0"
-git push origin v0.3.0
+git tag -a vX.Y.Z -m "SpriteTools vX.Y.Z"
+git push origin vX.Y.Z
 ```
 
-Then create a GitHub Release from tag `v0.3.0` (or create it with GitHub CLI if installed).
+Release automation is now tag-driven via GitHub Actions:
+
+- `.github/workflows/ci.yml` validates pushes and pull requests to `main`.
+- `.github/workflows/release.yml` builds and publishes release assets when a `v*` tag is pushed.
+
+Published release assets:
+
+- `SpriteTools-vX.Y.Z.exe`
+- `SpriteTools-win64.zip`
+
+Optional manual fallback (if automation is unavailable):
+
+```pwsh
+python -m PyInstaller --noconfirm --clean SpriteTools.spec
+Copy-Item dist/SpriteTools.exe dist/SpriteTools-vX.Y.Z.exe -Force
+Compress-Archive -Path dist/SpriteTools.exe -DestinationPath dist/SpriteTools-win64.zip -Force
+gh release create vX.Y.Z dist/SpriteTools-vX.Y.Z.exe dist/SpriteTools-win64.zip --title "SpriteTools vX.Y.Z"
+```

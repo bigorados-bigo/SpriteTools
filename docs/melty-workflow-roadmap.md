@@ -200,6 +200,48 @@ Provide a full keybindings management window so users can customize program shor
   - load resolved bindings once,
   - avoid per-frame lookup overhead.
 - Maintain backward compatibility with default bindings if user config is missing/invalid.
+- Shortcut policy for ongoing development:
+  - every new keyboard shortcut and modifier-driven interaction should be represented by a bindable action entry,
+  - gesture affordances (such as sprite-browser zoom controls) should map to the same bindable zoom actions whenever practical.
+
+---
+
+## 6) Workspace Panels + Explorer-Grade Sprite Browser
+
+### Goal
+Make sprite and group workflows feel like a modern file explorer: fast browsing, flexible organization, and adaptable panel layout (floating first, dockable where viable).
+
+### Core Features (Browser UX)
+- Multiple sprite browser display modes:
+  - details/list,
+  - thumbnails grid,
+  - compact tiles/strip.
+- Adjustable thumbnail zoom with smooth scaling and lazy thumbnail loading.
+- Organization controls:
+  - sort by name/index/group/modified,
+  - group by folder/tag/group id,
+  - optional pin/favorites filter for active working sets.
+- Navigation affordances:
+  - keyboard-first selection navigation,
+  - breadcrumb-like context label,
+  - quick jump/search.
+
+### Panel Layout Strategy
+
+#### Phase 1 (Lower Risk): Floating Panel Variants
+- Add optional floating versions for sprite list and group panel.
+- Keep current main-window splitter as canonical layout.
+- Preserve shared selection/model state between docked and floating presentations.
+
+#### Phase 2 (Higher Depth): Dockable Workspace
+- Evaluate migration of major panes to `QDockWidget`-based layout.
+- Support save/restore of custom workspace layouts.
+- Add reset-to-default-layout command.
+
+### Technical Viability Notes
+- Floating panels are highly viable in current architecture and can ship incrementally.
+- Full dockable workspace is viable in Qt, but is a deeper refactor because current UI relies on tightly-coupled splitter layouts and cross-panel interaction assumptions.
+- Recommendation: ship floating + explorer-browser improvements first, then perform dockable migration only after interaction/state synchronization is stabilized.
 
 ---
 
@@ -227,6 +269,11 @@ Exit criteria:
   - list/edit/reset actions,
   - conflict detection,
   - persisted user keymap.
+- Ship sprite browser UX baseline:
+  - list + thumbnail modes,
+  - zoom slider,
+  - basic sort/group options.
+- Add optional floating sprite/group panels (non-dockable first pass).
 
 Exit criteria:
 - User can align animation frames significantly faster than manual single-frame edits.
@@ -246,6 +293,7 @@ Exit criteria:
 - Add project validation tooling and reporting.
 - Add optional dedicated timeline workspace if main view becomes crowded.
 - Add keybinding profile import/export and optional multiple named keymap profiles.
+- Evaluate and optionally ship full dockable workspace layout (`QDockWidget`) with layout preset save/restore.
 
 Exit criteria:
 - End-to-end animation prep is manageable for large projects with minimal manual repetition.
