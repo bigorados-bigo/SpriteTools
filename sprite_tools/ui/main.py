@@ -46,6 +46,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QLineEdit,
     QAbstractItemView,
     QListWidget,
     QListWidgetItem,
@@ -2452,6 +2453,13 @@ class LoadedImagesPanel(QWidget):
         self.sort_mode_combo.addItem("Path", "path")
         browser_row.addWidget(self.sort_mode_combo)
 
+        browser_row.addWidget(QLabel("Search:"))
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText("Name/path (Ctrl+F, F3)")
+        self.search_edit.setClearButtonEnabled(True)
+        self.search_edit.setMinimumWidth(180)
+        browser_row.addWidget(self.search_edit)
+
         self.group_marker_mode_combo = QComboBox()
         self.group_marker_mode_combo.addItem("Text Color", "text")
         self.group_marker_mode_combo.addItem("Colored Square", "square")
@@ -2647,7 +2655,17 @@ class LoadedImagesPanel(QWidget):
         self.zoom_slider.sliderReleased.connect(self._on_zoom_slider_released)
         self.float_groups_button.toggled.connect(self._set_group_panel_floating)
         self.float_sprites_button.toggled.connect(self._set_sprite_panel_floating)
+        self.search_edit.textChanged.connect(self._on_search_text_changed)
         self.browser_settings_close_button.clicked.connect(self.browser_settings_dialog.close)
+
+        self.search_focus_shortcut = QShortcut(QKeySequence.StandardKey.Find, self)
+        self.search_focus_shortcut.activated.connect(self._focus_search)
+        self.search_next_shortcut = QShortcut(QKeySequence("F3"), self)
+        self.search_next_shortcut.activated.connect(lambda: self.jump_search(forward=True))
+        self.search_prev_shortcut = QShortcut(QKeySequence("Shift+F3"), self)
+        self.search_prev_shortcut.activated.connect(lambda: self.jump_search(forward=False))
+        self.search_clear_shortcut = QShortcut(QKeySequence(Qt.Key.Key_Escape), self.search_edit)
+        self.search_clear_shortcut.activated.connect(self._clear_search)
         self._apply_browser_mode()
 
     def set_loaded_count(self, count: int) -> None:
@@ -2687,6 +2705,9 @@ class LoadedImagesPanel(QWidget):
 
     def browser_scroll_speed(self) -> int:
         return int(self.scroll_speed_spin.value())
+
+    def browser_search_text(self) -> str:
+        return self.search_edit.text().strip()
 
     def _clamp_browser_zoom(self, zoom: int) -> int:
         return max(int(self.zoom_slider.minimum()), min(int(self.zoom_slider.maximum()), int(zoom)))
@@ -2802,6 +2823,100 @@ class LoadedImagesPanel(QWidget):
         if self._on_browser_settings_change is not None:
             self._on_browser_settings_change()
         self._schedule_browser_change_emit()
+
+    def _focus_search(self) -> None:
+        self.search_edit.setFocus(Qt.FocusReason.ShortcutFocusReason)
+        self.search_edit.selectAll()
+
+    def _clear_search(self) -> None:
+        if self.search_edit.text():
+            self.search_edit.clear()
+
+    def _on_search_text_changed(self, _text: str) -> None:
+        self.apply_browser_search_filter()
+
+    def _item_matches_search(self, item: QListWidgetItem, needle: str) -> bool:
+        text = (item.text() or "").lower()
+        tooltip = (item.toolTip() or "").lower()
+        return needle in text or needle in tooltip
+
+    def _visible_rows(self) -> List[int]:
+        rows: List[int] = []
+        for row in range(self.list_widget.count()):
+            item = self.list_widget.item(row)
+            if item is not None and not item.isHidden():
+                rows.append(row)
+        return rows
+
+    def jump_search(self, *, forward: bool) -> None:
+        visible_rows = self._visible_rows()
+        if not visible_rows:
+            return
+        current_row = self.list_widget.currentRow()
+        if current_row < 0:
+            target_row = visible_rows[0] if forward else visible_rows[-1]
+            self.list_widget.setCurrentRow(target_row)
+            self.list_widget.scrollToItem(self.list_widget.item(target_row))
+            return
+
+        if forward:
+            for row in visible_rows:
+                if row > current_row:
+                    self.list_widget.setCurrentRow(row)
+                    self.list_widget.scrollToItem(self.list_widget.item(row))
+                    return
+            target_row = visible_rows[0]
+        else:
+            for row in reversed(visible_rows):
+                if row < current_row:
+                    self.list_widget.setCurrentRow(row)
+                    self.list_widget.scrollToItem(self.list_widget.item(row))
+                    return
+            target_row = visible_rows[-1]
+        self.list_widget.setCurrentRow(target_row)
+        self.list_widget.scrollToItem(self.list_widget.item(target_row))
+
+    def apply_browser_search_filter(self) -> None:
+        needle = self.browser_search_text().lower()
+        list_widget = self.list_widget
+        selected_before = list_widget.currentItem()
+        selected_before_key = selected_before.data(Qt.ItemDataRole.UserRole) if selected_before is not None else None
+
+        updates_enabled = list_widget.updatesEnabled()
+        list_widget.setUpdatesEnabled(False)
+        try:
+            for row in range(list_widget.count()):
+                item = list_widget.item(row)
+                if item is None:
+                    continue
+                match = True if not needle else self._item_matches_search(item, needle)
+                item.setHidden(not match)
+                if not match:
+                    item.setSelected(False)
+
+            visible_rows = self._visible_rows()
+            if not visible_rows:
+                list_widget.clearSelection()
+                list_widget.setCurrentItem(None)
+            else:
+                current_item = list_widget.currentItem()
+                if current_item is None or current_item.isHidden():
+                    preferred_row = None
+                    if selected_before_key:
+                        for row in visible_rows:
+                            candidate = list_widget.item(row)
+                            if candidate is not None and candidate.data(Qt.ItemDataRole.UserRole) == selected_before_key:
+                                preferred_row = row
+                                break
+                    if preferred_row is None:
+                        preferred_row = visible_rows[0]
+                    list_widget.setCurrentRow(preferred_row)
+                    target = list_widget.item(preferred_row)
+                    if target is not None:
+                        list_widget.scrollToItem(target)
+        finally:
+            list_widget.setUpdatesEnabled(updates_enabled)
+            list_widget.viewport().update()
 
     def _schedule_browser_change_emit(self) -> None:
         count = self.list_widget.count()
@@ -9797,6 +9912,7 @@ class SpriteToolsWindow(QMainWindow):
         )
 
     def _after_loaded_images_list_changed(self) -> None:
+        self.images_panel.apply_browser_search_filter()
         self._refresh_sprite_group_visuals()
         self._update_loaded_count()
         self._update_export_buttons()
