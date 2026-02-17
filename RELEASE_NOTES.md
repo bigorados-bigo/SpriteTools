@@ -1,5 +1,18 @@
 # SpriteTools Release Notes
 
+## v0.3.2 (Main)
+
+### Sprite Browser Stability + UX
+
+- Added persistent floating state for both Groups and Sprites browser panels.
+- Added floating window geometry restore for both panels across app restarts.
+- Captured floating geometry on toggle/close paths to keep panel placement consistent.
+- Hardened floating panel event handling for safer close/dock transitions.
+
+### Notes
+
+- This release supersedes `v0.3.1` for current `main`.
+
 ## v0.3.1 (Main)
 
 ### Animation Assist Stabilization
