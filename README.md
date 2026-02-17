@@ -127,7 +127,20 @@ Repository remote:
 
 - `https://github.com/bigorados-bigo/SpriteTools`
 
-After staging/committing locally, push `main` and publish a release tag:
+Preferred release flow (one command from repo root):
+
+```pwsh
+pwsh -File scripts/release-tag.ps1 -Version X.Y.Z
+```
+
+This helper enforces:
+
+- clean working tree,
+- `main` branch only,
+- no duplicate local/remote tags,
+- push `main` (unless `-SkipPushMain`), then create/push release tag.
+
+Direct manual flow (fallback):
 
 ```pwsh
 git push -u origin main
