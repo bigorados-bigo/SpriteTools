@@ -106,6 +106,8 @@ _BROWSER_DEBOUNCE_SLOW_MS = 60
 _BROWSER_INPLACE_CHUNK_SMALL = 400
 _BROWSER_INPLACE_CHUNK_MEDIUM = 250
 _BROWSER_INPLACE_CHUNK_LARGE = 150
+_EVENT_TYPE_CLOSE = int(QEvent.Type.Close)
+_EVENT_TYPE_WHEEL = int(QEvent.Type.Wheel)
 _PROJECT_FOLDER_SUFFIX = ".spto"
 _PROJECT_LEGACY_FOLDER_SUFFIX = ".spritetools"
 _RECENT_PROJECTS_LIMIT = 8
@@ -2527,7 +2529,8 @@ class LoadedImagesPanel(QWidget):
         self.group_float_dialog.setModal(False)
         self.group_float_dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
         self.group_float_dialog.installEventFilter(self)
-        self.group_float_dialog_layout = QVBoxLayout(self.group_float_dialog)
+        self.group_float_dialog_layout = QVBoxLayout()
+        self.group_float_dialog.setLayout(self.group_float_dialog_layout)
         self.group_float_dialog_layout.setContentsMargins(4, 4, 4, 4)
         self.group_float_dialog_layout.setSpacing(4)
 
@@ -2536,7 +2539,8 @@ class LoadedImagesPanel(QWidget):
         self.sprite_float_dialog.setModal(False)
         self.sprite_float_dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
         self.sprite_float_dialog.installEventFilter(self)
-        self.sprite_float_dialog_layout = QVBoxLayout(self.sprite_float_dialog)
+        self.sprite_float_dialog_layout = QVBoxLayout()
+        self.sprite_float_dialog.setLayout(self.sprite_float_dialog_layout)
         self.sprite_float_dialog_layout.setContentsMargins(4, 4, 4, 4)
         self.sprite_float_dialog_layout.setSpacing(4)
 
@@ -3027,23 +3031,37 @@ class LoadedImagesPanel(QWidget):
             self.list_widget.setAlternatingRowColors(True)
 
     def eventFilter(self, watched: object, event: QEvent) -> bool:  # type: ignore[override]
-        if watched is self.group_float_dialog and event.type() == QEvent.Type.Close:
-            if self._group_panel_floating:
-                blocked = self.float_groups_button.blockSignals(True)
-                self.float_groups_button.setChecked(False)
-                self.float_groups_button.blockSignals(blocked)
+        try:
+            event_type = int(event.type())
+        except Exception:  # noqa: BLE001
+            return super().eventFilter(watched, event)
+
+        group_dialog = getattr(self, "group_float_dialog", None)
+        sprite_dialog = getattr(self, "sprite_float_dialog", None)
+        groups_button = getattr(self, "float_groups_button", None)
+        sprites_button = getattr(self, "float_sprites_button", None)
+        group_floating = bool(getattr(self, "_group_panel_floating", False))
+        sprite_floating = bool(getattr(self, "_sprite_panel_floating", False))
+        list_widget = getattr(self, "list_widget", None)
+        list_viewport = list_widget.viewport() if list_widget is not None else None
+
+        if watched is group_dialog and event_type == _EVENT_TYPE_CLOSE:
+            if group_floating and groups_button is not None:
+                blocked = groups_button.blockSignals(True)
+                groups_button.setChecked(False)
+                groups_button.blockSignals(blocked)
                 self._set_group_panel_floating(False)
             return False
 
-        if watched is self.sprite_float_dialog and event.type() == QEvent.Type.Close:
-            if self._sprite_panel_floating:
-                blocked = self.float_sprites_button.blockSignals(True)
-                self.float_sprites_button.setChecked(False)
-                self.float_sprites_button.blockSignals(blocked)
+        if watched is sprite_dialog and event_type == _EVENT_TYPE_CLOSE:
+            if sprite_floating and sprites_button is not None:
+                blocked = sprites_button.blockSignals(True)
+                sprites_button.setChecked(False)
+                sprites_button.blockSignals(blocked)
                 self._set_sprite_panel_floating(False)
             return False
 
-        if watched is self.list_widget.viewport() and event.type() == QEvent.Type.Wheel and isinstance(event, QWheelEvent):
+        if watched is list_viewport and event_type == _EVENT_TYPE_WHEEL and isinstance(event, QWheelEvent):
             if bool(event.modifiers() & Qt.KeyboardModifier.ControlModifier):
                 delta_y = event.angleDelta().y()
                 if delta_y != 0:
