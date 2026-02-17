@@ -2625,13 +2625,26 @@ class LoadedImagesPanel(QWidget):
 
         sprite_label = QLabel("Sprites")
         sprite_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.sprite_context_label = QLabel("No sprite selected")
+        self.sprite_context_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self.sprite_context_label.setStyleSheet("color: #9aa0a6; font-size: 10px;")
         sprite_section_layout.addWidget(sprite_label)
+        sprite_section_layout.addWidget(self.sprite_context_label)
         sprite_section_layout.addLayout(browser_row)
         sprite_section_layout.addWidget(self.list_widget, 1)
         sprite_actions = QHBoxLayout()
         sprite_actions.setSpacing(4)
         sprite_actions.addWidget(self.float_groups_button)
         sprite_actions.addWidget(self.float_sprites_button)
+        self.jump_edit = QLineEdit()
+        self.jump_edit.setPlaceholderText("Jump: #index, g:group, or name")
+        self.jump_edit.setClearButtonEnabled(True)
+        self.jump_edit.setMinimumWidth(160)
+        self.jump_edit.setMaximumWidth(260)
+        sprite_actions.addWidget(self.jump_edit)
+        self.jump_button = QPushButton("Go")
+        self.jump_button.setToolTip("Jump to matching visible sprite")
+        sprite_actions.addWidget(self.jump_button)
         sprite_actions.addStretch(1)
         sprite_actions.addWidget(QLabel("Zoom:"))
         sprite_actions.addWidget(self.zoom_slider)
@@ -2652,6 +2665,7 @@ class LoadedImagesPanel(QWidget):
         layout.addWidget(self.count_label)
         layout.addWidget(self.group_sprite_splitter, 1)
         self.list_widget.currentItemChanged.connect(on_selection_change)
+        self.list_widget.currentItemChanged.connect(self.on_sprite_selection_changed)
         self.list_widget.viewport().installEventFilter(self)
         self.display_mode_combo.currentIndexChanged.connect(self._on_browser_controls_changed)
         self.sort_mode_combo.currentIndexChanged.connect(self._on_browser_controls_changed)
@@ -2666,6 +2680,8 @@ class LoadedImagesPanel(QWidget):
         self.float_groups_button.toggled.connect(self._set_group_panel_floating)
         self.float_sprites_button.toggled.connect(self._set_sprite_panel_floating)
         self.search_edit.textChanged.connect(self._on_search_text_changed)
+        self.jump_button.clicked.connect(self._on_jump_requested)
+        self.jump_edit.returnPressed.connect(self._on_jump_requested)
         self.browser_settings_close_button.clicked.connect(self.browser_settings_dialog.close)
 
         self.search_focus_shortcut = QShortcut(QKeySequence.StandardKey.Find, self)
@@ -2845,6 +2861,67 @@ class LoadedImagesPanel(QWidget):
     def _on_search_text_changed(self, _text: str) -> None:
         self.apply_browser_search_filter()
 
+    def _update_sprite_context_label(self) -> None:
+        total = int(self.list_widget.count())
+        visible = len(self._visible_rows())
+        current_item = self.list_widget.currentItem()
+        if current_item is not None and not current_item.isHidden():
+            current_name = current_item.text() or "(unnamed)"
+            self.sprite_context_label.setText(f"Selected: {current_name} • Visible: {visible}/{total}")
+        else:
+            self.sprite_context_label.setText(f"No sprite selected • Visible: {visible}/{total}")
+
+    def _on_jump_requested(self) -> None:
+        query = (self.jump_edit.text() or "").strip()
+        if not query:
+            return
+
+        visible_rows = self._visible_rows()
+        if not visible_rows:
+            return
+
+        query_lower = query.lower()
+        target_row: int | None = None
+
+        if query_lower.startswith("#"):
+            try:
+                one_based = int(query_lower[1:])
+            except ValueError:
+                one_based = -1
+            if one_based > 0:
+                row = one_based - 1
+                if row in visible_rows:
+                    target_row = row
+        elif query_lower.startswith("g:"):
+            group_q = query_lower[2:].strip()
+            if group_q:
+                for row in visible_rows:
+                    item = self.list_widget.item(row)
+                    if item is None:
+                        continue
+                    group_id = str(item.data(_GROUP_ID_ROLE) or "")
+                    if group_q in group_id.lower():
+                        target_row = row
+                        break
+        else:
+            for row in visible_rows:
+                item = self.list_widget.item(row)
+                if item is None:
+                    continue
+                name_text = (item.text() or "").lower()
+                path_text = (item.toolTip() or "").lower()
+                if query_lower in name_text or query_lower in path_text:
+                    target_row = row
+                    break
+
+        if target_row is None:
+            return
+        self.list_widget.setCurrentRow(target_row)
+        target_item = self.list_widget.item(target_row)
+        if target_item is not None:
+            self.list_widget.scrollToItem(target_item)
+        self._update_sprite_context_label()
+
     def _item_matches_search(self, item: QListWidgetItem, needle: str) -> bool:
         text = (item.text() or "").lower()
         tooltip = (item.toolTip() or "").lower()
@@ -2889,8 +2966,8 @@ class LoadedImagesPanel(QWidget):
     def apply_browser_search_filter(self) -> None:
         needle = self.browser_search_text().lower()
         list_widget = self.list_widget
-        selected_before = list_widget.currentItem()
-        selected_before_key = selected_before.data(Qt.ItemDataRole.UserRole) if selected_before is not None else None
+        current_item = list_widget.currentItem()
+        had_current_hidden = bool(current_item is not None and current_item.isHidden())
 
         updates_enabled = list_widget.updatesEnabled()
         list_widget.setUpdatesEnabled(False)
@@ -2904,29 +2981,16 @@ class LoadedImagesPanel(QWidget):
                 if not match:
                     item.setSelected(False)
 
-            visible_rows = self._visible_rows()
-            if not visible_rows:
+            current_item_after = list_widget.currentItem()
+            if current_item_after is not None and current_item_after.isHidden():
                 list_widget.clearSelection()
                 list_widget.setCurrentItem(None)
-            else:
-                current_item = list_widget.currentItem()
-                if current_item is None or current_item.isHidden():
-                    preferred_row = None
-                    if selected_before_key:
-                        for row in visible_rows:
-                            candidate = list_widget.item(row)
-                            if candidate is not None and candidate.data(Qt.ItemDataRole.UserRole) == selected_before_key:
-                                preferred_row = row
-                                break
-                    if preferred_row is None:
-                        preferred_row = visible_rows[0]
-                    list_widget.setCurrentRow(preferred_row)
-                    target = list_widget.item(preferred_row)
-                    if target is not None:
-                        list_widget.scrollToItem(target)
+            elif current_item_after is None and had_current_hidden:
+                list_widget.clearSelection()
         finally:
             list_widget.setUpdatesEnabled(updates_enabled)
             list_widget.viewport().update()
+        self._update_sprite_context_label()
 
     def _schedule_browser_change_emit(self) -> None:
         count = self.list_widget.count()
@@ -3094,6 +3158,9 @@ class LoadedImagesPanel(QWidget):
                     event.accept()
                     return True
         return super().eventFilter(watched, event)
+
+    def on_sprite_selection_changed(self, *_args: object) -> None:
+        self._update_sprite_context_label()
 
     def set_project_info(
         self,
