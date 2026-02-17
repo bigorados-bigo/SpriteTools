@@ -1,0 +1,47 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-dev.txt
+
+      - name: Build executable
+        shell: pwsh
+        run: |
+          python -m PyInstaller --noconfirm --clean SpriteTools.spec
+          Copy-Item dist/SpriteTools.exe "dist/SpriteTools-${{ github.ref_name }}.exe" -Force
+          Compress-Archive -Path dist/SpriteTools.exe -DestinationPath dist/SpriteTools-win64.zip -Force
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: SpriteTools ${{ github.ref_name }}
+          body: |
+            SpriteTools ${{ github.ref_name }}
+
+            Automated tag build.
+            See RELEASE_NOTES.md for full details.
+          files: |
+            dist/SpriteTools-${{ github.ref_name }}.exe
+            dist/SpriteTools-win64.zip

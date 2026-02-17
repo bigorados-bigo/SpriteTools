@@ -19,3 +19,14 @@ sprite_tools_debug.log
 temp_rgb.png
 debug_frame_*.png
 616.png
+
+# Local project/test artifacts
+Projects/
+TestResults/
+
+# Local assistant/planning artifacts
+docs/assistant-context/
+docs/image/
+
+# Local exported settings
+spritetools-shortcuts.json
