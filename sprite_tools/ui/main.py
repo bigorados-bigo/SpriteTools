@@ -2504,18 +2504,16 @@ class LoadedImagesPanel(QWidget):
         self.zoom_value_label = QLabel("64")
         self.zoom_value_label.setMinimumWidth(30)
         browser_row.addWidget(self.zoom_value_label)
+        browser_row.addStretch(1)
 
         self.float_groups_button = QPushButton("Float Groups")
         self.float_groups_button.setCheckable(True)
         self.float_groups_button.setToolTip("Open Groups panel in a floating window")
-        browser_row.addWidget(self.float_groups_button)
 
         self.float_sprites_button = QPushButton("Float Sprites")
         self.float_sprites_button.setCheckable(True)
         self.float_sprites_button.setToolTip("Open Sprites panel in a floating window")
-        browser_row.addWidget(self.float_sprites_button)
 
-        browser_row.addStretch(1)
         self._zoom_by_view: Dict[str, int] = {
             "list": int(self.zoom_slider.value()),
             "thumbnails": int(self.zoom_slider.value()),
@@ -2564,8 +2562,8 @@ class LoadedImagesPanel(QWidget):
         settings_buttons.addWidget(self.browser_settings_close_button)
         settings_root.addLayout(settings_buttons)
         
-        self.clear_button = QPushButton("Clear Sprites")
-        self.clear_button.setToolTip("Remove all currently loaded sprites from the workspace")
+        self.clear_button = QPushButton("Clear All…")
+        self.clear_button.setToolTip("Dangerous action: hold Shift while clicking to clear all loaded sprites")
         self.clear_button.setMaximumHeight(24)
         self.count_label = QLabel("No files loaded")
         self.count_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -2632,6 +2630,13 @@ class LoadedImagesPanel(QWidget):
         sprite_section_layout.addWidget(sprite_label)
         sprite_section_layout.addLayout(browser_row)
         sprite_section_layout.addWidget(self.list_widget, 1)
+        sprite_actions = QHBoxLayout()
+        sprite_actions.setSpacing(4)
+        sprite_actions.addWidget(self.float_groups_button)
+        sprite_actions.addWidget(self.float_sprites_button)
+        sprite_actions.addStretch(1)
+        sprite_actions.addWidget(self.clear_button)
+        sprite_section_layout.addLayout(sprite_actions)
 
         self.group_sprite_splitter = QSplitter(Qt.Orientation.Vertical)
         self.group_sprite_splitter.addWidget(self.group_section)
@@ -2641,7 +2646,6 @@ class LoadedImagesPanel(QWidget):
         self.group_sprite_splitter.setStretchFactor(1, 3)
         self.group_sprite_splitter.setSizes([190, 430])
 
-        layout.addWidget(self.clear_button)
         layout.addWidget(self.project_info_label)
         layout.addWidget(self.count_label)
         layout.addWidget(self.group_sprite_splitter, 1)
@@ -7072,6 +7076,14 @@ class SpriteToolsWindow(QMainWindow):
     def _clear_all_sprites(self) -> None:
         """Clear all loaded sprites and reset palette."""
         if not self.sprite_records:
+            return
+
+        if not bool(QApplication.keyboardModifiers() & Qt.KeyboardModifier.ShiftModifier):
+            QMessageBox.information(
+                self,
+                "Clear All Sprites",
+                "Hold Shift and click 'Clear All…' to confirm this dangerous action.",
+            )
             return
         
         reply = QMessageBox.question(
