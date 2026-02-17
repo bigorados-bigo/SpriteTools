@@ -2511,12 +2511,18 @@ class LoadedImagesPanel(QWidget):
         self.float_groups_button = QPushButton("Float Groups")
         self.float_groups_button.setCheckable(True)
         self.float_groups_button.setToolTip("Open Groups panel in a floating window")
-        self.float_groups_button.setMaximumWidth(92)
+        self.float_groups_button.setText("")
+        self.float_groups_button.setAccessibleName("Float Groups")
+        self.float_groups_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_FileDialogDetailedView))
+        self.float_groups_button.setFixedWidth(28)
 
         self.float_sprites_button = QPushButton("Float Sprites")
         self.float_sprites_button.setCheckable(True)
         self.float_sprites_button.setToolTip("Open Sprites panel in a floating window")
-        self.float_sprites_button.setMaximumWidth(92)
+        self.float_sprites_button.setText("")
+        self.float_sprites_button.setAccessibleName("Float Sprites")
+        self.float_sprites_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_FileDialogListView))
+        self.float_sprites_button.setFixedWidth(28)
 
         self._zoom_by_view: Dict[str, int] = {
             "list": int(self.zoom_slider.value()),
@@ -2569,7 +2575,10 @@ class LoadedImagesPanel(QWidget):
         self.clear_button = QPushButton("Clear All…")
         self.clear_button.setToolTip("Dangerous action: hold Shift while clicking to clear all loaded sprites")
         self.clear_button.setMaximumHeight(24)
-        self.clear_button.setMaximumWidth(92)
+        self.clear_button.setText("")
+        self.clear_button.setAccessibleName("Clear All Sprites")
+        self.clear_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_DialogDiscardButton))
+        self.clear_button.setFixedWidth(28)
         self.count_label = QLabel("No files loaded")
         self.count_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.project_info_label = QLabel("Workspace: Unsaved")
