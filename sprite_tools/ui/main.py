@@ -2531,6 +2531,8 @@ class LoadedImagesPanel(QWidget):
         self._last_view_mode = "list"
         self._group_panel_floating = False
         self._sprite_panel_floating = False
+        self._group_panel_saved_geometry: bytes | None = None
+        self._sprite_panel_saved_geometry: bytes | None = None
 
         self.group_float_dialog = QDialog(self)
         self.group_float_dialog.setWindowTitle("Groups")
@@ -2751,6 +2753,50 @@ class LoadedImagesPanel(QWidget):
 
     def browser_search_text(self) -> str:
         return self.search_edit.text().strip()
+
+    def browser_group_panel_floating(self) -> bool:
+        return bool(self._group_panel_floating)
+
+    def browser_sprite_panel_floating(self) -> bool:
+        return bool(self._sprite_panel_floating)
+
+    def browser_group_panel_geometry(self) -> bytes | None:
+        if self.group_float_dialog.isVisible():
+            try:
+                return bytes(self.group_float_dialog.saveGeometry())
+            except Exception:  # noqa: BLE001
+                return self._group_panel_saved_geometry
+        return self._group_panel_saved_geometry
+
+    def browser_sprite_panel_geometry(self) -> bytes | None:
+        if self.sprite_float_dialog.isVisible():
+            try:
+                return bytes(self.sprite_float_dialog.saveGeometry())
+            except Exception:  # noqa: BLE001
+                return self._sprite_panel_saved_geometry
+        return self._sprite_panel_saved_geometry
+
+    def apply_browser_panel_window_settings(
+        self,
+        *,
+        group_floating: bool,
+        sprite_floating: bool,
+        group_geometry: bytes | None = None,
+        sprite_geometry: bytes | None = None,
+    ) -> None:
+        self._group_panel_saved_geometry = bytes(group_geometry) if group_geometry else None
+        self._sprite_panel_saved_geometry = bytes(sprite_geometry) if sprite_geometry else None
+
+        blocked_group = self.float_groups_button.blockSignals(True)
+        blocked_sprite = self.float_sprites_button.blockSignals(True)
+        try:
+            self.float_groups_button.setChecked(bool(group_floating))
+            self._set_group_panel_floating(bool(group_floating))
+            self.float_sprites_button.setChecked(bool(sprite_floating))
+            self._set_sprite_panel_floating(bool(sprite_floating))
+        finally:
+            self.float_groups_button.blockSignals(blocked_group)
+            self.float_sprites_button.blockSignals(blocked_sprite)
 
     def _clamp_browser_zoom(self, zoom: int) -> int:
         return max(int(self.zoom_slider.minimum()), min(int(self.zoom_slider.maximum()), int(zoom)))
@@ -3041,18 +3087,31 @@ class LoadedImagesPanel(QWidget):
             self.group_section.setParent(None)
             self.group_float_dialog_layout.addWidget(self.group_section)
             self.group_float_dialog.resize(520, 340)
+            if self._group_panel_saved_geometry:
+                try:
+                    self.group_float_dialog.restoreGeometry(self._group_panel_saved_geometry)
+                except Exception:  # noqa: BLE001
+                    pass
             self.group_float_dialog.show()
             self.group_float_dialog.raise_()
             self.group_float_dialog.activateWindow()
             self._group_panel_floating = True
+            if self._on_browser_settings_change is not None:
+                self._on_browser_settings_change()
             return
 
         if not self._group_panel_floating:
             return
+        try:
+            self._group_panel_saved_geometry = bytes(self.group_float_dialog.saveGeometry())
+        except Exception:  # noqa: BLE001
+            pass
         self.group_section.setParent(None)
         self.group_sprite_splitter.insertWidget(0, self.group_section)
         self.group_float_dialog.hide()
         self._group_panel_floating = False
+        if self._on_browser_settings_change is not None:
+            self._on_browser_settings_change()
 
     def _set_sprite_panel_floating(self, enabled: bool) -> None:
         if enabled:
@@ -3061,18 +3120,31 @@ class LoadedImagesPanel(QWidget):
             self.sprite_section.setParent(None)
             self.sprite_float_dialog_layout.addWidget(self.sprite_section)
             self.sprite_float_dialog.resize(620, 460)
+            if self._sprite_panel_saved_geometry:
+                try:
+                    self.sprite_float_dialog.restoreGeometry(self._sprite_panel_saved_geometry)
+                except Exception:  # noqa: BLE001
+                    pass
             self.sprite_float_dialog.show()
             self.sprite_float_dialog.raise_()
             self.sprite_float_dialog.activateWindow()
             self._sprite_panel_floating = True
+            if self._on_browser_settings_change is not None:
+                self._on_browser_settings_change()
             return
 
         if not self._sprite_panel_floating:
             return
+        try:
+            self._sprite_panel_saved_geometry = bytes(self.sprite_float_dialog.saveGeometry())
+        except Exception:  # noqa: BLE001
+            pass
         self.sprite_section.setParent(None)
         self.group_sprite_splitter.insertWidget(1, self.sprite_section)
         self.sprite_float_dialog.hide()
         self._sprite_panel_floating = False
+        if self._on_browser_settings_change is not None:
+            self._on_browser_settings_change()
 
     def _apply_browser_mode(self) -> None:
         zoom = self.browser_zoom()
@@ -3134,6 +3206,10 @@ class LoadedImagesPanel(QWidget):
 
         if watched is group_dialog and event_type == _EVENT_TYPE_CLOSE:
             if group_floating and groups_button is not None:
+                try:
+                    self._group_panel_saved_geometry = bytes(self.group_float_dialog.saveGeometry())
+                except Exception:  # noqa: BLE001
+                    pass
                 blocked = groups_button.blockSignals(True)
                 groups_button.setChecked(False)
                 groups_button.blockSignals(blocked)
@@ -3142,6 +3218,10 @@ class LoadedImagesPanel(QWidget):
 
         if watched is sprite_dialog and event_type == _EVENT_TYPE_CLOSE:
             if sprite_floating and sprites_button is not None:
+                try:
+                    self._sprite_panel_saved_geometry = bytes(self.sprite_float_dialog.saveGeometry())
+                except Exception:  # noqa: BLE001
+                    pass
                 blocked = sprites_button.blockSignals(True)
                 sprites_button.setChecked(False)
                 sprites_button.blockSignals(blocked)
@@ -6338,6 +6418,16 @@ class SpriteToolsWindow(QMainWindow):
         self._set_pref("browser/sprites_group_square_padding", int(self.images_panel.browser_group_square_padding()))
         self._set_pref("browser/sprites_group_square_fill_alpha", int(self.images_panel.browser_group_square_fill_alpha()))
         self._set_pref("browser/sprites_scroll_speed", int(self.images_panel.browser_scroll_speed()))
+        self._set_pref("browser/sprites_group_panel_floating", bool(self.images_panel.browser_group_panel_floating()))
+        self._set_pref("browser/sprites_sprite_panel_floating", bool(self.images_panel.browser_sprite_panel_floating()))
+
+        group_geometry = self.images_panel.browser_group_panel_geometry()
+        if group_geometry:
+            self._set_pref("browser/sprites_group_panel_geometry", group_geometry)
+
+        sprite_geometry = self.images_panel.browser_sprite_panel_geometry()
+        if sprite_geometry:
+            self._set_pref("browser/sprites_sprite_panel_geometry", sprite_geometry)
 
     def _load_load_mode_setting(self) -> None:
         mode_value = str(self._settings.value("import/load_mode", "detect")).strip().lower()
@@ -6364,6 +6454,33 @@ class SpriteToolsWindow(QMainWindow):
         zoom = self._get_pref_int("browser/sprites_zoom", 64)
         list_zoom = self._get_pref_int("browser/sprites_zoom_list", zoom)
         thumbnails_zoom = self._get_pref_int("browser/sprites_zoom_thumbnails", zoom)
+        group_panel_floating = self._get_pref_bool("browser/sprites_group_panel_floating", False)
+        sprite_panel_floating = self._get_pref_bool("browser/sprites_sprite_panel_floating", False)
+        group_panel_geometry = self._settings.value("browser/sprites_group_panel_geometry")
+        sprite_panel_geometry = self._settings.value("browser/sprites_sprite_panel_geometry")
+
+        parsed_group_geometry: bytes | None = None
+        if isinstance(group_panel_geometry, bytes):
+            parsed_group_geometry = group_panel_geometry
+        elif isinstance(group_panel_geometry, bytearray):
+            parsed_group_geometry = bytes(group_panel_geometry)
+        elif group_panel_geometry is not None:
+            try:
+                parsed_group_geometry = bytes(group_panel_geometry)
+            except Exception:  # noqa: BLE001
+                parsed_group_geometry = None
+
+        parsed_sprite_geometry: bytes | None = None
+        if isinstance(sprite_panel_geometry, bytes):
+            parsed_sprite_geometry = sprite_panel_geometry
+        elif isinstance(sprite_panel_geometry, bytearray):
+            parsed_sprite_geometry = bytes(sprite_panel_geometry)
+        elif sprite_panel_geometry is not None:
+            try:
+                parsed_sprite_geometry = bytes(sprite_panel_geometry)
+            except Exception:  # noqa: BLE001
+                parsed_sprite_geometry = None
+
         self.images_panel.apply_browser_settings(
             view_mode=view_mode,
             sort_mode=sort_mode,
@@ -6376,10 +6493,16 @@ class SpriteToolsWindow(QMainWindow):
             group_square_fill_alpha=group_square_fill_alpha,
             scroll_speed=scroll_speed,
         )
+        self.images_panel.apply_browser_panel_window_settings(
+            group_floating=group_panel_floating,
+            sprite_floating=sprite_panel_floating,
+            group_geometry=parsed_group_geometry,
+            sprite_geometry=parsed_sprite_geometry,
+        )
         self._last_browser_sort_mode = self.images_panel.browser_sort_mode()
         self._last_browser_view_mode = self.images_panel.browser_view_mode()
         logger.debug(
-            "Loaded sprite browser settings view=%s sort=%s zoom=%s list_zoom=%s thumbs_zoom=%s marker=%s border=%s pad=%s fill=%s scroll=%s",
+            "Loaded sprite browser settings view=%s sort=%s zoom=%s list_zoom=%s thumbs_zoom=%s marker=%s border=%s pad=%s fill=%s scroll=%s group_float=%s sprite_float=%s",
             view_mode,
             sort_mode,
             zoom,
@@ -6390,6 +6513,8 @@ class SpriteToolsWindow(QMainWindow):
             group_square_padding,
             group_square_fill_alpha,
             scroll_speed,
+            group_panel_floating,
+            sprite_panel_floating,
         )
 
     def _save_persistent_ui_state(self) -> None:
