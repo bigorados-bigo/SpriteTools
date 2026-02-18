@@ -245,6 +245,49 @@ Make sprite and group workflows feel like a modern file explorer: fast browsing,
 
 ---
 
+## 7) Reusable Spawnable UI Bases (Master Step)
+
+### Goal
+Refactor major UI workspaces into reusable base components that can be spawned in multiple contexts (main view, pivot assist, dedicated tools) without duplicating behavior.
+
+### Why This Matters
+- Prevent feature drift between main timeline/preview and pivot-assist timeline/preview.
+- Make new features automatically available in all spawned workspaces.
+- Reduce maintenance risk when timeline or preview behavior changes.
+
+### Target Architecture
+- Extract timeline UI + behavior into a reusable `AnimationTimelineWorkspace` (widget/controller pair).
+- Extract preview controls + rendering behavior into a reusable `PreviewWorkspace` with mode support:
+  - sprite edit,
+  - animation assist.
+- Introduce host-level integration points (callbacks/service interfaces) instead of direct cross-widget coupling.
+- Keep project/model state centralized in existing window/state services while UI workspaces remain reusable views/controllers.
+
+### Migration Strategy (Phased, Non-Astronomical)
+
+#### Phase R1 — UI Shell Extraction
+- Move timeline panel construction into reusable class with no behavior changes.
+- Move preview control strip construction into reusable class with no behavior changes.
+
+#### Phase R2 — Controller Extraction
+- Move playback/range/scrub/selection logic into reusable controller(s).
+- Replace ad-hoc dialog-specific logic with host adapters.
+
+#### Phase R3 — Dual Host Adoption
+- Main window adopts reusable timeline/preview workspaces.
+- Pivot Assist adopts the same workspaces (proxy parity by design).
+
+#### Phase R4 — Cleanup + Hardening
+- Remove duplicated fallback paths.
+- Add regression checklist covering parity across hosts.
+
+### Effort/Risk Note
+- This is a medium-to-large refactor, but feasible in incremental phases.
+- Not an astronomical rewrite if done with compatibility shims and phase gates.
+- Recommended to schedule as a dedicated milestone after current pivot-assist stabilization.
+
+---
+
 ## Roadmap Phases
 
 ## Phase A — Foundation (Low Risk)
@@ -298,6 +341,15 @@ Exit criteria:
 Exit criteria:
 - End-to-end animation prep is manageable for large projects with minimal manual repetition.
 
+## Phase E — Reusable Workspace Core
+
+- Execute the Reusable Spawnable UI Bases master step (Section 7).
+- Converge main timeline/preview and pivot-assist timeline/preview onto shared workspace components.
+- Verify shortcut, playback, onion, duration, and range behavior parity across hosts.
+
+Exit criteria:
+- Timeline/preview feature updates are implemented once and reflected in all spawned workspace hosts.
+
 ---
 
 ## Architectural Guidance (Do Not Break Core)
@@ -330,6 +382,9 @@ Exit criteria:
 11. Shortcut action registry + metadata model (category/label/default binding).
 12. Keybindings window (edit/reset/conflict resolution).
 13. Keybinding profile import/export support.
+14. Reusable `AnimationTimelineWorkspace` extraction (UI shell first).
+15. Reusable `PreviewWorkspace` extraction (mode parity: sprite edit + animation assist).
+16. Host adapter layer for main window + pivot assist workspace spawning.
 
 ---
 

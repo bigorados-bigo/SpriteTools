@@ -1,5 +1,33 @@
 # SpriteTools Release Notes
 
+## v0.4.0 (Main)
+
+### Animation + Timeline Authoring
+
+- Added sprite-list to timeline drag-and-drop frame insertion in Animation Timeline.
+- Added animation slot-aware creation: `New` now uses selected empty slot or next empty slot.
+- Added `New from Selection` to create a tag directly from current sprite selection.
+- Added drag-to-empty-animation-slot creation from sprite selection.
+- New animation tags now auto-set `out` to match frame count on creation.
+
+### Replacement + Sorting + Sync
+
+- Added numeric-aware natural sorting for name/path/group surfaces.
+- Added Ctrl+drop source-replacement flow for sprite list and timeline with improved feedback.
+- Added ordered multi-file batch replacement and timeline overflow append behavior.
+- Hardened animation source remapping so frame references update consistently across runtime key forms.
+- Improved timeline/frame selection palette sync and playhead landing behavior.
+
+### Input + Shortcut Ownership
+
+- Added hold-to-seek behavior for Pivot Assist left/right seek keys.
+- Fixed sprite-list drag initiation and post-drag selection state issues.
+- Added focus ownership guards so sprite list and swatches keep arrow-key navigation without firing window-level seek shortcuts.
+
+### Notes
+
+- This release supersedes `v0.3.2` for current `main`.
+
 ## v0.3.2 (Main)
 
 ### Sprite Browser Stability + UX

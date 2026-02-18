@@ -31,7 +31,7 @@ jobs:
         run: |
           python -m PyInstaller --noconfirm --clean SpriteTools.spec
           Copy-Item dist/SpriteTools.exe "dist/SpriteTools-${{ github.ref_name }}.exe" -Force
-          Compress-Archive -Path dist/SpriteTools.exe -DestinationPath dist/SpriteTools-win64.zip -Force
+          Compress-Archive -Path dist/SpriteTools.exe -DestinationPath "dist/SpriteTools-${{ github.ref_name }}-win64.zip" -Force
 
       - name: Publish release
         uses: softprops/action-gh-release@v2
@@ -44,4 +44,4 @@ jobs:
             See RELEASE_NOTES.md for full details.
           files: |
             dist/SpriteTools-${{ github.ref_name }}.exe
-            dist/SpriteTools-win64.zip
+            dist/SpriteTools-${{ github.ref_name }}-win64.zip

@@ -156,13 +156,13 @@ Release automation is now tag-driven via GitHub Actions:
 Published release assets:
 
 - `SpriteTools-vX.Y.Z.exe`
-- `SpriteTools-win64.zip`
+- `SpriteTools-vX.Y.Z-win64.zip`
 
 Optional manual fallback (if automation is unavailable):
 
 ```pwsh
 python -m PyInstaller --noconfirm --clean SpriteTools.spec
 Copy-Item dist/SpriteTools.exe dist/SpriteTools-vX.Y.Z.exe -Force
-Compress-Archive -Path dist/SpriteTools.exe -DestinationPath dist/SpriteTools-win64.zip -Force
-gh release create vX.Y.Z dist/SpriteTools-vX.Y.Z.exe dist/SpriteTools-win64.zip --title "SpriteTools vX.Y.Z"
+Compress-Archive -Path dist/SpriteTools.exe -DestinationPath dist/SpriteTools-vX.Y.Z-win64.zip -Force
+gh release create vX.Y.Z dist/SpriteTools-vX.Y.Z.exe dist/SpriteTools-vX.Y.Z-win64.zip --title "SpriteTools vX.Y.Z"
 ```

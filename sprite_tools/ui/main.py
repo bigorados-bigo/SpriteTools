@@ -10,7 +10,7 @@ from collections import OrderedDict, defaultdict, deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, DefaultDict, Dict, List, Literal, Sequence, Tuple
+from typing import Any, Callable, DefaultDict, Dict, List, Literal, Sequence, Tuple, cast
 
 import logging
 import os
@@ -55,6 +55,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QInputDialog,
     QKeySequenceEdit,
+    QMenu,
     QPushButton,
     QGroupBox,
     QScrollArea,
@@ -78,7 +79,9 @@ except Exception:  # noqa: BLE001
     QOpenGLWidget = None
 
 from sprite_tools.file_scanner import ScanOptions, iter_image_files, is_supported_image
+from sprite_tools.axis_presets import AxisPreset, load_axis_presets_from_directory
 from sprite_tools.palette_ops import PaletteError, PaletteInfo, extract_palette, read_act_palette
+from sprite_tools.pivot_assist import PivotAssistFrame, build_pivot_assist_result
 from sprite_tools.project_system import PROJECT_MANIFEST_NAME, ProjectManifest, ProjectPaths, ProjectService, ProjectSpriteEntry
 from sprite_tools.quantization import quantize_image
 from sprite_tools.processing import ProcessOptions, process_image_object, process_sprite, write_act
@@ -97,6 +100,7 @@ _TIMELINE_FRAME_LABEL_ROLE = Qt.ItemDataRole.UserRole + 13
 _TIMELINE_FRAME_DURATION_ROLE = Qt.ItemDataRole.UserRole + 14
 _TIMELINE_FRAME_NUMBER_ROLE = Qt.ItemDataRole.UserRole + 15
 _TIMELINE_FRAME_NAME_ROLE = Qt.ItemDataRole.UserRole + 16
+_ANIM_TAG_SLOT_KIND_ROLE = Qt.ItemDataRole.UserRole + 30
 _BROWSER_REBUILD_WARN_MS = 40.0
 _BROWSER_INPLACE_WARN_MS = 20.0
 _SPRITE_ICON_CACHE_LIMIT = 8192
@@ -121,6 +125,21 @@ _GROUP_COLOR_PRESETS: List[ColorTuple] = [
     (240, 150, 210),
     (200, 200, 120),
 ]
+
+
+def _natural_sort_parts(text: str) -> tuple[Any, ...]:
+    lowered = str(text or "").casefold()
+    if not lowered:
+        return ("",)
+    parts: List[Any] = []
+    for token in re.split(r"(\d+)", lowered):
+        if token == "":
+            continue
+        if token.isdigit():
+            parts.append((0, int(token)))
+        else:
+            parts.append((1, token))
+    return tuple(parts)
 
 
 def _setup_debug_logging() -> None:
@@ -450,6 +469,23 @@ class AnimationTag:
     state_label: str = ""
     frames: List[AnimationFrameEntry] = field(default_factory=list)
     notes: str = ""
+    color: ColorTuple = (120, 120, 120)
+    in_frame: int = 0
+    out_frame: int = 1
+    sort_index: int = 0
+    created_at_utc: str = ""
+
+    @staticmethod
+    def _parse_color(payload: Any, default: ColorTuple = (120, 120, 120)) -> ColorTuple:
+        if isinstance(payload, (list, tuple)) and len(payload) >= 3:
+            try:
+                r = max(0, min(255, int(payload[0])))
+                g = max(0, min(255, int(payload[1])))
+                b = max(0, min(255, int(payload[2])))
+                return (r, g, b)
+            except (TypeError, ValueError):
+                return default
+        return default
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -458,6 +494,11 @@ class AnimationTag:
             "state_label": str(self.state_label or ""),
             "frames": [frame.to_dict() for frame in self.frames],
             "notes": str(self.notes or ""),
+            "color": [int(self.color[0]), int(self.color[1]), int(self.color[2])],
+            "in_frame": max(0, int(self.in_frame)),
+            "out_frame": max(1, int(self.out_frame)),
+            "sort_index": int(self.sort_index),
+            "created_at_utc": str(self.created_at_utc or ""),
         }
 
     @classmethod
@@ -468,6 +509,11 @@ class AnimationTag:
             raise ValueError("Animation tag missing id/name")
         state_label = str(payload.get("state_label", "") or "")
         notes = str(payload.get("notes", "") or "")
+        color = cls._parse_color(payload.get("color", (120, 120, 120)))
+        in_frame = max(0, int(payload.get("in_frame", 0)))
+        out_frame = max(in_frame + 1, int(payload.get("out_frame", 1)))
+        sort_index = int(payload.get("sort_index", 0))
+        created_at_utc = str(payload.get("created_at_utc", "") or "")
         frames_raw = payload.get("frames", [])
         frames: List[AnimationFrameEntry] = []
         if isinstance(frames_raw, list):
@@ -478,7 +524,18 @@ class AnimationTag:
                     frames.append(AnimationFrameEntry.from_dict(frame_payload))
                 except Exception:  # noqa: BLE001
                     continue
-        return cls(tag_id=tag_id, name=name, state_label=state_label, frames=frames, notes=notes)
+        return cls(
+            tag_id=tag_id,
+            name=name,
+            state_label=state_label,
+            frames=frames,
+            notes=notes,
+            color=color,
+            in_frame=in_frame,
+            out_frame=out_frame,
+            sort_index=sort_index,
+            created_at_utc=created_at_utc,
+        )
 
 
 @dataclass
@@ -893,7 +950,7 @@ class PaletteModel(QAbstractListModel):
         self.last_index_remap: Dict[int, int] | None = None
 
     def rowCount(self, parent: QModelIndex | None = None) -> int:  # type: ignore[override]
-        if parent and parent.isValid():
+        if parent is not None and parent.isValid():
             return 0
         return 256  # Always 256 slots
 
@@ -1033,7 +1090,7 @@ class PaletteModel(QAbstractListModel):
         if emit_signal:
             self.palette_changed.emit([c for c in self.colors if c is not None], reason)
 
-    def update_color(self, row: int, color: ColorTuple, alpha: int = 255) -> None:
+    def update_color(self, row: int, color: ColorTuple, alpha: int = 255, *, reason: str = "edit") -> None:
         if not (0 <= row < 256):
             return
         self.colors[row] = color
@@ -1042,7 +1099,7 @@ class PaletteModel(QAbstractListModel):
         self.dataChanged.emit(index, index, [Qt.DecorationRole, Qt.UserRole])
         logger.debug("Model update_color row=%s color=%s alpha=%s", row, color, alpha)
         self.last_index_remap = None
-        self.palette_changed.emit([c for c in self.colors if c is not None], "edit")
+        self.palette_changed.emit([c for c in self.colors if c is not None], str(reason or "edit"))
 
     def set_slot(self, row: int, color: ColorTuple | None, alpha: int = 255) -> None:
         if not (0 <= row < 256):
@@ -1197,6 +1254,7 @@ class PaletteListView(QListView):
             self._last_change_reason = "refresh"
 
     def _edit_index(self, index: QModelIndex) -> None:
+        self._disable_selected_color_preview_highlight()
         color = self.model_obj.data(index, Qt.UserRole)
         raw_alpha = self.model_obj.data(index, Qt.UserRole + 1)
         alpha = 255 if raw_alpha is None else max(0, min(255, int(raw_alpha)))
@@ -1207,15 +1265,35 @@ class PaletteListView(QListView):
             dialog.setWindowTitle(f"Add color to index {index.row()}")
             dialog.setOption(QColorDialog.ColorDialogOption.ShowAlphaChannel, True)
             dialog.setOption(QColorDialog.ColorDialogOption.DontUseNativeDialog, True)
+            live_applied = {"value": False}
+
+            def _apply_live_new(value: QColor) -> None:
+                if not value.isValid():
+                    return
+                live_applied["value"] = True
+                self.model_obj.update_color(
+                    int(index.row()),
+                    (value.red(), value.green(), value.blue()),
+                    value.alpha(),
+                    reason="refresh",
+                )
+
+            dialog.currentColorChanged.connect(_apply_live_new)
             if dialog.exec() != QDialog.DialogCode.Accepted:
+                if live_applied["value"]:
+                    self.model_obj.set_slot(int(index.row()), None, 255)
+                    self.model_obj.palette_changed.emit([c for c in self.model_obj.colors if c is not None], "refresh")
                 return
             result = dialog.currentColor()
             if not result.isValid():
+                if live_applied["value"]:
+                    self.model_obj.set_slot(int(index.row()), None, 255)
+                    self.model_obj.palette_changed.emit([c for c in self.model_obj.colors if c is not None], "refresh")
                 return
             new_color = (result.red(), result.green(), result.blue())
             new_alpha = result.alpha()
             logger.debug("PaletteListView add color to empty slot row=%s color=%s alpha=%s", index.row(), new_color, new_alpha)
-            self.model_obj.update_color(index.row(), new_color, new_alpha)
+            self.model_obj.update_color(index.row(), new_color, new_alpha, reason="edit")
             return
         
         if not isinstance(color, tuple):
@@ -1227,15 +1305,46 @@ class PaletteListView(QListView):
         dialog.setWindowTitle(f"Edit color at index {index.row()}")
         dialog.setOption(QColorDialog.ColorDialogOption.ShowAlphaChannel, True)
         dialog.setOption(QColorDialog.ColorDialogOption.DontUseNativeDialog, True)
+        original_color = (int(color[0]), int(color[1]), int(color[2]))
+        original_alpha = int(alpha)
+
+        def _apply_live_existing(value: QColor) -> None:
+            if not value.isValid():
+                return
+            self.model_obj.update_color(
+                int(index.row()),
+                (value.red(), value.green(), value.blue()),
+                value.alpha(),
+                reason="refresh",
+            )
+
+        dialog.currentColorChanged.connect(_apply_live_existing)
         if dialog.exec() != QDialog.DialogCode.Accepted:
+            self.model_obj.update_color(int(index.row()), original_color, original_alpha, reason="refresh")
             return
         result = dialog.currentColor()
         if not result.isValid():
+            self.model_obj.update_color(int(index.row()), original_color, original_alpha, reason="refresh")
             return
         updated = (result.red(), result.green(), result.blue())
         updated_alpha = result.alpha()
+        if updated == original_color and updated_alpha == original_alpha:
+            return
         logger.debug("PaletteListView edit row=%s new_color=%s alpha=%s", index.row(), updated, updated_alpha)
-        self.model_obj.update_color(index.row(), updated, updated_alpha)
+        self.model_obj.update_color(index.row(), updated, updated_alpha, reason="edit")
+
+    def _disable_selected_color_preview_highlight(self) -> None:
+        owner = self.window()
+        highlight_toggle = getattr(owner, "highlight_checkbox", None)
+        if highlight_toggle is None:
+            return
+        if not hasattr(highlight_toggle, "isChecked") or not hasattr(highlight_toggle, "setChecked"):
+            return
+        try:
+            if bool(highlight_toggle.isChecked()):
+                highlight_toggle.setChecked(False)
+        except Exception:  # noqa: BLE001
+            return
 
     def _handle_model_change(self, colors: List[ColorTuple], reason: str) -> None:
         self._last_change_reason = reason
@@ -1261,6 +1370,21 @@ class PaletteListView(QListView):
             self._paste_hex_color()
             return
         super().keyPressEvent(event)
+
+    def event(self, event) -> bool:  # type: ignore[override]
+        if event.type() == QEvent.Type.ShortcutOverride:
+            key = int(event.key()) if hasattr(event, "key") else -1
+            mods_obj = event.modifiers() if hasattr(event, "modifiers") else Qt.KeyboardModifier.NoModifier
+            mods = int(getattr(mods_obj, "value", 0))
+            if mods == 0 and key in (
+                int(Qt.Key.Key_Left),
+                int(Qt.Key.Key_Right),
+                int(Qt.Key.Key_Up),
+                int(Qt.Key.Key_Down),
+            ):
+                event.accept()
+                return True
+        return super().event(event)
 
     def set_show_index_labels(self, enabled: bool) -> None:
         self._delegate.show_index_labels = bool(enabled)
@@ -1841,7 +1965,9 @@ class PreviewCanvas(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._pixmap: QPixmap | None = None
+        self._backdrop_pixmap: QPixmap | None = None
         self._overlay_layers: List[tuple[int, QRegion, QColor]] = []
+        self._guide_options: Dict[str, object] = {}
         self._placeholder_text = "Select an image to preview"
         self.setMinimumSize(200, 200)
 
@@ -1853,6 +1979,18 @@ class PreviewCanvas(QWidget):
         if self._pixmap is not None and self._pixmap.cacheKey() == pixmap.cacheKey():
             return
         self._pixmap = pixmap
+        self.update()
+
+    def set_backdrop_pixmap(self, pixmap: QPixmap | None) -> None:
+        if pixmap is None:
+            if self._backdrop_pixmap is None:
+                return
+            self._backdrop_pixmap = None
+            self.update()
+            return
+        if self._backdrop_pixmap is not None and self._backdrop_pixmap.cacheKey() == pixmap.cacheKey():
+            return
+        self._backdrop_pixmap = pixmap
         self.update()
 
     def _pixmap_top_left(self) -> QPoint:
@@ -1895,6 +2033,108 @@ class PreviewCanvas(QWidget):
             return
         self.update(dirty.adjusted(-2, -2, 2, 2).intersected(self.rect()))
 
+    def set_guide_options(self, options: Dict[str, object]) -> None:
+        self._guide_options = dict(options)
+        self.update()
+
+    def _draw_guides(self, painter: QPainter, pixmap_rect: QRect, *, layer: str = "top") -> None:
+        opts = self._guide_options
+        if not opts:
+            return
+        source_w = max(1, int(opts.get("source_w", pixmap_rect.width())))
+        source_h = max(1, int(opts.get("source_h", pixmap_rect.height())))
+        if source_w <= 0 or source_h <= 0:
+            return
+
+        scale_x = float(pixmap_rect.width()) / float(source_w)
+        scale_y = float(pixmap_rect.height()) / float(source_h)
+
+        painter.save()
+        painter.setClipRect(pixmap_rect)
+
+        if bool(opts.get("show_grid", False)):
+            step = max(1, int(opts.get("grid_step", 8)))
+            grid_pen = QPen(QColor(255, 255, 255, 40))
+            grid_pen.setWidth(1)
+            painter.setPen(grid_pen)
+            x = 0
+            while x <= source_w:
+                px = int(round(pixmap_rect.x() + (x * scale_x)))
+                painter.drawLine(px, pixmap_rect.y(), px, pixmap_rect.bottom())
+                x += step
+            y = 0
+            while y <= source_h:
+                py = int(round(pixmap_rect.y() + (y * scale_y)))
+                painter.drawLine(pixmap_rect.x(), py, pixmap_rect.right(), py)
+                y += step
+
+        axis_layer = str(opts.get("axis_layer", "top") or "top").strip().lower()
+        if axis_layer not in {"top", "bottom"}:
+            axis_layer = "top"
+        if bool(opts.get("show_axis", False)) and axis_layer == layer:
+            axis_x = max(0, min(source_w, int(opts.get("axis_x", source_w // 2))))
+            axis_y = max(0, min(source_h, int(opts.get("axis_y", source_h // 2))))
+            axis_color_raw = opts.get("axis_color", (80, 180, 255))
+            if isinstance(axis_color_raw, (list, tuple)) and len(axis_color_raw) >= 3:
+                try:
+                    axis_r = max(0, min(255, int(axis_color_raw[0])))
+                    axis_g = max(0, min(255, int(axis_color_raw[1])))
+                    axis_b = max(0, min(255, int(axis_color_raw[2])))
+                except (TypeError, ValueError):
+                    axis_r, axis_g, axis_b = 80, 180, 255
+            else:
+                axis_r, axis_g, axis_b = 80, 180, 255
+            px = int(round(pixmap_rect.x() + (axis_x * scale_x)))
+            py = int(round(pixmap_rect.y() + (axis_y * scale_y)))
+            axis_pen = QPen(QColor(axis_r, axis_g, axis_b, 220))
+            axis_pen.setWidth(2)
+            painter.setPen(axis_pen)
+            painter.drawLine(px, pixmap_rect.y(), px, pixmap_rect.bottom())
+            painter.drawLine(pixmap_rect.x(), py, pixmap_rect.right(), py)
+
+        custom_axes_raw = opts.get("custom_axes", [])
+        if isinstance(custom_axes_raw, list):
+            for axis in custom_axes_raw:
+                if not isinstance(axis, dict):
+                    continue
+                try:
+                    axis_x = max(0, min(source_w, int(axis.get("x", source_w // 2))))
+                    axis_y = max(0, min(source_h, int(axis.get("y", source_h // 2))))
+                except (TypeError, ValueError):
+                    continue
+                color_raw = axis.get("color", (255, 190, 120, 220))
+                if isinstance(color_raw, (list, tuple)) and len(color_raw) >= 3:
+                    r = max(0, min(255, int(color_raw[0])))
+                    g = max(0, min(255, int(color_raw[1])))
+                    b = max(0, min(255, int(color_raw[2])))
+                    a = max(0, min(255, int(color_raw[3]))) if len(color_raw) >= 4 else 220
+                else:
+                    r, g, b, a = 255, 190, 120, 220
+                custom_layer = str(axis.get("layer", "top") or "top").strip().lower()
+                if custom_layer not in {"top", "bottom"}:
+                    custom_layer = "top"
+                if custom_layer != layer:
+                    continue
+                px = int(round(pixmap_rect.x() + (axis_x * scale_x)))
+                py = int(round(pixmap_rect.y() + (axis_y * scale_y)))
+                axis_pen = QPen(QColor(r, g, b, a))
+                axis_pen.setWidth(1)
+                axis_pen.setStyle(Qt.PenStyle.DashLine)
+                painter.setPen(axis_pen)
+                painter.drawLine(px, pixmap_rect.y(), px, pixmap_rect.bottom())
+                painter.drawLine(pixmap_rect.x(), py, pixmap_rect.right(), py)
+
+        if bool(opts.get("show_ground", False)):
+            ground_y = max(0, min(source_h, int(opts.get("ground_y", source_h - 1))))
+            py = int(round(pixmap_rect.y() + (ground_y * scale_y)))
+            ground_pen = QPen(QColor(120, 255, 120, 220))
+            ground_pen.setWidth(2)
+            ground_pen.setStyle(Qt.PenStyle.DashLine)
+            painter.setPen(ground_pen)
+            painter.drawLine(pixmap_rect.x(), py, pixmap_rect.right(), py)
+
+        painter.restore()
+
     def paintEvent(self, event) -> None:  # type: ignore[override]
         event_rect = event.rect() if hasattr(event, "rect") else self.rect()
         painter = QPainter(self)
@@ -1917,6 +2157,19 @@ class PreviewCanvas(QWidget):
             painter.end()
             return
 
+        if self._backdrop_pixmap is not None:
+            backdrop = self._backdrop_pixmap
+            backdrop_source = QRect(
+                max(0, exposed.x() - px),
+                max(0, exposed.y() - py),
+                max(0, min(exposed.width(), backdrop.width() - max(0, exposed.x() - px))),
+                max(0, min(exposed.height(), backdrop.height() - max(0, exposed.y() - py))),
+            )
+            if backdrop_source.width() > 0 and backdrop_source.height() > 0:
+                painter.drawPixmap(exposed, backdrop, backdrop_source)
+
+        self._draw_guides(painter, bounds, layer="bottom")
+
         source = QRect(exposed.x() - px, exposed.y() - py, exposed.width(), exposed.height())
         painter.drawPixmap(exposed, pixmap, source)
 
@@ -1932,6 +2185,8 @@ class PreviewCanvas(QWidget):
                 painter.setClipRegion(translated)
                 painter.fillRect(exposed, color)
                 painter.restore()
+
+        self._draw_guides(painter, bounds, layer="top")
 
         painter.end()
 
@@ -2012,6 +2267,7 @@ class PreviewPane(QWidget):
 
     def set_pixmap(self, pixmap: QPixmap | None, *, reset_zoom: bool = False) -> None:
         if pixmap is None:
+            self.image_label.set_backdrop_pixmap(None)
             self.image_label.set_display_pixmap(None)
             self.image_label.set_overlay_layers([])
             self._source_pixmap = None
@@ -2086,6 +2342,9 @@ class PreviewPane(QWidget):
             self._overlay_scaled_region_cache = {}
         self._overlay_source_size = QSize(source_size)
         self._push_overlay_layers_to_canvas()
+
+    def set_guide_options(self, options: Dict[str, object]) -> None:
+        self.image_label.set_guide_options(options)
 
     def _scaled_overlay_region(self, layer_key: int, region: QRegion, target_size: QSize) -> QRegion:
         source_w = max(1, int(self._overlay_source_size.width()))
@@ -2262,15 +2521,7 @@ class PreviewPane(QWidget):
             painter.end()
             display_pixmap = shifted
 
-        if backdrop is not None:
-            composed = QPixmap(backdrop)
-            painter = QPainter(composed)
-            if static_pixmap is not None:
-                painter.drawPixmap(0, 0, static_pixmap)
-            painter.drawPixmap(0, 0, display_pixmap)
-            painter.end()
-            display_pixmap = composed
-        elif static_pixmap is not None:
+        if static_pixmap is not None:
             composed = QPixmap(display_pixmap.size())
             composed.fill(Qt.GlobalColor.transparent)
             painter = QPainter(composed)
@@ -2279,6 +2530,7 @@ class PreviewPane(QWidget):
             painter.end()
             display_pixmap = composed
 
+        self.image_label.set_backdrop_pixmap(backdrop)
         self.image_label.set_display_pixmap(display_pixmap)
         self._push_overlay_layers_to_canvas()
         viewport_size = self.scroll_area.viewport().size()
@@ -2618,11 +2870,15 @@ class LoadedImagesPanel(QWidget):
         group_actions.addWidget(self.detach_group_button)
         group_actions.addWidget(self.auto_group_button)
 
-        self.list_widget = QListWidget()
+        self.list_widget = SpriteBrowserListWidget()
         self.list_widget.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.list_widget.setMovement(QListView.Movement.Static)
         self.list_widget.setResizeMode(QListView.ResizeMode.Adjust)
         self.list_widget.setUniformItemSizes(True)
+        self.list_widget.setDragEnabled(True)
+        self.list_widget.setDragDropMode(QAbstractItemView.DragDropMode.DragOnly)
+        self.list_widget.setSelectionRectVisible(False)
+        self.list_widget.setDefaultDropAction(Qt.DropAction.CopyAction)
         self.list_widget.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
         self.list_widget.setHorizontalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
 
@@ -3310,7 +3566,7 @@ class FloatingPaletteWindow(QWidget):
 
         root = QVBoxLayout(self)
         root.setContentsMargins(8, 8, 8, 8)
-        root.setSpacing(6)
+        root.setSpacing(4)
 
         controls = QHBoxLayout()
         self.load_button = QPushButton("Load")
@@ -3655,15 +3911,24 @@ class MergeOperationDialog(QDialog):
         self._destination_blink_timer = QTimer(self)
         self._destination_blink_timer.setInterval(30)
         self._destination_blink_timer.timeout.connect(self._tick_destination_blink)
+        self._applying_palette_view_options = False
+        self._pending_force_columns_retry = False
         self._view_columns = max(1, min(32, self._owner._get_pref_int("merge/view_columns", 8)))
         self._view_force_columns = self._owner._get_pref_bool("merge/view_force_columns", True)
         self._view_zoom = max(16, min(96, self._owner._get_pref_int("merge/view_zoom", 42)))
         self._view_gap = max(-8, min(20, self._owner._get_pref_int("merge/view_gap", 6)))
         self._view_show_indices = self._owner._get_pref_bool("merge/view_show_indices", True)
         self._view_show_grid = self._owner._get_pref_bool("merge/view_show_grid", True)
+        self._auto_merge_tolerance = max(0, min(255, self._owner._get_pref_int("merge/auto_tolerance", 10)))
+        self._guide_show_grid = bool(self._owner._preview_guides_show_grid)
+        self._guide_grid_step = max(1, min(64, int(self._owner._preview_guides_grid_step)))
+        self._guide_show_axis = bool(self._owner._preview_guides_show_axis)
+        self._guide_axis_x = max(-4096, min(4096, int(self._owner._preview_guides_axis_x)))
+        self._guide_axis_y = max(-4096, min(4096, int(self._owner._preview_guides_axis_y)))
         self.setModal(True)
         self.setWindowTitle("Merge Indexes (Source → Destination)")
-        self.resize(1160, 700)
+        merge_w, merge_h = self._owner._get_merge_dialog_size()
+        self.resize(int(merge_w), int(merge_h))
 
         root = QVBoxLayout(self)
         root.setContentsMargins(8, 8, 8, 8)
@@ -3683,6 +3948,53 @@ class MergeOperationDialog(QDialog):
         self.view_settings_btn.setToolTip("Configure merge palette swatch view")
         self.view_settings_btn.clicked.connect(self._open_view_settings)
         controls.addWidget(self.view_settings_btn)
+
+        controls.addWidget(QLabel("Auto-Merge tol"))
+        self.auto_merge_tolerance_spin = QSpinBox()
+        self.auto_merge_tolerance_spin.setRange(0, 255)
+        self.auto_merge_tolerance_spin.setValue(int(self._auto_merge_tolerance))
+        self.auto_merge_tolerance_spin.setToolTip("Color distance threshold for Auto-Merge in Merge Mode")
+        self.auto_merge_tolerance_spin.valueChanged.connect(
+            lambda value: self._owner._set_pref("merge/auto_tolerance", max(0, min(255, int(value))))
+        )
+        controls.addWidget(self.auto_merge_tolerance_spin)
+        self.auto_merge_btn = QPushButton("Auto-Merge")
+        self.auto_merge_btn.setToolTip("Automatically merge similar colors across the current palette")
+        self.auto_merge_btn.clicked.connect(self._auto_merge_from_dialog)
+        controls.addWidget(self.auto_merge_btn)
+
+        self.guide_grid_check = QCheckBox("Grid")
+        self.guide_grid_check.setChecked(bool(self._guide_show_grid))
+        self.guide_grid_check.toggled.connect(self._on_guide_options_changed)
+        controls.addWidget(self.guide_grid_check)
+        controls.addWidget(QLabel("Step"))
+        self.guide_grid_step_spin = QSpinBox()
+        self.guide_grid_step_spin.setRange(1, 64)
+        self.guide_grid_step_spin.setValue(int(self._guide_grid_step))
+        self.guide_grid_step_spin.setFixedWidth(56)
+        self.guide_grid_step_spin.valueChanged.connect(self._on_guide_options_changed)
+        controls.addWidget(self.guide_grid_step_spin)
+        self.guide_axis_check = QCheckBox("Axis")
+        self.guide_axis_check.setChecked(bool(self._guide_show_axis))
+        self.guide_axis_check.toggled.connect(self._on_guide_options_changed)
+        controls.addWidget(self.guide_axis_check)
+        controls.addWidget(QLabel("X"))
+        self.guide_axis_x_spin = QSpinBox()
+        self.guide_axis_x_spin.setRange(-4096, 4096)
+        self.guide_axis_x_spin.setValue(int(self._guide_axis_x))
+        self.guide_axis_x_spin.setFixedWidth(64)
+        self.guide_axis_x_spin.valueChanged.connect(self._on_guide_options_changed)
+        controls.addWidget(self.guide_axis_x_spin)
+        controls.addWidget(QLabel("Y"))
+        self.guide_axis_y_spin = QSpinBox()
+        self.guide_axis_y_spin.setRange(-4096, 4096)
+        self.guide_axis_y_spin.setValue(int(self._guide_axis_y))
+        self.guide_axis_y_spin.setFixedWidth(64)
+        self.guide_axis_y_spin.valueChanged.connect(self._on_guide_options_changed)
+        controls.addWidget(self.guide_axis_y_spin)
+        self.guide_custom_axis_btn = QPushButton("Custom Axis...")
+        self.guide_custom_axis_btn.clicked.connect(self._owner._open_custom_axis_slots_dialog)
+        controls.addWidget(self.guide_custom_axis_btn)
 
         controls.addWidget(QLabel("Source Swatches After Merge"))
         self.source_after_combo = QComboBox()
@@ -4007,70 +4319,97 @@ class MergeOperationDialog(QDialog):
         self._refresh_views()
 
     def _apply_palette_view_options(self) -> None:
-        gap = max(-8, int(self._view_gap))
-        cols = max(1, int(self._view_columns))
-        effective_gap = max(0, gap)
-        tightness = max(0, -gap)
-        force_columns = bool(self._view_force_columns)
-        if force_columns:
-            viewport_width = max(120, self.palette_view.viewport().width())
-            cell = _compute_forced_cell_size(viewport_width, cols, effective_gap)
-            self.palette_view.setSpacing(effective_gap)
-            self.palette_view.set_cell_size(cell)
-            realized_cols = self.palette_view.measure_first_row_columns()
-            if realized_cols and realized_cols != cols:
-                attempts = 0
-                while realized_cols < cols and cell > 16 and attempts < 40:
-                    cell -= 1
-                    self.palette_view.set_cell_size(cell)
-                    realized_cols = self.palette_view.measure_first_row_columns()
-                    attempts += 1
-                while realized_cols > cols and cell < 96 and attempts < 80:
-                    cell += 1
-                    self.palette_view.set_cell_size(cell)
-                    new_realized = self.palette_view.measure_first_row_columns()
-                    attempts += 1
-                    if new_realized < cols:
+        if self._applying_palette_view_options:
+            return
+        self._applying_palette_view_options = True
+        try:
+            gap = max(-8, int(self._view_gap))
+            cols = max(1, int(self._view_columns))
+            effective_gap = max(0, gap)
+            tightness = max(0, -gap)
+            force_columns = bool(self._view_force_columns)
+            if force_columns:
+                viewport_width = max(120, self.palette_view.viewport().width())
+                cell = _compute_forced_cell_size(viewport_width, cols, effective_gap)
+                self.palette_view.setSpacing(effective_gap)
+                self.palette_view.set_cell_size(cell)
+                realized_cols = self.palette_view.measure_first_row_columns()
+                if realized_cols and realized_cols != cols:
+                    attempts = 0
+                    while realized_cols < cols and cell > 16 and attempts < 40:
                         cell -= 1
                         self.palette_view.set_cell_size(cell)
                         realized_cols = self.palette_view.measure_first_row_columns()
-                        break
-                    realized_cols = new_realized
-                logger.debug(
-                    "Merge view exact-fit correction target_cols=%s realized_cols=%s cell=%s attempts=%s",
-                    cols,
-                    realized_cols,
-                    cell,
-                    attempts,
-                )
-            self._view_zoom = cell
-        else:
-            viewport_width = self.palette_view.viewport().width()
-            cell = max(16, min(96, int(self._view_zoom)))
-            realized_cols = self.palette_view.measure_first_row_columns()
-        self.palette_view.setSpacing(effective_gap)
-        self.palette_view.set_cell_size(cell)
-        self.palette_view.set_swatch_inset(max(1, 6 - tightness))
-        self.palette_view.set_show_index_labels(bool(self._view_show_indices))
-        self.palette_view.set_show_grid_lines(bool(self._view_show_grid))
-        if force_columns:
-            self.palette_view.setMinimumWidth(220)
-        else:
-            self.palette_view.setMinimumWidth(cols * (cell + effective_gap) + 30)
-        final_realized_cols = self.palette_view.measure_first_row_columns()
-        logger.debug(
-            "Merge dialog view applied force_cols=%s cols=%s realized_cols=%s zoom=%s gap=%s effective_gap=%s tightness=%s viewport_w=%s idx=%s grid=%s",
-            force_columns,
-            cols,
-            final_realized_cols,
-            cell,
-            gap,
-            effective_gap,
-            tightness,
-            viewport_width,
-            self._view_show_indices,
-            self._view_show_grid,
-        )
+                        attempts += 1
+                    while realized_cols > cols and cell < 96 and attempts < 80:
+                        cell += 1
+                        self.palette_view.set_cell_size(cell)
+                        new_realized = self.palette_view.measure_first_row_columns()
+                        attempts += 1
+                        if new_realized < cols:
+                            cell -= 1
+                            self.palette_view.set_cell_size(cell)
+                            realized_cols = self.palette_view.measure_first_row_columns()
+                            break
+                        realized_cols = new_realized
+                    logger.debug(
+                        "Merge view exact-fit correction target_cols=%s realized_cols=%s cell=%s attempts=%s",
+                        cols,
+                        realized_cols,
+                        cell,
+                        attempts,
+                    )
+                self._view_zoom = cell
+            else:
+                viewport_width = self.palette_view.viewport().width()
+                cell = max(16, min(96, int(self._view_zoom)))
+                realized_cols = self.palette_view.measure_first_row_columns()
+            self.palette_view.setSpacing(effective_gap)
+            self.palette_view.set_cell_size(cell)
+            self.palette_view.set_swatch_inset(max(1, 6 - tightness))
+            self.palette_view.set_show_index_labels(bool(self._view_show_indices))
+            self.palette_view.set_show_grid_lines(bool(self._view_show_grid))
+            if force_columns:
+                self.palette_view.setMinimumWidth(220)
+            else:
+                self.palette_view.setMinimumWidth(cols * (cell + effective_gap) + 30)
+            self.palette_view.doItemsLayout()
+            final_realized_cols = self.palette_view.measure_first_row_columns()
+            logger.debug(
+                "Merge dialog view applied force_cols=%s cols=%s realized_cols=%s zoom=%s gap=%s effective_gap=%s tightness=%s viewport_w=%s idx=%s grid=%s",
+                force_columns,
+                cols,
+                final_realized_cols,
+                cell,
+                gap,
+                effective_gap,
+                tightness,
+                viewport_width,
+                self._view_show_indices,
+                self._view_show_grid,
+            )
+            if force_columns and final_realized_cols > 0 and final_realized_cols != cols and not self._pending_force_columns_retry:
+                self._pending_force_columns_retry = True
+                QTimer.singleShot(0, self._retry_force_columns_layout)
+        finally:
+            self._applying_palette_view_options = False
+
+    def _retry_force_columns_layout(self) -> None:
+        self._pending_force_columns_retry = False
+        if not self.isVisible():
+            return
+        if not self._view_force_columns:
+            return
+        self._apply_palette_view_options()
+
+    def resizeEvent(self, event) -> None:  # type: ignore[override]
+        super().resizeEvent(event)
+        if self._view_force_columns:
+            self._apply_palette_view_options()
+
+    def closeEvent(self, event) -> None:  # type: ignore[override]
+        self._owner._store_merge_dialog_size(self.size())
+        super().closeEvent(event)
 
     def _save_palette_view_options(self) -> None:
         self._owner._set_pref("merge/view_columns", int(self._view_columns))
@@ -4173,7 +4512,15 @@ class MergeOperationDialog(QDialog):
         self._refresh_preview_from_state()
 
     def _update_destination_blink_state(self) -> None:
-        highlight_enabled = bool(getattr(self._owner, "highlight_checkbox", None) and self._owner.highlight_checkbox.isChecked())
+        hover_highlight_enabled = bool(
+            getattr(self._owner, "hover_highlight_checkbox", None)
+            and self._owner.hover_highlight_checkbox.isChecked()
+        )
+        selected_highlight_enabled = bool(
+            getattr(self._owner, "highlight_checkbox", None)
+            and self._owner.highlight_checkbox.isChecked()
+        )
+        highlight_enabled = bool(hover_highlight_enabled or selected_highlight_enabled)
         should_blink = self._hover_palette_row is not None
         if should_blink and highlight_enabled and not self._destination_blink_timer.isActive():
             self._destination_blink_on = True
@@ -4273,6 +4620,7 @@ class MergeOperationDialog(QDialog):
 
         selected_record = preview_records[0] if preview_records else None
         if selected_record is None:
+            self.preview_pane.set_guide_options({})
             self.preview_pane.set_pixmap(None, reset_zoom=False)
             return
         self.preview_title_label.setText(f"Previewing: {selected_record.path.name}")
@@ -4285,7 +4633,70 @@ class MergeOperationDialog(QDialog):
             blink_highlight=self._destination_blink_on,
             blink_phase=self._destination_blink_phase,
         )
+        indexed = getattr(selected_record, "indexed_image", None)
+        source_w = int(indexed.width) if indexed is not None else int(max(1, pixmap.width()))
+        source_h = int(indexed.height) if indexed is not None else int(max(1, pixmap.height()))
+        self.preview_pane.set_guide_options(
+            {
+                "source_w": int(max(1, source_w)),
+                "source_h": int(max(1, source_h)),
+                "show_grid": bool(self._guide_show_grid),
+                "grid_step": int(self._guide_grid_step),
+                "show_axis": bool(self._guide_show_axis),
+                "axis_x": int(self._guide_axis_x),
+                "axis_y": int(self._guide_axis_y),
+                "axis_layer": str(self._owner._preview_guides_axis_layer),
+                "axis_color": tuple(int(v) for v in self._owner._preview_guides_axis_color),
+                "show_ground": False,
+                "custom_axes": self._owner._enabled_custom_axis_guides(),
+            }
+        )
         self.preview_pane.set_pixmap(pixmap, reset_zoom=False)
+
+    def _on_guide_options_changed(self, _value: object) -> None:
+        self._guide_show_grid = bool(self.guide_grid_check.isChecked())
+        self._guide_grid_step = int(self.guide_grid_step_spin.value())
+        self._guide_show_axis = bool(self.guide_axis_check.isChecked())
+        self._guide_axis_x = int(self.guide_axis_x_spin.value())
+        self._guide_axis_y = int(self.guide_axis_y_spin.value())
+        self._owner._set_global_guide_state(
+            show_grid=bool(self._guide_show_grid),
+            grid_step=int(self._guide_grid_step),
+            show_axis=bool(self._guide_show_axis),
+            axis_x=int(self._guide_axis_x),
+            axis_y=int(self._guide_axis_y),
+            axis_layer=str(self._owner._preview_guides_axis_layer),
+            axis_color=self._owner._preview_guides_axis_color,
+            source="merge",
+        )
+
+    def apply_external_guide_state(
+        self,
+        *,
+        show_grid: bool,
+        grid_step: int,
+        show_axis: bool,
+        axis_x: int,
+        axis_y: int,
+    ) -> None:
+        self._guide_show_grid = bool(show_grid)
+        self._guide_grid_step = max(1, min(64, int(grid_step)))
+        self._guide_show_axis = bool(show_axis)
+        self._guide_axis_x = max(-4096, min(4096, int(axis_x)))
+        self._guide_axis_y = max(-4096, min(4096, int(axis_y)))
+        for widget, value in (
+            (self.guide_grid_check, bool(self._guide_show_grid)),
+            (self.guide_grid_step_spin, int(self._guide_grid_step)),
+            (self.guide_axis_check, bool(self._guide_show_axis)),
+            (self.guide_axis_x_spin, int(self._guide_axis_x)),
+            (self.guide_axis_y_spin, int(self._guide_axis_y)),
+        ):
+            blocked = widget.blockSignals(True)
+            if isinstance(widget, QCheckBox):
+                widget.setChecked(bool(value))
+            else:
+                widget.setValue(int(value))
+            widget.blockSignals(blocked)
 
     def _refresh_views(self) -> None:
         scope = self._scope()
@@ -4423,6 +4834,15 @@ class MergeOperationDialog(QDialog):
         else:
             self._refresh_views()
 
+    def _auto_merge_from_dialog(self) -> None:
+        tolerance = max(0, min(255, int(self.auto_merge_tolerance_spin.value())))
+        self._owner._set_pref("merge/auto_tolerance", tolerance)
+        applied = self._owner._auto_merge_colors_with_tolerance(tolerance, parent=self)
+        if not applied:
+            return
+        self._load_palette_snapshot()
+        self._refresh_views()
+
     def _refresh_preview_sprite_picker(self, records: Sequence[SpriteRecord]) -> None:
         selected_keys = {item.data(Qt.ItemDataRole.UserRole) for item in self.preview_sprite_list.selectedItems()}
         self.preview_sprite_list.blockSignals(True)
@@ -4446,6 +4866,2232 @@ class MergeOperationDialog(QDialog):
                         item.setSelected(True)
                         break
         self.preview_sprite_list.blockSignals(False)
+
+
+class PivotAssistDialog(QDialog):
+    def __init__(
+        self,
+        owner: "SpriteToolsWindow",
+        records: Sequence[tuple[str, SpriteRecord]],
+        sequence_keys: Sequence[str] | None = None,
+        sequence_frames: Sequence[tuple[str, int, str]] | None = None,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._owner = owner
+        self.setWindowTitle("Pivot Assist")
+        self.resize(1040, 700)
+        saved_geometry = self._owner._settings.value("pivot_assist/geometry")
+        if saved_geometry is not None:
+            try:
+                self.restoreGeometry(saved_geometry)
+            except Exception:  # noqa: BLE001
+                logger.debug("Pivot Assist geometry restore failed", exc_info=True)
+
+        self._records: List[tuple[str, SpriteRecord]] = list(records)
+        self._record_by_key: Dict[str, SpriteRecord] = {key: record for key, record in self._records}
+        self._sequence_frames: List[tuple[str, int, str]] = []
+        if sequence_frames:
+            for key, duration_frames, label in sequence_frames:
+                if key not in self._record_by_key:
+                    continue
+                self._sequence_frames.append((key, max(1, int(duration_frames)), str(label)))
+        if not self._sequence_frames:
+            base_keys = [key for key in (sequence_keys or []) if key in self._record_by_key]
+            if not base_keys:
+                base_keys = [key for key, _record in self._records]
+            self._sequence_frames = [(key, 1, f"{idx + 1}") for idx, key in enumerate(base_keys)]
+        self._original_offsets: Dict[str, tuple[int, int]] = {
+            key: (int(record.offset_x), int(record.offset_y)) for key, record in self._records
+        }
+        self._suggestions: Dict[str, PivotAssistFrame] = {}
+        self._nudges: Dict[str, tuple[int, int]] = {}
+        self._macro_global_dx = 0
+        self._macro_global_dy = 0
+        self._play_remaining_subframes = 1
+        self._play_subframe_progress = 0
+        self._syncing_from_sequence_selection = False
+        self._reference_source_keys: List[str] = []
+        self._reference_onion_enabled = False
+        self._reference_onion_opacity = 120
+        self._reference_onion_tint: tuple[int, int, int] = (255, 220, 120)
+        self._reference_onion_max_layers = 3
+        self._guide_source_size = QSize(0, 0)
+        self._micro_drag_enabled = False
+        self._macro_drag_enabled = False
+        self._history_undo_stack: List[Dict[str, Dict[str, tuple[int, int]] | tuple[int, int]]] = []
+        self._history_redo_stack: List[Dict[str, Dict[str, tuple[int, int]] | tuple[int, int]]] = []
+        self._history_limit = 240
+        self._history_restoring = False
+        self._drag_history_started = False
+        self._swallow_space_key_release = False
+        self._shortcut_focus_forward_widgets: List[QWidget] = []
+        self._app_event_filter_installed = False
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(8, 8, 8, 8)
+        root.setSpacing(6)
+
+        review_row = QHBoxLayout()
+        review_row.setSpacing(8)
+        review_label = QLabel("Review all selected frames, adjust per-frame micro offsets, then apply to Local offsets.")
+        review_row.addWidget(review_label)
+        review_row.addStretch(1)
+        root.addLayout(review_row)
+
+        options_row = QHBoxLayout()
+        options_row.addWidget(QLabel("Smoothing"))
+        self.smoothing_slider = QSlider(Qt.Orientation.Horizontal)
+        self.smoothing_slider.setRange(0, 100)
+        self.smoothing_slider.setValue(35)
+        self.smoothing_slider.setFixedWidth(180)
+        self.smoothing_slider.setToolTip(
+            "Controls temporal smoothing between frames.\n"
+            "Low = follows motion quickly. High = smoother but can ignore sudden big moves."
+        )
+        options_row.addWidget(self.smoothing_slider)
+        self.smoothing_value_label = QLabel("35")
+        self.smoothing_value_label.setMinimumWidth(28)
+        options_row.addWidget(self.smoothing_value_label)
+        options_row.addSpacing(12)
+        options_row.addWidget(QLabel("Max Jump"))
+        self.max_jump_spin = QSpinBox()
+        self.max_jump_spin.setRange(0, 128)
+        self.max_jump_spin.setValue(8)
+        self.max_jump_spin.setToolTip(
+            "Maximum per-frame movement allowed after smoothing.\n"
+            "Very low values (1-2) almost lock movement and can hide real shifts."
+        )
+        options_row.addWidget(self.max_jump_spin)
+        options_row.addSpacing(12)
+        options_row.addWidget(QLabel("Anchor"))
+        self.anchor_mode_combo = QComboBox(self)
+        self.anchor_mode_combo.addItem("Hybrid", "hybrid")
+        self.anchor_mode_combo.addItem("Centroid", "centroid")
+        self.anchor_mode_combo.addItem("Foot", "foot")
+        self.anchor_mode_combo.addItem("BBox Center", "bbox_center")
+        self.anchor_mode_combo.setCurrentIndex(0)
+        self.anchor_mode_combo.setToolTip(
+            "Defines which anchor is extracted from each frame for alignment.\n"
+            "Hybrid = general default, Foot = better for grounded characters,\n"
+            "Centroid = center of mass, BBox Center = geometric center box."
+        )
+        options_row.addWidget(self.anchor_mode_combo)
+        options_row.addWidget(QLabel("Solver"))
+        self.solver_mode_combo = QComboBox(self)
+        self.solver_mode_combo.addItem("Hybrid", "hybrid")
+        self.solver_mode_combo.addItem("Anchor", "anchor")
+        self.solver_mode_combo.addItem("Phase", "phase")
+        self.solver_mode_combo.setCurrentIndex(0)
+        self.solver_mode_combo.setToolTip(
+            "Alignment engine mode.\n"
+            "Hybrid blends anchor and phase-correlation; Anchor uses shape anchors only; Phase uses frequency-domain shift estimation."
+        )
+        options_row.addWidget(self.solver_mode_combo)
+        options_row.addWidget(QLabel("Reference"))
+        self.reference_mode_combo = QComboBox(self)
+        self.reference_mode_combo.addItem("First Frame", "first")
+        self.reference_mode_combo.addItem("Median", "median")
+        self.reference_mode_combo.addItem("Current Frame", "index")
+        self.reference_mode_combo.addItem("Picked Sources Median", "records_median")
+        self.reference_mode_combo.setCurrentIndex(0)
+        self.reference_mode_combo.setToolTip(
+            "Defines the reference frame set used for delta computation.\n"
+            "First Frame = anchor to frame 1. Median = balanced center.\n"
+            "Current Frame = use selected frame. Picked Sources = use your chosen set."
+        )
+        options_row.addWidget(self.reference_mode_combo)
+        options_row.addWidget(QLabel("Mask"))
+        self.mask_mode_combo = QComboBox(self)
+        self.mask_mode_combo.addItem("Auto", "auto")
+        self.mask_mode_combo.addItem("Alpha", "alpha")
+        self.mask_mode_combo.addItem("Border FG", "border")
+        self.mask_mode_combo.addItem("Transparency", "transparency")
+        self.mask_mode_combo.setCurrentIndex(0)
+        self.mask_mode_combo.setToolTip(
+            "Foreground extraction mode for frame analysis.\n"
+            "Auto = best guess, Border FG = detect bg from border colors,\n"
+            "Transparency = treat transparent indexes as background, Alpha = use alpha only."
+        )
+        options_row.addWidget(self.mask_mode_combo)
+        options_row.addWidget(QLabel("Gain"))
+        self.response_gain_spin = QSpinBox(self)
+        self.response_gain_spin.setRange(10, 300)
+        self.response_gain_spin.setSingleStep(5)
+        self.response_gain_spin.setSuffix("%")
+        self.response_gain_spin.setValue(100)
+        self.response_gain_spin.setToolTip(
+            "Strength multiplier for final offsets.\n"
+            "100% = normal, >100% = stronger movement, <100% = softer movement."
+        )
+        options_row.addWidget(self.response_gain_spin)
+        self.recompute_btn = QPushButton("Recompute")
+        options_row.addWidget(self.recompute_btn)
+        self.apply_preset_btn = QPushButton("Preset...")
+        self.apply_preset_btn.setToolTip("Apply a preconfigured tuning preset")
+        options_row.addWidget(self.apply_preset_btn)
+        self.pick_reference_sources_btn = QPushButton("Pick Sources...")
+        self.pick_reference_sources_btn.setToolTip(
+            "Choose one or more frames to use as a reference pool.\n"
+            "Useful when frame 1 is not representative."
+        )
+        options_row.addWidget(self.pick_reference_sources_btn)
+        self.debug_report_btn = QPushButton("Copy Debug Report")
+        self.debug_report_btn.setToolTip("Copy pivot analysis details for the current sequence")
+        review_row.addWidget(self.debug_report_btn)
+        options_row.addStretch(1)
+        root.addLayout(options_row)
+
+        info_row = QHBoxLayout()
+        info_row.setSpacing(8)
+        self.reference_source_summary = QLabel("Reference sources: auto from current sequence")
+        self.reference_source_summary.setWordWrap(False)
+        self.reference_source_summary.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        info_row.addWidget(self.reference_source_summary, 2)
+        info_row.addWidget(QLabel("|"), 0)
+        self.settings_help_label = QLabel("")
+        self.settings_help_label.setWordWrap(False)
+        self.settings_help_label.setStyleSheet("color: #d6c36b;")
+        self.settings_help_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        info_row.addWidget(self.settings_help_label, 2)
+        info_row.addWidget(QLabel("|"), 0)
+        self.smoothing_explainer_label = QLabel("")
+        self.smoothing_explainer_label.setWordWrap(False)
+        self.smoothing_explainer_label.setStyleSheet("color: #9fd3ff;")
+        self.smoothing_explainer_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        info_row.addWidget(self.smoothing_explainer_label, 3)
+        root.addLayout(info_row)
+
+        body_splitter = QSplitter(Qt.Orientation.Horizontal, self)
+        root.addWidget(body_splitter, 1)
+
+        self.frame_list = QListWidget()
+        self.frame_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.frame_list.setMinimumWidth(220)
+        body_splitter.addWidget(self.frame_list)
+
+        right_container = QWidget(self)
+        right = QVBoxLayout(right_container)
+        right.setContentsMargins(0, 0, 0, 0)
+        right.setSpacing(6)
+        body_splitter.addWidget(right_container)
+        body_splitter.setStretchFactor(0, 1)
+        body_splitter.setStretchFactor(1, 2)
+        self._pivot_body_splitter = body_splitter
+
+        preview_controls = QHBoxLayout()
+        preview_controls.addWidget(QLabel("View"))
+        self.preview_mode_combo = QComboBox(self)
+        self.preview_mode_combo.addItem("Sprite Edit", "sprite_edit")
+        self.preview_mode_combo.addItem("Animation Assist", "animation_assist")
+        self.preview_mode_combo.setCurrentIndex(1)
+        self.preview_mode_combo.setToolTip("Choose preview behavior for Pivot Assist")
+        preview_controls.addWidget(self.preview_mode_combo)
+        self.play_btn = QPushButton("Play")
+        self.play_btn.setCheckable(True)
+        preview_controls.addWidget(self.play_btn)
+        self.loop_check = QCheckBox("Loop")
+        self.loop_check.setChecked(True)
+        preview_controls.addWidget(self.loop_check)
+        preview_controls.addWidget(QLabel("FPS"))
+        self.fps_spin = QSpinBox(self)
+        self.fps_spin.setRange(1, 60)
+        self.fps_spin.setValue(max(1, int(self._owner.animation_fps_spin.value())))
+        self.fps_spin.setFixedWidth(64)
+        preview_controls.addWidget(self.fps_spin)
+
+        self.onion_check = QCheckBox("Onion")
+        self.onion_check.setChecked(bool(self._owner._preview_onion_enabled))
+        self.onion_check.setToolTip("Enable onion skin in Pivot Assist preview")
+        preview_controls.addWidget(self.onion_check)
+        self.onion_settings_btn = QPushButton("Onion Settings...")
+        self.onion_settings_btn.setToolTip("Open onion controls used by Pivot Assist preview")
+        preview_controls.addWidget(self.onion_settings_btn)
+        self.reference_onion_check = QCheckBox("Ref Onion")
+        self.reference_onion_check.setChecked(bool(self._reference_onion_enabled))
+        self.reference_onion_check.setToolTip("Show reference-frame onion layer in Pivot Assist preview")
+        preview_controls.addWidget(self.reference_onion_check)
+        self.reference_onion_settings_btn = QPushButton("Ref Onion Settings...")
+        self.reference_onion_settings_btn.setToolTip("Configure reference onion tint, opacity, and layer count")
+        preview_controls.addWidget(self.reference_onion_settings_btn)
+        self.highlight_check = QCheckBox("Highlight")
+        self.highlight_check.setChecked(bool(self._owner.highlight_checkbox.isChecked()))
+        self.highlight_check.setToolTip("Use main preview highlight overlays")
+        preview_controls.addWidget(self.highlight_check)
+        preview_controls.addWidget(QLabel("Scaling"))
+        self.scaling_combo = QComboBox()
+        self.scaling_combo.addItem("Nearest", Qt.TransformationMode.FastTransformation)
+        self.scaling_combo.addItem("Bilinear", Qt.TransformationMode.SmoothTransformation)
+        self.scaling_combo.setCurrentIndex(0 if self._owner.filter_combo.currentIndex() == 0 else 1)
+        preview_controls.addWidget(self.scaling_combo)
+        preview_controls.addStretch(1)
+
+        guide_controls = QHBoxLayout()
+        self.show_grid_check = QCheckBox("Grid")
+        self.show_grid_check.setChecked(True)
+        self.show_grid_check.setToolTip("Toggle pixel grid overlay")
+        guide_controls.addWidget(self.show_grid_check)
+        guide_controls.addWidget(QLabel("Step"))
+        self.grid_step_spin = QSpinBox(self)
+        self.grid_step_spin.setRange(1, 64)
+        self.grid_step_spin.setValue(8)
+        self.grid_step_spin.setFixedWidth(64)
+        guide_controls.addWidget(self.grid_step_spin)
+
+        self.show_axis_check = QCheckBox("Base Axis")
+        self.show_axis_check.setChecked(True)
+        self.show_axis_check.setToolTip("Toggle configurable base axis (0,0) guide")
+        guide_controls.addWidget(self.show_axis_check)
+        guide_controls.addWidget(QLabel("X"))
+        self.axis_x_spin = QSpinBox(self)
+        self.axis_x_spin.setRange(-4096, 4096)
+        self.axis_x_spin.setValue(0)
+        self.axis_x_spin.setFixedWidth(72)
+        guide_controls.addWidget(self.axis_x_spin)
+        guide_controls.addWidget(QLabel("Y"))
+        self.axis_y_spin = QSpinBox(self)
+        self.axis_y_spin.setRange(-4096, 4096)
+        self.axis_y_spin.setValue(0)
+        self.axis_y_spin.setFixedWidth(72)
+        guide_controls.addWidget(self.axis_y_spin)
+        guide_controls.addWidget(QLabel("Layer"))
+        self.axis_layer_combo = QComboBox(self)
+        self.axis_layer_combo.addItem("Top", "top")
+        self.axis_layer_combo.addItem("Bottom", "bottom")
+        self.axis_layer_combo.setFixedWidth(88)
+        guide_controls.addWidget(self.axis_layer_combo)
+        self.axis_color_btn = QPushButton("Color", self)
+        self.axis_color_btn.setFixedWidth(60)
+        self.axis_color_btn.setToolTip("Pick base axis color")
+        self._owner._set_color_button_preview(self.axis_color_btn, self._owner._preview_guides_axis_color)
+        guide_controls.addWidget(self.axis_color_btn)
+        self.axis_preset_btn = QPushButton("Axis Preset...", self)
+        self.axis_preset_btn.setToolTip("Apply axis preset from project presets")
+        guide_controls.addWidget(self.axis_preset_btn)
+        self.custom_axis_btn = QPushButton("Custom Axis...", self)
+        self.custom_axis_btn.setToolTip("Edit project custom axis slots")
+        guide_controls.addWidget(self.custom_axis_btn)
+
+        self.show_ground_check = QCheckBox("Ground")
+        self.show_ground_check.setChecked(True)
+        self.show_ground_check.setToolTip("Toggle configurable ground line")
+        guide_controls.addWidget(self.show_ground_check)
+        guide_controls.addWidget(QLabel("Y"))
+        self.ground_y_spin = QSpinBox(self)
+        self.ground_y_spin.setRange(-4096, 4096)
+        self.ground_y_spin.setValue(0)
+        self.ground_y_spin.setFixedWidth(72)
+        guide_controls.addWidget(self.ground_y_spin)
+        guide_controls.addStretch(1)
+
+        self.preview_panel = PreviewPane(self)
+        self.preview_panel.title.setVisible(False)
+        self.preview_panel.set_scaling_mode(
+            Qt.TransformationMode.FastTransformation
+            if self.scaling_combo.currentData() == Qt.TransformationMode.FastTransformation
+            else Qt.TransformationMode.SmoothTransformation
+        )
+        self.preview_panel.set_drag_backdrop_rgba(self._owner._resolve_drag_backdrop_rgba())
+        self.preview_panel.scroll_area.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.preview_panel.scroll_area.viewport().setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.preview_panel.image_label.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        preview_section = QWidget(right_container)
+        preview_section_layout = QVBoxLayout(preview_section)
+        preview_section_layout.setContentsMargins(0, 0, 0, 0)
+        preview_section_layout.setSpacing(4)
+        preview_section_layout.addWidget(self.preview_panel, 1)
+        preview_section.setMinimumHeight(220)
+
+        timeline_section = QWidget(right_container)
+        timeline_layout = QVBoxLayout(timeline_section)
+        timeline_layout.setContentsMargins(0, 0, 0, 0)
+        timeline_layout.setSpacing(4)
+        timeline_strip = QHBoxLayout()
+        timeline_strip.setSpacing(6)
+        timeline_strip.addWidget(QLabel("Sequence Timeline"))
+        timeline_strip.addWidget(self.show_grid_check)
+        timeline_strip.addWidget(QLabel("Step"))
+        timeline_strip.addWidget(self.grid_step_spin)
+        timeline_strip.addWidget(self.show_axis_check)
+        timeline_strip.addWidget(QLabel("X"))
+        timeline_strip.addWidget(self.axis_x_spin)
+        timeline_strip.addWidget(QLabel("Y"))
+        timeline_strip.addWidget(self.axis_y_spin)
+        timeline_strip.addWidget(QLabel("Layer"))
+        timeline_strip.addWidget(self.axis_layer_combo)
+        timeline_strip.addWidget(self.axis_color_btn)
+        timeline_strip.addWidget(self.axis_preset_btn)
+        timeline_strip.addWidget(self.custom_axis_btn)
+        timeline_strip.addSpacing(8)
+        timeline_strip.addWidget(self.onion_check)
+        timeline_strip.addWidget(self.onion_settings_btn)
+        timeline_strip.addWidget(self.reference_onion_check)
+        timeline_strip.addWidget(self.reference_onion_settings_btn)
+        timeline_strip.addStretch(1)
+        timeline_strip.addWidget(QLabel("View"))
+        timeline_strip.addWidget(self.preview_mode_combo)
+        timeline_strip.addWidget(self.play_btn)
+        timeline_strip.addWidget(self.loop_check)
+        timeline_strip.addWidget(QLabel("FPS"))
+        timeline_strip.addWidget(self.fps_spin)
+        timeline_strip.addWidget(self.highlight_check)
+        timeline_strip.addWidget(QLabel("Scaling"))
+        timeline_strip.addWidget(self.scaling_combo)
+        timeline_layout.addLayout(timeline_strip)
+        self.pivot_timeline_ruler = TimelineRulerWidget()
+        self.pivot_timeline_ruler.setToolTip("Sequence ruler (1f playhead)")
+        timeline_layout.addWidget(self.pivot_timeline_ruler)
+        self.sequence_list = QListWidget(self)
+        self.sequence_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.sequence_list.setViewMode(QListView.ViewMode.ListMode)
+        self.sequence_list.setFlow(QListView.Flow.LeftToRight)
+        self.sequence_list.setWrapping(False)
+        self.sequence_list.setUniformItemSizes(False)
+        self.sequence_list.setResizeMode(QListView.ResizeMode.Adjust)
+        self.sequence_list.setMovement(QListView.Movement.Snap)
+        self.sequence_list.setDragDropMode(QAbstractItemView.DragDropMode.NoDragDrop)
+        self.sequence_list.setDragEnabled(False)
+        self.sequence_list.setAcceptDrops(False)
+        self.sequence_list.viewport().setAcceptDrops(False)
+        self.sequence_list.setDropIndicatorShown(False)
+        self.sequence_list.setDragDropOverwriteMode(False)
+        self.sequence_list.setDefaultDropAction(Qt.DropAction.MoveAction)
+        self.sequence_list.setAutoScroll(True)
+        self.sequence_list.setAutoScrollMargin(24)
+        self.sequence_list.setHorizontalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        self.sequence_list.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.sequence_list.setIconSize(QSize(56, 56))
+        self.sequence_list.setMouseTracking(True)
+        self.sequence_list.viewport().setMouseTracking(True)
+        self.sequence_list.setMinimumHeight(102)
+        self.sequence_list.setSpacing(0)
+        self.sequence_list.setStyleSheet(
+            "QListWidget { background-color: #1f1f1f; border: 1px solid #3f3f3f; }"
+            "QListWidget::item { border: 0px; background: transparent; padding: 0px; margin: 0px; }"
+            "QListWidget::item:selected { border: 1px solid #7fb6ff; background-color: rgba(80,120,160,140); }"
+        )
+        self._pivot_timeline_item_delegate = AnimationTimelineItemDelegate(self.sequence_list)
+        self.sequence_list.setItemDelegate(self._pivot_timeline_item_delegate)
+        timeline_layout.addWidget(self.sequence_list)
+        timeline_section.setMinimumHeight(120)
+
+        adjustments_section = QGroupBox("Frame Adjustments", right_container)
+        adjustments_layout = QVBoxLayout(adjustments_section)
+        adjustments_layout.setContentsMargins(6, 6, 6, 6)
+        adjustments_layout.setSpacing(4)
+
+        self.detail_label = QLabel("Select a frame to adjust")
+        self.detail_label.setWordWrap(True)
+        self.detail_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.MinimumExpanding)
+        self.confidence_label = QLabel("Confidence: -")
+        adjustments_layout.addWidget(self.detail_label)
+        adjustments_layout.addWidget(self.confidence_label)
+
+        micro_title = QLabel("Micro")
+        micro_title.setStyleSheet("font-weight: 600;")
+        adjustments_layout.addWidget(micro_title)
+
+        nudge_row = QHBoxLayout()
+        nudge_row.addWidget(QLabel("X"))
+        self.nudge_x_spin = QSpinBox()
+        self.nudge_x_spin.setRange(-128, 128)
+        nudge_row.addWidget(self.nudge_x_spin)
+        nudge_row.addWidget(QLabel("Y"))
+        self.nudge_y_spin = QSpinBox()
+        self.nudge_y_spin.setRange(-128, 128)
+        nudge_row.addWidget(self.nudge_y_spin)
+        nudge_row.addStretch(1)
+        adjustments_layout.addLayout(nudge_row)
+
+        micro_actions_row = QHBoxLayout()
+        self.reset_micro_btn = QPushButton("Reset Micro")
+        self.reset_micro_btn.setToolTip("Reset all per-frame micro adjustments")
+        micro_actions_row.addWidget(self.reset_micro_btn)
+        micro_actions_row.addStretch(1)
+        adjustments_layout.addLayout(micro_actions_row)
+
+        self.drag_micro_check = QPushButton("Drag Micro")
+        self.drag_micro_check.setCheckable(True)
+        self.drag_micro_check.setToolTip("Enable right-click drag on preview for per-frame micro nudge")
+        micro_drag_row = QHBoxLayout()
+        micro_drag_row.addWidget(self.drag_micro_check)
+        micro_drag_row.addStretch(1)
+        adjustments_layout.addLayout(micro_drag_row)
+
+        macro_title = QLabel("Macro")
+        macro_title.setStyleSheet("font-weight: 600;")
+        adjustments_layout.addWidget(macro_title)
+
+        self.drag_macro_check = QPushButton("Drag Macro")
+        self.drag_macro_check.setCheckable(True)
+        self.drag_macro_check.setToolTip("Enable right-click drag to nudge all selected frames")
+
+        macro_row = QHBoxLayout()
+        macro_row.addWidget(QLabel("X"))
+        self.macro_x_spin = QSpinBox()
+        self.macro_x_spin.setRange(-128, 128)
+        macro_row.addWidget(self.macro_x_spin)
+        macro_row.addWidget(QLabel("Y"))
+        self.macro_y_spin = QSpinBox()
+        self.macro_y_spin.setRange(-128, 128)
+        macro_row.addWidget(self.macro_y_spin)
+        macro_row.addStretch(1)
+        adjustments_layout.addLayout(macro_row)
+
+        macro_actions_row = QHBoxLayout()
+        self.apply_macro_btn = QPushButton("Reset Macro")
+        self.apply_macro_btn.setToolTip("Reset Macro (All) offsets back to zero")
+        macro_actions_row.addWidget(self.apply_macro_btn)
+        macro_actions_row.addStretch(1)
+        adjustments_layout.addLayout(macro_actions_row)
+
+        macro_drag_row = QHBoxLayout()
+        macro_drag_row.addWidget(self.drag_macro_check)
+        macro_drag_row.addStretch(1)
+        adjustments_layout.addLayout(macro_drag_row)
+
+        adjustments_section.setMinimumWidth(260)
+
+        top_splitter = QSplitter(Qt.Orientation.Horizontal, right_container)
+        top_splitter.addWidget(preview_section)
+        top_splitter.addWidget(adjustments_section)
+        top_splitter.setStretchFactor(0, 4)
+        top_splitter.setStretchFactor(1, 2)
+        self._pivot_top_splitter = top_splitter
+
+        right_splitter = QSplitter(Qt.Orientation.Vertical, right_container)
+        right_splitter.addWidget(top_splitter)
+        right_splitter.addWidget(timeline_section)
+        right_splitter.setStretchFactor(0, 4)
+        right_splitter.setStretchFactor(1, 2)
+        right.addWidget(right_splitter, 1)
+        self._pivot_right_splitter = right_splitter
+
+        self._play_timer = QTimer(self)
+        self._play_timer.setInterval(max(16, int(round(1000.0 / max(1, int(self.fps_spin.value()))))))
+        self._play_timer.timeout.connect(self._tick_playback)
+        self._last_debug_report = ""
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        root.addWidget(buttons)
+
+        self.smoothing_slider.valueChanged.connect(self._on_smoothing_changed)
+        self.max_jump_spin.valueChanged.connect(lambda _value: (self._update_smoothing_explainer(), self._recompute()))
+        self.anchor_mode_combo.currentIndexChanged.connect(lambda _index: self._recompute())
+        self.solver_mode_combo.currentIndexChanged.connect(lambda _index: self._recompute())
+        self.reference_mode_combo.currentIndexChanged.connect(lambda _index: self._recompute())
+        self.mask_mode_combo.currentIndexChanged.connect(lambda _index: self._recompute())
+        self.response_gain_spin.valueChanged.connect(lambda _value: (self._update_smoothing_explainer(), self._recompute()))
+        self.recompute_btn.clicked.connect(self._recompute)
+        self.apply_preset_btn.clicked.connect(self._apply_preset)
+        self.pick_reference_sources_btn.clicked.connect(self._open_reference_source_picker)
+        self.debug_report_btn.clicked.connect(self._copy_debug_report)
+        self.frame_list.currentItemChanged.connect(self._on_current_frame_changed)
+        self.nudge_x_spin.valueChanged.connect(self._on_nudge_changed)
+        self.nudge_y_spin.valueChanged.connect(self._on_nudge_changed)
+        self.drag_micro_check.toggled.connect(self._on_drag_micro_toggled)
+        self.drag_macro_check.toggled.connect(self._on_drag_macro_toggled)
+        self.reset_micro_btn.clicked.connect(self._reset_all_micro_adjustments)
+        self.macro_x_spin.valueChanged.connect(self._on_macro_value_changed)
+        self.macro_y_spin.valueChanged.connect(self._on_macro_value_changed)
+        self.apply_macro_btn.clicked.connect(self._on_apply_macro_clicked)
+        self.onion_check.toggled.connect(self._on_preview_options_changed)
+        self.onion_settings_btn.clicked.connect(self._open_onion_settings_from_dialog)
+        self.reference_onion_check.toggled.connect(self._on_preview_options_changed)
+        self.reference_onion_settings_btn.clicked.connect(self._open_reference_onion_settings)
+        self.highlight_check.toggled.connect(self._on_preview_options_changed)
+        self.preview_mode_combo.currentIndexChanged.connect(self._on_preview_options_changed)
+        self.show_grid_check.toggled.connect(self._on_shared_guide_options_changed)
+        self.grid_step_spin.valueChanged.connect(self._on_shared_guide_options_changed)
+        self.show_axis_check.toggled.connect(self._on_shared_guide_options_changed)
+        self.axis_x_spin.valueChanged.connect(self._on_shared_guide_options_changed)
+        self.axis_y_spin.valueChanged.connect(self._on_shared_guide_options_changed)
+        self.axis_layer_combo.currentIndexChanged.connect(self._on_shared_guide_options_changed)
+        self.axis_color_btn.clicked.connect(self._open_axis_color_picker)
+        self.axis_preset_btn.clicked.connect(self._on_axis_preset_clicked)
+        self.custom_axis_btn.clicked.connect(self._owner._open_custom_axis_slots_dialog)
+        self.show_ground_check.toggled.connect(lambda _v: self._update_guide_overlays())
+        self.ground_y_spin.valueChanged.connect(lambda _v: self._update_guide_overlays())
+        self.play_btn.toggled.connect(self._on_play_toggled)
+        self.fps_spin.valueChanged.connect(self._on_fps_changed)
+        self.scaling_combo.currentIndexChanged.connect(self._on_preview_options_changed)
+        self.sequence_list.currentItemChanged.connect(self._on_sequence_current_changed)
+        self.sequence_list.horizontalScrollBar().valueChanged.connect(self.pivot_timeline_ruler.set_scroll_x)
+        self.preview_panel.drag_offset_changed.connect(self._on_preview_drag_micro_delta)
+        self.preview_panel.drag_started.connect(self._on_preview_drag_started)
+        self.preview_panel.drag_finished.connect(self._on_preview_drag_finished)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+
+        self._shortcut_focus_forward_widgets = [
+            self.smoothing_slider,
+            self.max_jump_spin,
+            self.anchor_mode_combo,
+            self.solver_mode_combo,
+            self.reference_mode_combo,
+            self.mask_mode_combo,
+            self.response_gain_spin,
+            self.preview_mode_combo,
+            self.scaling_combo,
+            self.fps_spin,
+            self.recompute_btn,
+            self.apply_preset_btn,
+            self.pick_reference_sources_btn,
+            self.debug_report_btn,
+            self.play_btn,
+            self.loop_check,
+            self.onion_check,
+            self.onion_settings_btn,
+            self.reference_onion_check,
+            self.reference_onion_settings_btn,
+            self.highlight_check,
+            self.show_grid_check,
+            self.show_axis_check,
+            self.show_ground_check,
+            self.drag_micro_check,
+            self.drag_macro_check,
+            self.reset_micro_btn,
+            self.macro_x_spin,
+            self.macro_y_spin,
+            self.apply_macro_btn,
+        ]
+        app = QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self)
+            self._app_event_filter_installed = True
+
+        self._restore_pivot_assist_ui_preferences()
+
+        self._update_smoothing_explainer()
+        self._update_guide_overlays()
+
+        self._recompute()
+
+    def _parse_splitter_sizes_pref(self, key: str, expected_count: int) -> List[int] | None:
+        raw = str(self._owner._settings.value(key, "") or "").strip()
+        if not raw:
+            return None
+        parsed: List[int] = []
+        for token in raw.split(","):
+            try:
+                parsed.append(max(0, int(token.strip())))
+            except ValueError:
+                return None
+        if len(parsed) != int(expected_count):
+            return None
+        return parsed
+
+    def _save_pivot_assist_ui_preferences(self) -> None:
+        try:
+            self._owner._set_pref("pivot_assist/smoothing", int(self.smoothing_slider.value()))
+            self._owner._set_pref("pivot_assist/max_jump", int(self.max_jump_spin.value()))
+            self._owner._set_pref("pivot_assist/anchor_mode", str(self.anchor_mode_combo.currentData() or "hybrid"))
+            self._owner._set_pref("pivot_assist/solver_mode", str(self.solver_mode_combo.currentData() or "hybrid"))
+            self._owner._set_pref("pivot_assist/reference_mode", str(self.reference_mode_combo.currentData() or "first"))
+            self._owner._set_pref("pivot_assist/mask_mode", str(self.mask_mode_combo.currentData() or "auto"))
+            self._owner._set_pref("pivot_assist/response_gain", int(self.response_gain_spin.value()))
+            self._owner._set_pref("pivot_assist/preview_mode", str(self.preview_mode_combo.currentData() or "animation_assist"))
+            self._owner._set_pref("pivot_assist/scaling_mode", "nearest" if self.scaling_combo.currentIndex() == 0 else "bilinear")
+            self._owner._set_pref("pivot_assist/play_loop", bool(self.loop_check.isChecked()))
+            self._owner._set_pref("pivot_assist/fps", int(self.fps_spin.value()))
+            self._owner._set_pref("pivot_assist/show_grid", bool(self.show_grid_check.isChecked()))
+            self._owner._set_pref("pivot_assist/grid_step", int(self.grid_step_spin.value()))
+            self._owner._set_pref("pivot_assist/show_axis", bool(self.show_axis_check.isChecked()))
+            self._owner._set_pref("pivot_assist/axis_x", int(self.axis_x_spin.value()))
+            self._owner._set_pref("pivot_assist/axis_y", int(self.axis_y_spin.value()))
+            self._owner._set_pref("pivot_assist/show_ground", bool(self.show_ground_check.isChecked()))
+            self._owner._set_pref("pivot_assist/ground_y", int(self.ground_y_spin.value()))
+            self._owner._set_pref("pivot_assist/reference_onion_enabled", bool(self.reference_onion_check.isChecked()))
+            self._owner._set_pref("pivot_assist/reference_onion_opacity", int(self._reference_onion_opacity))
+            self._owner._set_pref(
+                "pivot_assist/reference_onion_tint",
+                f"{int(self._reference_onion_tint[0])},{int(self._reference_onion_tint[1])},{int(self._reference_onion_tint[2])}",
+            )
+            self._owner._set_pref("pivot_assist/reference_onion_max_layers", int(self._reference_onion_max_layers))
+            self._owner._set_pref("pivot_assist/body_splitter_sizes", ",".join(str(int(v)) for v in self._pivot_body_splitter.sizes()))
+            self._owner._set_pref("pivot_assist/top_splitter_sizes", ",".join(str(int(v)) for v in self._pivot_top_splitter.sizes()))
+            self._owner._set_pref("pivot_assist/right_splitter_sizes", ",".join(str(int(v)) for v in self._pivot_right_splitter.sizes()))
+        except Exception:  # noqa: BLE001
+            logger.debug("Pivot Assist UI preference save failed", exc_info=True)
+
+    def _restore_pivot_assist_ui_preferences(self) -> None:
+        try:
+            self.smoothing_slider.setValue(max(0, min(100, int(self._owner._settings.value("pivot_assist/smoothing", self.smoothing_slider.value())))))
+            self.max_jump_spin.setValue(max(0, min(128, int(self._owner._settings.value("pivot_assist/max_jump", self.max_jump_spin.value())))))
+            self.response_gain_spin.setValue(max(10, min(300, int(self._owner._settings.value("pivot_assist/response_gain", self.response_gain_spin.value())))))
+
+            for combo, pref_key in (
+                (self.anchor_mode_combo, "pivot_assist/anchor_mode"),
+                (self.solver_mode_combo, "pivot_assist/solver_mode"),
+                (self.reference_mode_combo, "pivot_assist/reference_mode"),
+                (self.mask_mode_combo, "pivot_assist/mask_mode"),
+                (self.preview_mode_combo, "pivot_assist/preview_mode"),
+            ):
+                pref_value = str(self._owner._settings.value(pref_key, "") or "").strip()
+                if pref_value:
+                    idx = combo.findData(pref_value)
+                    if idx >= 0:
+                        combo.setCurrentIndex(idx)
+
+            scaling_pref = str(self._owner._settings.value("pivot_assist/scaling_mode", "") or "").strip().lower()
+            if scaling_pref in {"nearest", "bilinear"}:
+                self.scaling_combo.setCurrentIndex(0 if scaling_pref == "nearest" else 1)
+
+            self.loop_check.setChecked(self._owner._get_pref_bool("pivot_assist/play_loop", self.loop_check.isChecked()))
+            self.fps_spin.setValue(max(1, min(60, int(self._owner._settings.value("pivot_assist/fps", self.fps_spin.value())))))
+            self.apply_external_guide_state(
+                show_grid=bool(self._owner._preview_guides_show_grid),
+                grid_step=int(self._owner._preview_guides_grid_step),
+                show_axis=bool(self._owner._preview_guides_show_axis),
+                axis_x=int(self._owner._preview_guides_axis_x),
+                axis_y=int(self._owner._preview_guides_axis_y),
+                axis_layer=str(self._owner._preview_guides_axis_layer),
+                axis_color=self._owner._preview_guides_axis_color,
+            )
+            self.show_ground_check.setChecked(self._owner._get_pref_bool("pivot_assist/show_ground", self.show_ground_check.isChecked()))
+            self.ground_y_spin.setValue(int(self._owner._settings.value("pivot_assist/ground_y", self.ground_y_spin.value())))
+            self._reference_onion_enabled = self._owner._get_pref_bool("pivot_assist/reference_onion_enabled", self._reference_onion_enabled)
+            self.reference_onion_check.setChecked(bool(self._reference_onion_enabled))
+            self._reference_onion_opacity = max(
+                0,
+                min(255, int(self._owner._settings.value("pivot_assist/reference_onion_opacity", self._reference_onion_opacity))),
+            )
+            self._reference_onion_max_layers = max(
+                0,
+                min(32, int(self._owner._settings.value("pivot_assist/reference_onion_max_layers", self._reference_onion_max_layers))),
+            )
+            reference_tint_raw = str(
+                self._owner._settings.value(
+                    "pivot_assist/reference_onion_tint",
+                    f"{int(self._reference_onion_tint[0])},{int(self._reference_onion_tint[1])},{int(self._reference_onion_tint[2])}",
+                )
+                or ""
+            ).strip()
+            tint_parts = [part.strip() for part in reference_tint_raw.split(",")]
+            if len(tint_parts) == 3:
+                try:
+                    self._reference_onion_tint = (
+                        max(0, min(255, int(tint_parts[0]))),
+                        max(0, min(255, int(tint_parts[1]))),
+                        max(0, min(255, int(tint_parts[2]))),
+                    )
+                except ValueError:
+                    pass
+
+            body_sizes = self._parse_splitter_sizes_pref("pivot_assist/body_splitter_sizes", self._pivot_body_splitter.count())
+            if body_sizes is not None:
+                self._pivot_body_splitter.setSizes(body_sizes)
+            top_sizes = self._parse_splitter_sizes_pref("pivot_assist/top_splitter_sizes", self._pivot_top_splitter.count())
+            if top_sizes is not None:
+                self._pivot_top_splitter.setSizes(top_sizes)
+            right_sizes = self._parse_splitter_sizes_pref("pivot_assist/right_splitter_sizes", self._pivot_right_splitter.count())
+            if right_sizes is not None:
+                self._pivot_right_splitter.setSizes(right_sizes)
+        except Exception:  # noqa: BLE001
+            logger.debug("Pivot Assist UI preference restore failed", exc_info=True)
+
+    def _records_for_suggestion_pass(self) -> List[SpriteRecord]:
+        ordered: List[SpriteRecord] = []
+        seen: set[str] = set()
+        for key, _duration_frames, _label in self._sequence_frames:
+            if key in seen:
+                continue
+            record = self._record_by_key.get(key)
+            if record is None:
+                continue
+            ordered.append(record)
+            seen.add(key)
+        for key, record in self._records:
+            if key in seen:
+                continue
+            ordered.append(record)
+            seen.add(key)
+        return ordered
+
+    def _on_smoothing_changed(self, value: int) -> None:
+        self.smoothing_value_label.setText(str(int(value)))
+        logger.debug("pivot.ui smoothing_changed value=%s", int(value))
+        self._update_smoothing_explainer()
+        self._recompute()
+
+    def _update_smoothing_explainer(self) -> None:
+        smoothing = int(self.smoothing_slider.value())
+        gain = int(self.response_gain_spin.value())
+        max_jump = int(self.max_jump_spin.value())
+        if smoothing <= 20:
+            behavior = "Fast reaction"
+        elif smoothing <= 55:
+            behavior = "Balanced"
+        else:
+            behavior = "Heavy stabilization"
+        self.smoothing_explainer_label.setText(
+            f"Smoothing={smoothing} → {behavior}. "
+            f"Higher values damp quick frame-to-frame changes; Max Jump={max_jump} caps per-frame movement; Gain={gain}% scales final response."
+        )
+
+    def _nudge_current_frame(self, dx: int, dy: int) -> None:
+        current = self.frame_list.currentItem()
+        if current is None:
+            return
+        next_x = max(self.nudge_x_spin.minimum(), min(self.nudge_x_spin.maximum(), int(self.nudge_x_spin.value()) + int(dx)))
+        next_y = max(self.nudge_y_spin.minimum(), min(self.nudge_y_spin.maximum(), int(self.nudge_y_spin.value()) + int(dy)))
+        self.nudge_x_spin.setValue(next_x)
+        self.nudge_y_spin.setValue(next_y)
+        logger.debug("pivot.ui nudge_shortcut key=%s delta=(%s,%s) next=(%s,%s)", str(current.data(Qt.ItemDataRole.UserRole) or ""), int(dx), int(dy), next_x, next_y)
+
+    def _snapshot_map(self, source: Dict[str, tuple[int, int]]) -> Dict[str, tuple[int, int]]:
+        snap: Dict[str, tuple[int, int]] = {}
+        for key, values in source.items():
+            dx, dy = values
+            ix = int(dx)
+            iy = int(dy)
+            if ix == 0 and iy == 0:
+                continue
+            snap[str(key)] = (ix, iy)
+        return snap
+
+    def _snapshot_adjustments(self) -> Dict[str, Dict[str, tuple[int, int]] | tuple[int, int]]:
+        return {
+            "micro": self._snapshot_map(self._nudges),
+            "macro_global": (int(self._macro_global_dx), int(self._macro_global_dy)),
+        }
+
+    def _effective_adjustment_for_key(self, key: str) -> tuple[int, int]:
+        micro_dx, micro_dy = self._nudges.get(key, (0, 0))
+        macro_dx, macro_dy = int(self._macro_global_dx), int(self._macro_global_dy)
+        return (int(micro_dx) + int(macro_dx), int(micro_dy) + int(macro_dy))
+
+    def _push_history_before_mutation(self, label: str) -> None:
+        if self._history_restoring:
+            return
+        state = self._snapshot_adjustments()
+        if self._history_undo_stack and self._history_undo_stack[-1] == state:
+            return
+        self._history_undo_stack.append(state)
+        if len(self._history_undo_stack) > self._history_limit:
+            self._history_undo_stack.pop(0)
+        self._history_redo_stack.clear()
+        logger.debug("pivot.ui history_push label=%s undo_depth=%s", label, len(self._history_undo_stack))
+
+    def _restore_nudges_from_history(self, state: Dict[str, Dict[str, tuple[int, int]] | tuple[int, int]]) -> None:
+        self._history_restoring = True
+        try:
+            micro = state.get("micro", {}) if isinstance(state, dict) else {}
+            macro_global = state.get("macro_global", (0, 0)) if isinstance(state, dict) else (0, 0)
+            self._nudges = {str(key): (int(value[0]), int(value[1])) for key, value in micro.items()}
+            macro_dx = int(macro_global[0]) if isinstance(macro_global, tuple) and len(macro_global) >= 1 else 0
+            macro_dy = int(macro_global[1]) if isinstance(macro_global, tuple) and len(macro_global) >= 2 else 0
+            self._macro_global_dx = macro_dx
+            self._macro_global_dy = macro_dy
+            self.macro_x_spin.blockSignals(True)
+            self.macro_y_spin.blockSignals(True)
+            self.macro_x_spin.setValue(macro_dx)
+            self.macro_y_spin.setValue(macro_dy)
+            self.macro_x_spin.blockSignals(False)
+            self.macro_y_spin.blockSignals(False)
+            for row in range(self.frame_list.count()):
+                item = self.frame_list.item(row)
+                if item is None:
+                    continue
+                key = str(item.data(Qt.ItemDataRole.UserRole) or "")
+                record = self._record_by_key.get(key)
+                frame = self._suggestions.get(key)
+                if record is None or frame is None:
+                    continue
+                item.setText(self._list_item_text(key, record.path.name, frame.confidence))
+            current = self.frame_list.currentItem()
+            if current is not None:
+                self._on_current_frame_changed(current, None)
+        finally:
+            self._history_restoring = False
+
+    def handle_shortcut_undo(self) -> bool:
+        if not self.isVisible() or not self._history_undo_stack:
+            return False
+        current = self._snapshot_adjustments()
+        target = self._history_undo_stack.pop()
+        self._history_redo_stack.append(current)
+        self._restore_nudges_from_history(target)
+        logger.debug("pivot.ui history_undo undo_depth=%s redo_depth=%s", len(self._history_undo_stack), len(self._history_redo_stack))
+        return True
+
+    def handle_shortcut_redo(self) -> bool:
+        if not self.isVisible() or not self._history_redo_stack:
+            return False
+        current = self._snapshot_adjustments()
+        target = self._history_redo_stack.pop()
+        self._history_undo_stack.append(current)
+        self._restore_nudges_from_history(target)
+        logger.debug("pivot.ui history_redo undo_depth=%s redo_depth=%s", len(self._history_undo_stack), len(self._history_redo_stack))
+        return True
+
+    def _refresh_adjustment_views(self) -> None:
+        for row in range(self.frame_list.count()):
+            item = self.frame_list.item(row)
+            if item is None:
+                continue
+            key = str(item.data(Qt.ItemDataRole.UserRole) or "")
+            frame = self._suggestions.get(key)
+            record = self._record_by_key.get(key)
+            if frame is None or record is None:
+                continue
+            item.setText(self._list_item_text(key, record.path.name, frame.confidence))
+        current = self.frame_list.currentItem()
+        if current is not None:
+            self._on_current_frame_changed(current, None)
+
+    def _set_macro_global(self, dx: int, dy: int, *, reason: str, push_history: bool) -> bool:
+        next_x = max(self.macro_x_spin.minimum(), min(self.macro_x_spin.maximum(), int(dx)))
+        next_y = max(self.macro_y_spin.minimum(), min(self.macro_y_spin.maximum(), int(dy)))
+        if int(self._macro_global_dx) == next_x and int(self._macro_global_dy) == next_y:
+            return False
+        if push_history and not self._drag_history_started:
+            self._push_history_before_mutation(reason)
+        self._macro_global_dx = next_x
+        self._macro_global_dy = next_y
+        self.macro_x_spin.blockSignals(True)
+        self.macro_y_spin.blockSignals(True)
+        self.macro_x_spin.setValue(next_x)
+        self.macro_y_spin.setValue(next_y)
+        self.macro_x_spin.blockSignals(False)
+        self.macro_y_spin.blockSignals(False)
+        self._refresh_adjustment_views()
+        logger.debug("pivot.ui macro_global_set reason=%s value=(%s,%s)", reason, next_x, next_y)
+        return True
+
+    def _apply_macro_delta(self, dx: int, dy: int, *, reason: str) -> bool:
+        return self._set_macro_global(
+            int(self._macro_global_dx) + int(dx),
+            int(self._macro_global_dy) + int(dy),
+            reason=reason,
+            push_history=True,
+        )
+
+    def _on_apply_macro_clicked(self) -> None:
+        self._set_macro_global(0, 0, reason="macro-reset", push_history=True)
+
+    def _on_macro_value_changed(self, _value: int) -> None:
+        if self._history_restoring:
+            return
+        self._set_macro_global(
+            int(self.macro_x_spin.value()),
+            int(self.macro_y_spin.value()),
+            reason="macro-spin",
+            push_history=True,
+        )
+
+    def _on_drag_macro_toggled(self, enabled: bool) -> None:
+        self._macro_drag_enabled = bool(enabled)
+        if self._macro_drag_enabled and self.drag_micro_check.isChecked():
+            self.drag_micro_check.blockSignals(True)
+            self.drag_micro_check.setChecked(False)
+            self.drag_micro_check.blockSignals(False)
+            self._micro_drag_enabled = False
+        self.preview_panel.set_drag_mode(self._micro_drag_enabled or self._macro_drag_enabled)
+        logger.debug("pivot.ui drag_macro enabled=%s", self._macro_drag_enabled)
+
+    def _on_preview_drag_started(self) -> None:
+        if not (self._micro_drag_enabled or self._macro_drag_enabled):
+            return
+        self._push_history_before_mutation("drag-adjust")
+        self._drag_history_started = True
+
+    def _on_preview_drag_finished(self, _dx: int, _dy: int) -> None:
+        self._drag_history_started = False
+
+    def _reset_all_micro_adjustments(self) -> None:
+        if not self._nudges:
+            return
+        self._push_history_before_mutation("reset-micro")
+        self._nudges.clear()
+        current = self.frame_list.currentItem()
+        if current is not None:
+            self.nudge_x_spin.blockSignals(True)
+            self.nudge_y_spin.blockSignals(True)
+            self.nudge_x_spin.setValue(0)
+            self.nudge_y_spin.setValue(0)
+            self.nudge_x_spin.blockSignals(False)
+            self.nudge_y_spin.blockSignals(False)
+            key = str(current.data(Qt.ItemDataRole.UserRole) or "")
+            self._update_preview_for_key(key, center_row=self.sequence_list.currentRow())
+        logger.debug("pivot.ui reset_micro_all")
+
+    def handle_shortcut_play_pause(self) -> bool:
+        if not self.isVisible() or not self.play_btn.isEnabled():
+            return False
+        self.play_btn.toggle()
+        return True
+
+    def handle_shortcut_seek(self, delta: int) -> bool:
+        if not self.isVisible():
+            return False
+        self._seek_sequence_by_delta(int(delta))
+        return True
+
+    def handle_shortcut_nudge(self, dx: int, dy: int) -> bool:
+        if not self.isVisible():
+            return False
+        self._nudge_current_frame(int(dx), int(dy))
+        return True
+
+    def handle_shortcut_reset_micro(self) -> bool:
+        if not self.isVisible():
+            return False
+        self._reset_all_micro_adjustments()
+        return True
+
+    def handle_shortcut_macro(self, dx: int, dy: int) -> bool:
+        if not self.isVisible():
+            return False
+        return self._apply_macro_delta(int(dx), int(dy), reason="macro-shortcut")
+
+    def _event_matches_binding(self, event, action: str, default: str) -> bool:
+        mod_obj = event.modifiers() if hasattr(event, "modifiers") else Qt.KeyboardModifier.NoModifier
+        mod_value = int(getattr(mod_obj, "value", 0))
+        combo_value = int(event.key()) | mod_value
+        sequence_text = KeybindingsDialog._normalize_shortcut_text(QKeySequence(combo_value).toString())
+        if not sequence_text:
+            return False
+        bindings = self._owner._get_key_bindings(action, default)
+        for entry in bindings:
+            bound = KeybindingsDialog._normalize_shortcut_text(str(entry.get("shortcut", "")))
+            if bound and bound.lower() == sequence_text.lower():
+                return True
+        return False
+
+    def _combo_popup_open(self) -> bool:
+        combos = [
+            self.anchor_mode_combo,
+            self.solver_mode_combo,
+            self.reference_mode_combo,
+            self.mask_mode_combo,
+            self.preview_mode_combo,
+            self.scaling_combo,
+        ]
+        for combo in combos:
+            view = combo.view()
+            if view is not None and view.isVisible():
+                return True
+        return False
+
+    def _handle_focus_aware_shortcut_event(self, event, *, watched: object | None = None) -> bool:
+        if not self.isVisible() or not self.isActiveWindow():
+            return False
+        if self._combo_popup_open():
+            return False
+        event_type = event.type()
+        key = int(event.key()) if hasattr(event, "key") else -1
+        mod_obj = event.modifiers() if hasattr(event, "modifiers") else Qt.KeyboardModifier.NoModifier
+        mods = int(getattr(mod_obj, "value", 0))
+        ctrl_mod = int(getattr(Qt.KeyboardModifier.ControlModifier, "value", 0))
+        shift_mod = int(getattr(Qt.KeyboardModifier.ShiftModifier, "value", 0))
+        no_mods = mods == 0
+        ctrl_only = mods == ctrl_mod
+        shift_only = mods == shift_mod
+        is_auto_repeat = bool(event.isAutoRepeat()) if hasattr(event, "isAutoRepeat") else False
+
+        managed_key = key in (
+            int(Qt.Key.Key_Space),
+            int(Qt.Key.Key_Left),
+            int(Qt.Key.Key_Right),
+            int(Qt.Key.Key_Up),
+            int(Qt.Key.Key_Down),
+        )
+        managed_mods = no_mods or ctrl_only or shift_only
+        allow_seek_autorepeat = bool(
+            is_auto_repeat
+            and no_mods
+            and key in (int(Qt.Key.Key_Left), int(Qt.Key.Key_Right))
+        )
+        if event_type == QEvent.Type.KeyPress and is_auto_repeat and managed_key and managed_mods and not allow_seek_autorepeat:
+            logger.debug("pivot.ui shortcut_ignored autorepeat key=%s mods=%s", key, mods)
+            event.accept()
+            return True
+
+        if event_type == QEvent.Type.KeyRelease:
+            if key != int(Qt.Key.Key_Space):
+                return False
+            if self._swallow_space_key_release:
+                self._swallow_space_key_release = False
+                event.accept()
+                return True
+            return False
+
+        if event_type != QEvent.Type.KeyPress:
+            return False
+
+        focus = QApplication.focusWidget()
+        if watched is not None and isinstance(watched, QWidget):
+            focus = watched
+        if key == int(Qt.Key.Key_Space) and no_mods and self._event_matches_binding(event, "pivot_assist/play_pause", "Space"):
+            if self.handle_shortcut_play_pause():
+                logger.debug("pivot.ui shortcut_trigger action=play_pause")
+                self._swallow_space_key_release = True
+                event.accept()
+                return True
+
+        if key == int(Qt.Key.Key_Left) and ctrl_only and self._event_matches_binding(event, "pivot_assist/macro_left", "Ctrl+Left"):
+            if self.handle_shortcut_macro(-1, 0):
+                logger.debug("pivot.ui shortcut_trigger action=macro_left")
+                event.accept()
+                return True
+        if key == int(Qt.Key.Key_Right) and ctrl_only and self._event_matches_binding(event, "pivot_assist/macro_right", "Ctrl+Right"):
+            if self.handle_shortcut_macro(1, 0):
+                logger.debug("pivot.ui shortcut_trigger action=macro_right")
+                event.accept()
+                return True
+        if key == int(Qt.Key.Key_Up) and ctrl_only and self._event_matches_binding(event, "pivot_assist/macro_up", "Ctrl+Up"):
+            if self.handle_shortcut_macro(0, -1):
+                logger.debug("pivot.ui shortcut_trigger action=macro_up")
+                event.accept()
+                return True
+        if key == int(Qt.Key.Key_Down) and ctrl_only and self._event_matches_binding(event, "pivot_assist/macro_down", "Ctrl+Down"):
+            if self.handle_shortcut_macro(0, 1):
+                logger.debug("pivot.ui shortcut_trigger action=macro_down")
+                event.accept()
+                return True
+
+        if key == int(Qt.Key.Key_Left) and shift_only and self._event_matches_binding(event, "pivot_assist/nudge_left", "Shift+Left"):
+            if self.handle_shortcut_nudge(-1, 0):
+                logger.debug("pivot.ui shortcut_trigger action=nudge_left")
+                event.accept()
+                return True
+        if key == int(Qt.Key.Key_Right) and shift_only and self._event_matches_binding(event, "pivot_assist/nudge_right", "Shift+Right"):
+            if self.handle_shortcut_nudge(1, 0):
+                logger.debug("pivot.ui shortcut_trigger action=nudge_right")
+                event.accept()
+                return True
+        if key == int(Qt.Key.Key_Up) and shift_only and self._event_matches_binding(event, "pivot_assist/nudge_up", "Shift+Up"):
+            if self.handle_shortcut_nudge(0, -1):
+                logger.debug("pivot.ui shortcut_trigger action=nudge_up")
+                event.accept()
+                return True
+        if key == int(Qt.Key.Key_Down) and shift_only and self._event_matches_binding(event, "pivot_assist/nudge_down", "Shift+Down"):
+            if self.handle_shortcut_nudge(0, 1):
+                logger.debug("pivot.ui shortcut_trigger action=nudge_down")
+                event.accept()
+                return True
+
+        if isinstance(focus, (QSlider, QSpinBox, QLineEdit)):
+            return False
+
+        if key == int(Qt.Key.Key_Left) and no_mods and self._event_matches_binding(event, "pivot_assist/seek_left_1f", "Left"):
+            if self.handle_shortcut_seek(-1):
+                logger.debug("pivot.ui shortcut_trigger action=seek_left")
+                event.accept()
+                return True
+        if key == int(Qt.Key.Key_Right) and no_mods and self._event_matches_binding(event, "pivot_assist/seek_right_1f", "Right"):
+            if self.handle_shortcut_seek(1):
+                logger.debug("pivot.ui shortcut_trigger action=seek_right")
+                event.accept()
+                return True
+        return False
+
+    def _restore_shortcut_focus_context(self) -> None:
+        if self.sequence_list.count() > 0:
+            self.sequence_list.setFocus(Qt.FocusReason.ShortcutFocusReason)
+            return
+        if self.frame_list.count() > 0:
+            self.frame_list.setFocus(Qt.FocusReason.ShortcutFocusReason)
+
+    def _on_drag_micro_toggled(self, enabled: bool) -> None:
+        self._micro_drag_enabled = bool(enabled)
+        if self._micro_drag_enabled and self.drag_macro_check.isChecked():
+            self.drag_macro_check.blockSignals(True)
+            self.drag_macro_check.setChecked(False)
+            self.drag_macro_check.blockSignals(False)
+            self._macro_drag_enabled = False
+        self.preview_panel.set_drag_mode(self._micro_drag_enabled or self._macro_drag_enabled)
+        logger.debug("pivot.ui drag_micro enabled=%s", self._micro_drag_enabled)
+
+    def _on_preview_drag_micro_delta(self, dx: int, dy: int) -> None:
+        if self._macro_drag_enabled:
+            self._apply_macro_delta(int(dx), int(dy), reason="macro-drag")
+            return
+        if not self._micro_drag_enabled:
+            return
+        current = self.frame_list.currentItem()
+        if current is None:
+            return
+        key = str(current.data(Qt.ItemDataRole.UserRole) or "")
+        if not self._drag_history_started:
+            self._push_history_before_mutation("micro-drag")
+        current_x, current_y = self._nudges.get(key, (0, 0))
+        next_x = max(self.nudge_x_spin.minimum(), min(self.nudge_x_spin.maximum(), int(current_x) + int(dx)))
+        next_y = max(self.nudge_y_spin.minimum(), min(self.nudge_y_spin.maximum(), int(current_y) + int(dy)))
+        if next_x == int(current_x) and next_y == int(current_y):
+            return
+        self.nudge_x_spin.setValue(next_x)
+        self.nudge_y_spin.setValue(next_y)
+        logger.debug("pivot.ui drag_micro_delta key=%s delta=(%s,%s) next=(%s,%s)", key, int(dx), int(dy), next_x, next_y)
+
+    def _update_guide_overlays(self) -> None:
+        source_w = int(self._guide_source_size.width())
+        source_h = int(self._guide_source_size.height())
+        if source_w <= 0 or source_h <= 0:
+            self.preview_panel.set_guide_options({})
+            return
+        guide_options: Dict[str, object] = {
+            "source_w": source_w,
+            "source_h": source_h,
+            "show_grid": bool(self.show_grid_check.isChecked()),
+            "grid_step": int(self.grid_step_spin.value()),
+            "show_axis": bool(self.show_axis_check.isChecked()),
+            "axis_x": int(self.axis_x_spin.value()),
+            "axis_y": int(self.axis_y_spin.value()),
+            "axis_layer": str(self.axis_layer_combo.currentData() or self._owner._preview_guides_axis_layer),
+            "axis_color": self._owner._normalize_rgb_color(
+                self.axis_color_btn.property("axis_color"),
+                self._owner._preview_guides_axis_color,
+            ),
+            "show_ground": bool(self.show_ground_check.isChecked()),
+            "ground_y": int(self.ground_y_spin.value()),
+            "custom_axes": self._owner._enabled_custom_axis_guides(),
+        }
+        self.preview_panel.set_guide_options(guide_options)
+
+    def _open_axis_color_picker(self) -> None:
+        current = self._owner._normalize_rgb_color(
+            self.axis_color_btn.property("axis_color"),
+            self._owner._preview_guides_axis_color,
+        )
+        chosen = QColorDialog.getColor(QColor(int(current[0]), int(current[1]), int(current[2])), self, "Base Axis Color")
+        if not chosen.isValid():
+            return
+        self._owner._set_color_button_preview(self.axis_color_btn, (int(chosen.red()), int(chosen.green()), int(chosen.blue())))
+        self._on_shared_guide_options_changed(None)
+
+    def _on_axis_preset_clicked(self) -> None:
+        self._owner._open_axis_preset_picker()
+        self.apply_external_guide_state(
+            show_grid=bool(self._owner._preview_guides_show_grid),
+            grid_step=int(self._owner._preview_guides_grid_step),
+            show_axis=bool(self._owner._preview_guides_show_axis),
+            axis_x=int(self._owner._preview_guides_axis_x),
+            axis_y=int(self._owner._preview_guides_axis_y),
+            axis_layer=str(self._owner._preview_guides_axis_layer),
+            axis_color=self._owner._preview_guides_axis_color,
+        )
+
+    def _on_shared_guide_options_changed(self, _value: object) -> None:
+        axis_color = self._owner._normalize_rgb_color(
+            self.axis_color_btn.property("axis_color"),
+            self._owner._preview_guides_axis_color,
+        )
+        self._owner._set_global_guide_state(
+            show_grid=bool(self.show_grid_check.isChecked()),
+            grid_step=int(self.grid_step_spin.value()),
+            show_axis=bool(self.show_axis_check.isChecked()),
+            axis_x=int(self.axis_x_spin.value()),
+            axis_y=int(self.axis_y_spin.value()),
+            axis_layer=str(self.axis_layer_combo.currentData() or self._owner._preview_guides_axis_layer),
+            axis_color=axis_color,
+            source="pivot",
+        )
+
+    def apply_external_guide_state(
+        self,
+        *,
+        show_grid: bool,
+        grid_step: int,
+        show_axis: bool,
+        axis_x: int,
+        axis_y: int,
+        axis_layer: str | None = None,
+        axis_color: ColorTuple | None = None,
+    ) -> None:
+        layer_value = str(axis_layer or self._owner._preview_guides_axis_layer or "top").strip().lower()
+        if layer_value not in {"top", "bottom"}:
+            layer_value = "top"
+        color_value = self._owner._normalize_rgb_color(axis_color, self._owner._preview_guides_axis_color)
+        for widget, value in (
+            (self.show_grid_check, bool(show_grid)),
+            (self.grid_step_spin, max(1, min(64, int(grid_step)))),
+            (self.show_axis_check, bool(show_axis)),
+            (self.axis_x_spin, max(-4096, min(4096, int(axis_x)))),
+            (self.axis_y_spin, max(-4096, min(4096, int(axis_y)))),
+            (self.axis_layer_combo, str(layer_value)),
+        ):
+            blocked = widget.blockSignals(True)
+            if isinstance(widget, QCheckBox):
+                widget.setChecked(bool(value))
+            elif isinstance(widget, QComboBox):
+                combo_index = widget.findData(value)
+                widget.setCurrentIndex(combo_index if combo_index >= 0 else 0)
+            else:
+                widget.setValue(int(value))
+            widget.blockSignals(blocked)
+        self._owner._set_color_button_preview(self.axis_color_btn, color_value)
+        self._update_guide_overlays()
+
+    def _reference_onion_source_keys(self, current_key: str) -> List[str]:
+        keys: List[str] = []
+        mode = str(self.reference_mode_combo.currentData() or "first")
+        if mode == "records_median":
+            for key in self._reference_source_keys:
+                if key in self._owner.sprite_records:
+                    keys.append(key)
+        elif mode == "first":
+            if self._sequence_frames:
+                keys.append(self._sequence_frames[0][0])
+        elif mode == "median":
+            if self._sequence_frames:
+                median_index = max(0, min(len(self._sequence_frames) - 1, len(self._sequence_frames) // 2))
+                keys.append(self._sequence_frames[median_index][0])
+        elif mode == "index":
+            row = int(self.sequence_list.currentRow())
+            if 0 <= row < len(self._sequence_frames):
+                keys.append(self._sequence_frames[row][0])
+            elif current_key:
+                keys.append(current_key)
+
+        if not keys and self._sequence_frames:
+            keys.append(self._sequence_frames[0][0])
+
+        unique: List[str] = []
+        seen: set[str] = set()
+        for key in keys:
+            if key == current_key:
+                continue
+            if key in seen:
+                continue
+            if key not in self._owner.sprite_records:
+                continue
+            seen.add(key)
+            unique.append(key)
+
+        max_layers = max(0, int(self._reference_onion_max_layers))
+        if max_layers <= 0:
+            return []
+        return unique[:max_layers]
+
+    def _merge_static_layers(self, base_layer: QPixmap | None, overlay_layer: QPixmap | None) -> QPixmap | None:
+        if base_layer is None:
+            return overlay_layer
+        if overlay_layer is None:
+            return base_layer
+        width = max(base_layer.width(), overlay_layer.width())
+        height = max(base_layer.height(), overlay_layer.height())
+        merged = QPixmap(max(1, int(width)), max(1, int(height)))
+        merged.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(merged)
+        try:
+            base_x = int((merged.width() - base_layer.width()) * 0.5)
+            base_y = int((merged.height() - base_layer.height()) * 0.5)
+            overlay_x = int((merged.width() - overlay_layer.width()) * 0.5)
+            overlay_y = int((merged.height() - overlay_layer.height()) * 0.5)
+            painter.drawPixmap(base_x, base_y, base_layer)
+            painter.drawPixmap(overlay_x, overlay_y, overlay_layer)
+        finally:
+            painter.end()
+        return merged
+
+    def _compose_reference_onion_pixmap(self, current_key: str) -> QPixmap | None:
+        if not bool(self.reference_onion_check.isChecked()):
+            return None
+
+        source_keys = self._reference_onion_source_keys(current_key)
+        if not source_keys:
+            return None
+
+        source_pixmaps: List[QPixmap] = []
+        for key in source_keys:
+            record = self._owner.sprite_records.get(key)
+            if record is None:
+                continue
+            pixmap = self._owner._get_animation_preview_pixmap(record)
+            if pixmap is not None:
+                source_pixmaps.append(pixmap)
+
+        if not source_pixmaps:
+            return None
+
+        width = max(pixmap.width() for pixmap in source_pixmaps)
+        height = max(pixmap.height() for pixmap in source_pixmaps)
+        target = QPixmap(max(1, int(width)), max(1, int(height)))
+        target.fill(Qt.GlobalColor.transparent)
+
+        base_opacity = max(0.0, min(1.0, float(self._reference_onion_opacity) / 255.0))
+        tint = self._reference_onion_tint
+        total = len(source_pixmaps)
+
+        painter = QPainter(target)
+        try:
+            for index, pixmap in reversed(list(enumerate(source_pixmaps, start=1))):
+                weight = float(total - index + 1) / float(max(1, total))
+                opacity = max(0.0, min(1.0, base_opacity * weight))
+                x = int((target.width() - pixmap.width()) * 0.5)
+                y = int((target.height() - pixmap.height()) * 0.5)
+                painter.save()
+                painter.setOpacity(opacity)
+                painter.drawPixmap(x, y, pixmap)
+                painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceAtop)
+                painter.setOpacity(opacity)
+                painter.fillRect(x, y, pixmap.width(), pixmap.height(), QColor(int(tint[0]), int(tint[1]), int(tint[2])))
+                painter.restore()
+        finally:
+            painter.end()
+
+        return target
+
+    def _open_reference_onion_settings(self) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Reference Onion Settings")
+        dialog.setModal(True)
+        layout = QFormLayout(dialog)
+
+        enabled_check = QCheckBox("Enable reference onion", dialog)
+        enabled_check.setChecked(bool(self.reference_onion_check.isChecked()))
+        opacity_spin = QSpinBox(dialog)
+        opacity_spin.setRange(0, 255)
+        opacity_spin.setValue(int(self._reference_onion_opacity))
+        opacity_spin.setSuffix(" /255")
+        max_layers_spin = QSpinBox(dialog)
+        max_layers_spin.setRange(0, 32)
+        max_layers_spin.setValue(int(self._reference_onion_max_layers))
+
+        tint = [
+            int(self._reference_onion_tint[0]),
+            int(self._reference_onion_tint[1]),
+            int(self._reference_onion_tint[2]),
+        ]
+        tint_btn = QPushButton(dialog)
+        tint_btn.setMinimumWidth(120)
+
+        def _refresh_tint_btn() -> None:
+            tint_btn.setText("Tint")
+            tint_btn.setStyleSheet(
+                f"background-color: rgb({int(tint[0])}, {int(tint[1])}, {int(tint[2])}); border: 1px solid #888;"
+            )
+
+        def _pick_tint() -> None:
+            chosen = QColorDialog.getColor(QColor(int(tint[0]), int(tint[1]), int(tint[2])), dialog, "Choose Reference Onion Tint")
+            if not chosen.isValid():
+                return
+            tint[0] = int(chosen.red())
+            tint[1] = int(chosen.green())
+            tint[2] = int(chosen.blue())
+            _refresh_tint_btn()
+
+        _refresh_tint_btn()
+        tint_btn.clicked.connect(_pick_tint)
+
+        layout.addRow("Enabled", enabled_check)
+        layout.addRow("Opacity", opacity_spin)
+        layout.addRow("Max reference layers", max_layers_spin)
+        layout.addRow("Tint", tint_btn)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel, parent=dialog)
+        layout.addRow(buttons)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        self._reference_onion_opacity = int(opacity_spin.value())
+        self._reference_onion_max_layers = int(max_layers_spin.value())
+        self._reference_onion_tint = (int(tint[0]), int(tint[1]), int(tint[2]))
+        checked = bool(enabled_check.isChecked())
+        if self.reference_onion_check.isChecked() != checked:
+            self.reference_onion_check.blockSignals(True)
+            self.reference_onion_check.setChecked(checked)
+            self.reference_onion_check.blockSignals(False)
+        self._on_preview_options_changed(None)
+
+    def _recompute(self) -> None:
+        solver_mode = str(self.solver_mode_combo.currentData() or "hybrid")
+        anchor_mode = str(self.anchor_mode_combo.currentData() or "hybrid")
+        reference_mode = str(self.reference_mode_combo.currentData() or "first")
+        mask_mode = str(self.mask_mode_combo.currentData() or "auto")
+        response_gain = int(self.response_gain_spin.value())
+        reference_index = int(self.sequence_list.currentRow()) if reference_mode == "index" else None
+        reference_records: List[SpriteRecord] | None = None
+        if reference_mode == "records_median":
+            selected_records: List[SpriteRecord] = []
+            for key in self._reference_source_keys:
+                record = self._owner.sprite_records.get(key)
+                if record is None:
+                    continue
+                selected_records.append(record)
+            reference_records = selected_records
+        logger.debug(
+            "pivot.ui recompute_start solver=%s anchor=%s reference=%s mask=%s gain=%s smooth=%s jump=%s ref_index=%s ref_sources=%s seq_count=%s",
+            solver_mode,
+            anchor_mode,
+            reference_mode,
+            mask_mode,
+            response_gain,
+            int(self.smoothing_slider.value()),
+            int(self.max_jump_spin.value()),
+            reference_index,
+            len(reference_records) if reference_records is not None else 0,
+            len(self._sequence_frames),
+        )
+        result = build_pivot_assist_result(
+            self._records_for_suggestion_pass(),
+            smoothing=int(self.smoothing_slider.value()),
+            max_jump=int(self.max_jump_spin.value()),
+            anchor_mode=(anchor_mode if anchor_mode in {"hybrid", "centroid", "foot", "bbox_center"} else "hybrid"),
+            reference_mode=(reference_mode if reference_mode in {"first", "median", "index", "records_median"} else "first"),
+            reference_index=reference_index,
+            reference_records=reference_records,
+            response_gain=response_gain,
+            mask_mode=(mask_mode if mask_mode in {"auto", "alpha", "border", "transparency"} else "auto"),
+            solver_mode=(solver_mode if solver_mode in {"hybrid", "anchor", "phase"} else "hybrid"),
+        )
+        self._suggestions.clear()
+        frame_by_key: Dict[str, PivotAssistFrame] = {frame.key: frame for frame in result.frames}
+        for key, _record in self._records:
+            frame = frame_by_key.get(key)
+            if frame is not None:
+                self._suggestions[key] = frame
+        logger.debug("pivot.ui recompute_mapped suggestions=%s", len(self._suggestions))
+        self._last_debug_report = self._build_debug_report(result)
+        logger.debug("Pivot Assist recompute\n%s", self._last_debug_report)
+        tips: List[str] = []
+        if int(self.max_jump_spin.value()) <= 2:
+            tips.append("Max Jump is very low, so large frame shifts can be suppressed.")
+        if int(self.smoothing_slider.value()) >= 70:
+            tips.append("High Smoothing can hide sudden movement spikes.")
+        if str(self.reference_mode_combo.currentData() or "") == "records_median" and not self._reference_source_keys:
+            tips.append("Picked Sources mode is active but no custom sources are selected.")
+        if int(self.response_gain_spin.value()) >= 220:
+            tips.append("High Gain can over-amplify noise after smoothing.")
+        if tips:
+            self.settings_help_label.setText("⚠ " + "  ".join(tips))
+            logger.debug("pivot.ui recompute_tips tips=%s", tips)
+        else:
+            self.settings_help_label.setText("")
+
+        current_key = None
+        current_item = self.frame_list.currentItem()
+        if current_item is not None:
+            current_key = str(current_item.data(Qt.ItemDataRole.UserRole) or "")
+
+        self.frame_list.blockSignals(True)
+        self.frame_list.clear()
+        for key, record in self._records:
+            frame = self._suggestions.get(key)
+            confidence = frame.confidence if frame is not None else 0.0
+            text = self._list_item_text(key, record.path.name, confidence)
+            item = QListWidgetItem(text)
+            item.setData(Qt.ItemDataRole.UserRole, key)
+            if confidence < 0.45:
+                item.setBackground(QColor(88, 52, 52, 140))
+            elif confidence < 0.70:
+                item.setBackground(QColor(88, 80, 48, 110))
+            self.frame_list.addItem(item)
+
+        if self.frame_list.count() > 0:
+            target_row = 0
+            if current_key:
+                for row in range(self.frame_list.count()):
+                    item = self.frame_list.item(row)
+                    if item is not None and str(item.data(Qt.ItemDataRole.UserRole) or "") == current_key:
+                        target_row = row
+                        break
+            self.frame_list.setCurrentRow(target_row)
+        self.frame_list.blockSignals(False)
+
+        current_sequence_row = self.sequence_list.currentRow() if hasattr(self, "sequence_list") else -1
+        self.sequence_list.blockSignals(True)
+        self.sequence_list.clear()
+        for index, (key, duration_frames, label) in enumerate(self._sequence_frames):
+            record = self._record_by_key.get(key)
+            display_name = record.path.name if record is not None else key
+            frame_name_stem = Path(display_name).stem
+            item = QListWidgetItem(f"≡ {index + 1:03d}\n{duration_frames}f")
+            item.setData(Qt.ItemDataRole.UserRole, key)
+            item.setData(Qt.ItemDataRole.UserRole + 1, int(duration_frames))
+            item.setData(_TIMELINE_ITEM_KIND_ROLE, "frame")
+            item.setData(_TIMELINE_FRAME_LABEL_ROLE, f"{label} {frame_name_stem}")
+            item.setData(_TIMELINE_FRAME_NUMBER_ROLE, int(index + 1))
+            item.setData(_TIMELINE_FRAME_NAME_ROLE, frame_name_stem)
+            item.setData(_TIMELINE_FRAME_DURATION_ROLE, f"{duration_frames}f")
+            item.setToolTip(f"{display_name}\nLabel: {label}\nDuration: {duration_frames} frame(s)")
+            item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+            block_width = self._pivot_timeline_frame_block_width(int(duration_frames))
+            item.setSizeHint(QSize(block_width, 92))
+            preview: QPixmap | None = None
+            if record is not None:
+                preview = self._owner._get_animation_preview_pixmap(record)
+            icon = self._owner._build_animation_timeline_cell_icon(preview, self.sequence_list.iconSize())
+            if icon is not None:
+                item.setIcon(icon)
+            self.sequence_list.addItem(item)
+        if self.sequence_list.count() > 0:
+            if 0 <= current_sequence_row < self.sequence_list.count():
+                self.sequence_list.setCurrentRow(current_sequence_row)
+            else:
+                self.sequence_list.setCurrentRow(0)
+        self.sequence_list.blockSignals(False)
+        self._play_subframe_progress = 0
+        self._update_pivot_timeline_ruler()
+
+        self._on_current_frame_changed(self.frame_list.currentItem(), None)
+        logger.debug("pivot.ui recompute_done frame_items=%s seq_items=%s", self.frame_list.count(), self.sequence_list.count())
+
+    def _open_reference_source_picker(self) -> None:
+        logger.debug("pivot.ui open_reference_source_picker begin existing_selected=%s", len(self._reference_source_keys))
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Pick Pivot Reference Sources")
+        dialog.resize(780, 560)
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(QLabel("Pick one or more source frames from all loaded sprites."))
+        search_input = QLineEdit(dialog)
+        search_input.setPlaceholderText("Search by filename...")
+        layout.addWidget(search_input)
+
+        list_widget = QListWidget(dialog)
+        list_widget.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        list_widget.setViewMode(QListView.ViewMode.IconMode)
+        list_widget.setFlow(QListView.Flow.LeftToRight)
+        list_widget.setWrapping(True)
+        list_widget.setResizeMode(QListView.ResizeMode.Adjust)
+        list_widget.setMovement(QListView.Movement.Static)
+        list_widget.setUniformItemSizes(False)
+        list_widget.setIconSize(QSize(72, 72))
+        list_widget.setGridSize(QSize(122, 120))
+        list_widget.setSpacing(8)
+        layout.addWidget(list_widget, 1)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel, dialog)
+        layout.addWidget(buttons)
+
+        icon_size = QSize(72, 72)
+        ordered_records = sorted(self._owner.sprite_records.items(), key=lambda item: item[1].path.name.lower())
+        for key, record in ordered_records:
+            item = QListWidgetItem(record.path.name)
+            item.setData(Qt.ItemDataRole.UserRole, key)
+            preview = self._owner._get_animation_preview_pixmap(record)
+            icon = self._owner._build_animation_timeline_cell_icon(preview, icon_size)
+            if icon is not None:
+                item.setIcon(icon)
+            item.setToolTip(record.path.as_posix())
+            list_widget.addItem(item)
+            if key in self._reference_source_keys:
+                item.setSelected(True)
+
+        def _apply_filter(text: str) -> None:
+            needle = text.strip().lower()
+            for row in range(list_widget.count()):
+                item = list_widget.item(row)
+                if item is None:
+                    continue
+                visible = True if not needle else needle in item.text().lower()
+                item.setHidden(not visible)
+
+        search_input.textChanged.connect(_apply_filter)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            logger.debug("pivot.ui open_reference_source_picker cancelled")
+            return
+
+        selected_keys: List[str] = []
+        for item in list_widget.selectedItems():
+            key = str(item.data(Qt.ItemDataRole.UserRole) or "")
+            if key:
+                selected_keys.append(key)
+        self._reference_source_keys = selected_keys
+        if selected_keys:
+            sample_labels: List[str] = []
+            for key in selected_keys[:3]:
+                record = self._owner.sprite_records.get(key)
+                if record is not None:
+                    sample_labels.append(record.path.name)
+            extra = "" if len(selected_keys) <= 3 else f" +{len(selected_keys) - 3}"
+            self.reference_source_summary.setText(
+                f"Reference sources: {len(selected_keys)} selected ({', '.join(sample_labels)}{extra})"
+            )
+        else:
+            self.reference_source_summary.setText("Reference sources: auto from current sequence")
+        logger.debug("pivot.ui reference_sources_updated count=%s", len(selected_keys))
+        self._recompute()
+
+    def _seek_sequence_by_delta(self, delta: int) -> None:
+        logger.debug("pivot.ui seek_request delta=%s current=%s count=%s", int(delta), self.sequence_list.currentRow(), self.sequence_list.count())
+        if self.sequence_list.count() <= 0:
+            return
+        row = self.sequence_list.currentRow()
+        if row < 0:
+            row = 0
+        next_row = max(0, min(self.sequence_list.count() - 1, int(row) + int(delta)))
+        if next_row == row:
+            return
+        self.sequence_list.setCurrentRow(next_row)
+        logger.debug("pivot.ui seek_applied from=%s to=%s", row, next_row)
+        item = self.sequence_list.item(next_row)
+        if item is not None:
+            self.sequence_list.scrollToItem(item, QAbstractItemView.ScrollHint.PositionAtCenter)
+
+    def _apply_preset(self) -> None:
+        preset, ok = QInputDialog.getItem(
+            self,
+            "Pivot Assist Preset",
+            "Choose a preset:",
+            [
+                "Balanced (default)",
+                "Big Shift Catch-Up",
+                "Stable No Jitter",
+                "Foot/Ground Lock",
+            ],
+            0,
+            False,
+        )
+        if not ok or not preset:
+            logger.debug("pivot.ui preset_cancelled")
+            return
+
+        logger.debug("pivot.ui preset_selected name=%s", preset)
+
+        if preset == "Balanced (default)":
+            self.smoothing_slider.setValue(35)
+            self.max_jump_spin.setValue(8)
+            self.response_gain_spin.setValue(100)
+            self.anchor_mode_combo.setCurrentIndex(max(0, self.anchor_mode_combo.findData("hybrid")))
+            self.solver_mode_combo.setCurrentIndex(max(0, self.solver_mode_combo.findData("hybrid")))
+            self.reference_mode_combo.setCurrentIndex(max(0, self.reference_mode_combo.findData("median")))
+            self.mask_mode_combo.setCurrentIndex(max(0, self.mask_mode_combo.findData("auto")))
+        elif preset == "Big Shift Catch-Up":
+            self.smoothing_slider.setValue(18)
+            self.max_jump_spin.setValue(22)
+            self.response_gain_spin.setValue(145)
+            self.anchor_mode_combo.setCurrentIndex(max(0, self.anchor_mode_combo.findData("foot")))
+            self.solver_mode_combo.setCurrentIndex(max(0, self.solver_mode_combo.findData("anchor")))
+            self.reference_mode_combo.setCurrentIndex(max(0, self.reference_mode_combo.findData("first")))
+            self.mask_mode_combo.setCurrentIndex(max(0, self.mask_mode_combo.findData("auto")))
+        elif preset == "Stable No Jitter":
+            self.smoothing_slider.setValue(62)
+            self.max_jump_spin.setValue(6)
+            self.response_gain_spin.setValue(95)
+            self.anchor_mode_combo.setCurrentIndex(max(0, self.anchor_mode_combo.findData("hybrid")))
+            self.solver_mode_combo.setCurrentIndex(max(0, self.solver_mode_combo.findData("hybrid")))
+            self.reference_mode_combo.setCurrentIndex(max(0, self.reference_mode_combo.findData("median")))
+            self.mask_mode_combo.setCurrentIndex(max(0, self.mask_mode_combo.findData("auto")))
+        elif preset == "Foot/Ground Lock":
+            self.smoothing_slider.setValue(28)
+            self.max_jump_spin.setValue(14)
+            self.response_gain_spin.setValue(120)
+            self.anchor_mode_combo.setCurrentIndex(max(0, self.anchor_mode_combo.findData("foot")))
+            self.solver_mode_combo.setCurrentIndex(max(0, self.solver_mode_combo.findData("anchor")))
+            self.reference_mode_combo.setCurrentIndex(max(0, self.reference_mode_combo.findData("records_median")))
+            self.mask_mode_combo.setCurrentIndex(max(0, self.mask_mode_combo.findData("transparency")))
+
+        self._recompute()
+
+    def _build_debug_report(self, result) -> str:
+        lines: List[str] = []
+        lines.append("Pivot Assist Debug Report")
+        lines.append(
+            "settings: "
+            f"smoothing={int(self.smoothing_slider.value())}, "
+            f"max_jump={int(self.max_jump_spin.value())}, "
+            f"anchor={str(self.anchor_mode_combo.currentData() or 'hybrid')}, "
+            f"solver={str(self.solver_mode_combo.currentData() or 'hybrid')}, "
+            f"reference={str(self.reference_mode_combo.currentData() or 'first')}, "
+            f"mask={str(self.mask_mode_combo.currentData() or 'auto')}, "
+            f"gain={int(self.response_gain_spin.value())}%"
+        )
+        if self._reference_source_keys:
+            lines.append(f"reference_sources={len(self._reference_source_keys)} custom")
+        lines.append(
+            f"reference_anchor=({result.reference_centroid[0]:.2f}, {result.reference_centroid[1]:.2f})"
+        )
+        lines.append("frames:")
+        for index, frame in enumerate(result.frames):
+            lines.append(
+                f"  {index + 1:03d} {frame.label} "
+                f"anchor=({frame.anchor_x:.2f},{frame.anchor_y:.2f}) "
+                f"raw=({frame.raw_dx:.2f},{frame.raw_dy:.2f}) "
+                f"phase=({frame.phase_dx:.2f},{frame.phase_dy:.2f}) "
+                f"phase_conf={frame.phase_confidence:.2f} "
+                f"w={frame.blend_weight:.2f} "
+                f"smooth=({frame.smooth_dx:.2f},{frame.smooth_dy:.2f}) "
+                f"final=({frame.suggested_dx},{frame.suggested_dy}) "
+                f"conf={frame.confidence:.3f}"
+            )
+        return "\n".join(lines)
+
+    def _copy_debug_report(self) -> None:
+        report = self._last_debug_report.strip()
+        if not report:
+            report = "Pivot Assist debug report is empty. Press Recompute first."
+        QApplication.clipboard().setText(report)
+        logger.debug("pivot.ui debug_report_copied chars=%s", len(report))
+        self._owner.statusBar().showMessage("Pivot Assist debug report copied", 3000)
+
+    def _on_sequence_current_changed(self, current: QListWidgetItem | None, _previous: QListWidgetItem | None) -> None:
+        if current is None:
+            return
+        key = str(current.data(Qt.ItemDataRole.UserRole) or "")
+        self._play_remaining_subframes = max(1, int(current.data(Qt.ItemDataRole.UserRole + 1) or 1))
+        self._play_subframe_progress = 0
+        logger.debug("pivot.ui sequence_current key=%s row=%s subframes=%s", key, self.sequence_list.currentRow(), self._play_remaining_subframes)
+        self._update_pivot_timeline_ruler()
+        self._update_preview_for_key(key, center_row=self.sequence_list.currentRow())
+        self._syncing_from_sequence_selection = True
+        try:
+            for row in range(self.frame_list.count()):
+                item = self.frame_list.item(row)
+                if item is None:
+                    continue
+                if str(item.data(Qt.ItemDataRole.UserRole) or "") == key:
+                    self.frame_list.setCurrentRow(row)
+                    break
+        finally:
+            self._syncing_from_sequence_selection = False
+
+    def _pivot_timeline_frame_block_width(self, duration_frames: int) -> int:
+        span = max(1, int(duration_frames))
+        return int(span * self._pivot_timeline_duration_unit_px())
+
+    def _pivot_timeline_duration_unit_px(self) -> int:
+        return 90
+
+    def _pivot_playhead_frame_position(self) -> int:
+        row = int(self.sequence_list.currentRow()) if hasattr(self, "sequence_list") else -1
+        if row < 0:
+            return 0
+        elapsed = 0
+        for index in range(max(0, row)):
+            item = self.sequence_list.item(index)
+            if item is None:
+                continue
+            elapsed += max(1, int(item.data(Qt.ItemDataRole.UserRole + 1) or 1))
+        return max(0, int(elapsed + int(self._play_subframe_progress)))
+
+    def _update_pivot_timeline_ruler(self) -> None:
+        if not hasattr(self, "pivot_timeline_ruler"):
+            return
+        durations: List[int] = []
+        widths: List[int] = []
+        for row in range(self.sequence_list.count()):
+            item = self.sequence_list.item(row)
+            if item is None:
+                continue
+            duration = max(1, int(item.data(Qt.ItemDataRole.UserRole + 1) or 1))
+            durations.append(duration)
+            widths.append(self._pivot_timeline_frame_block_width(duration))
+        total_frames = max(1, int(sum(durations)))
+        self.pivot_timeline_ruler.set_timeline_layout(
+            frame_widths=widths,
+            frame_durations=durations,
+            duration_unit_px=self._pivot_timeline_duration_unit_px(),
+            zoom_percent=100,
+        )
+        self.pivot_timeline_ruler.set_range_frames(0, total_frames)
+        self.pivot_timeline_ruler.set_scroll_x(self.sequence_list.horizontalScrollBar().value())
+        self.pivot_timeline_ruler.set_playhead_frame(self._pivot_playhead_frame_position())
+
+    def _best_sequence_row_for_key(self, key: str) -> int | None:
+        count = self.sequence_list.count()
+        if count <= 0:
+            return None
+        preferred_row = self.sequence_list.currentRow()
+        if 0 <= preferred_row < count:
+            preferred_item = self.sequence_list.item(preferred_row)
+            if preferred_item is not None and str(preferred_item.data(Qt.ItemDataRole.UserRole) or "") == key:
+                return preferred_row
+
+        first_match: int | None = None
+        for row in range(count):
+            item = self.sequence_list.item(row)
+            if item is None:
+                continue
+            if str(item.data(Qt.ItemDataRole.UserRole) or "") != key:
+                continue
+            if first_match is None:
+                first_match = row
+            if preferred_row >= 0 and abs(row - preferred_row) < abs(first_match - preferred_row):
+                first_match = row
+        return first_match
+
+    def _list_item_text(self, key: str, label: str, confidence: float) -> str:
+        frame = self._suggestions.get(key)
+        if frame is None:
+            return f"{label}  |  Δ(0, 0)  |  conf 0%"
+        nudge_x, nudge_y = self._effective_adjustment_for_key(key)
+        return (
+            f"{label}  |  Δ({int(frame.suggested_dx) + int(nudge_x)}, {int(frame.suggested_dy) + int(nudge_y)})"
+            f"  |  conf {int(round(max(0.0, min(1.0, confidence)) * 100.0))}%"
+        )
+
+    def _effective_offsets_for_preview(self) -> Dict[str, tuple[int, int]]:
+        updates: Dict[str, tuple[int, int]] = {}
+        for key, record in self._records:
+            frame = self._suggestions.get(key)
+            if frame is None:
+                continue
+            nudge_x, nudge_y = self._effective_adjustment_for_key(key)
+            original_x, original_y = self._original_offsets.get(key, (int(record.offset_x), int(record.offset_y)))
+            final_x = int(original_x) + int(frame.suggested_dx) + int(nudge_x)
+            final_y = int(original_y) + int(frame.suggested_dy) + int(nudge_y)
+            updates[key] = (final_x, final_y)
+        return updates
+
+    def _sequence_onion_neighbors(self, center_row: int) -> tuple[List[str], List[str]]:
+        if not self.onion_check.isChecked():
+            return [], []
+        if center_row < 0 or center_row >= len(self._sequence_frames):
+            return [], []
+
+        prev_keys: List[str] = []
+        next_keys: List[str] = []
+        prev_count = max(0, int(self._owner._preview_onion_prev_count))
+        next_count = max(0, int(self._owner._preview_onion_next_count))
+        for step in range(1, prev_count + 1):
+            idx = center_row - step
+            if idx < 0:
+                break
+            prev_keys.append(self._sequence_frames[idx][0])
+        for step in range(1, next_count + 1):
+            idx = center_row + step
+            if idx >= len(self._sequence_frames):
+                break
+            next_keys.append(self._sequence_frames[idx][0])
+        return prev_keys, next_keys
+
+    def _open_onion_settings_from_dialog(self) -> None:
+        self._owner._open_onion_settings()
+        self._on_preview_options_changed(None)
+
+    def _on_fps_changed(self, value: int) -> None:
+        interval = max(16, int(round(1000.0 / max(1, int(value)))))
+        self._play_timer.setInterval(interval)
+        logger.debug("pivot.ui fps_changed fps=%s interval_ms=%s", int(value), interval)
+
+    def _on_play_toggled(self, enabled: bool) -> None:
+        logger.debug("pivot.ui play_toggled enabled=%s row=%s count=%s", bool(enabled), self.sequence_list.currentRow(), self.sequence_list.count())
+        if enabled:
+            if self.sequence_list.count() <= 0:
+                self.play_btn.blockSignals(True)
+                self.play_btn.setChecked(False)
+                self.play_btn.blockSignals(False)
+                return
+            if self.sequence_list.currentRow() < 0:
+                self.sequence_list.setCurrentRow(0)
+            current = self.sequence_list.currentItem()
+            self._play_remaining_subframes = max(1, int(current.data(Qt.ItemDataRole.UserRole + 1) or 1)) if current is not None else 1
+            self._play_subframe_progress = 0
+            self._play_timer.start()
+            self.play_btn.setText("Pause")
+            self._update_pivot_timeline_ruler()
+            logger.debug("pivot.ui playback_started interval=%s start_subframes=%s", self._play_timer.interval(), self._play_remaining_subframes)
+        else:
+            self._play_timer.stop()
+            self.play_btn.setText("Play")
+            self._update_pivot_timeline_ruler()
+            logger.debug("pivot.ui playback_stopped")
+
+    def _tick_playback(self) -> None:
+        logger.debug("pivot.ui playback_tick row=%s remaining_before=%s", self.sequence_list.currentRow(), self._play_remaining_subframes)
+        if self.sequence_list.count() <= 0:
+            self._on_play_toggled(False)
+            return
+        self._play_remaining_subframes -= 1
+        self._play_subframe_progress = max(0, int(self._play_subframe_progress) + 1)
+        self._update_pivot_timeline_ruler()
+        if self._play_remaining_subframes > 0:
+            return
+
+        next_row = self.sequence_list.currentRow() + 1
+        if next_row >= self.sequence_list.count():
+            if self.loop_check.isChecked():
+                next_row = 0
+            else:
+                self.play_btn.blockSignals(True)
+                self.play_btn.setChecked(False)
+                self.play_btn.blockSignals(False)
+                self._on_play_toggled(False)
+                return
+        self.sequence_list.setCurrentRow(next_row)
+        next_item = self.sequence_list.currentItem()
+        self._play_remaining_subframes = max(1, int(next_item.data(Qt.ItemDataRole.UserRole + 1) or 1)) if next_item is not None else 1
+        self._play_subframe_progress = 0
+        self._update_pivot_timeline_ruler()
+        logger.debug("pivot.ui playback_advance next_row=%s next_subframes=%s", next_row, self._play_remaining_subframes)
+
+    def _update_preview_for_key(self, key: str, *, center_row: int | None = None) -> None:
+        record = self._record_by_key.get(key)
+        if record is None:
+            self._guide_source_size = QSize(0, 0)
+            self._update_guide_overlays()
+            self.preview_panel.set_static_pixmap(None)
+            self.preview_panel.set_overlay_layers([], QSize(0, 0))
+            self.preview_panel.set_pixmap(None, reset_zoom=False)
+            return
+
+        preview_offsets = self._effective_offsets_for_preview()
+        original_offsets: Dict[str, tuple[int, int]] = {}
+        for preview_key, (target_x, target_y) in preview_offsets.items():
+            candidate = self._record_by_key.get(preview_key)
+            if candidate is None:
+                continue
+            original_offsets[preview_key] = (int(candidate.offset_x), int(candidate.offset_y))
+            candidate.offset_x = int(target_x)
+            candidate.offset_y = int(target_y)
+
+        row = int(center_row) if center_row is not None else int(self.sequence_list.currentRow())
+        prev_keys, next_keys = self._sequence_onion_neighbors(row)
+        mode = str(self.preview_mode_combo.currentData() or "animation_assist")
+        try:
+            if mode == "animation_assist" and self.onion_check.isChecked():
+                composed = self._owner._compose_animation_assist_pixmap(key, prev_keys, next_keys)
+            else:
+                composed = self._owner._compose_animation_assist_pixmap(key, [], [])
+
+            if composed is None:
+                self._guide_source_size = QSize(0, 0)
+                self._update_guide_overlays()
+                self.preview_panel.set_static_pixmap(None)
+                self.preview_panel.set_overlay_layers([], QSize(0, 0))
+                self.preview_panel.set_pixmap(None, reset_zoom=False)
+                return
+
+            current_pixmap, onion_pixmap = composed
+            use_onion = mode == "animation_assist" and self.onion_check.isChecked()
+            reference_onion = self._compose_reference_onion_pixmap(key) if mode == "animation_assist" else None
+            static_layer = self._merge_static_layers(onion_pixmap if use_onion else None, reference_onion)
+            self.preview_panel.set_static_pixmap(static_layer)
+            self.preview_panel.set_pixmap(current_pixmap, reset_zoom=False)
+            indexed = getattr(record, "indexed_image", None)
+            if indexed is not None:
+                self._guide_source_size = QSize(int(indexed.width), int(indexed.height))
+            else:
+                self._guide_source_size = current_pixmap.size()
+            self._update_guide_overlays()
+
+            if self.highlight_check.isChecked() and mode == "animation_assist":
+                layers, size, _signature = self._owner._animation_assist_overlay_layers_for_key(key)
+                self.preview_panel.set_overlay_layers(layers, size)
+            else:
+                self.preview_panel.set_overlay_layers([], QSize(0, 0))
+        finally:
+            for preview_key, (original_x, original_y) in original_offsets.items():
+                candidate = self._record_by_key.get(preview_key)
+                if candidate is None:
+                    continue
+                candidate.offset_x = int(original_x)
+                candidate.offset_y = int(original_y)
+
+    def _on_preview_options_changed(self, _value: object) -> None:
+        mode = self.scaling_combo.currentData()
+        self.preview_panel.set_scaling_mode(
+            Qt.TransformationMode.FastTransformation
+            if mode == Qt.TransformationMode.FastTransformation
+            else Qt.TransformationMode.SmoothTransformation
+        )
+        assist_mode = str(self.preview_mode_combo.currentData() or "animation_assist") == "animation_assist"
+        self.onion_check.setEnabled(assist_mode)
+        self.onion_settings_btn.setEnabled(assist_mode)
+        self.reference_onion_check.setEnabled(assist_mode)
+        self.reference_onion_settings_btn.setEnabled(assist_mode)
+        logger.debug(
+            "pivot.ui preview_options mode=%s scaling=%s assist_mode=%s onion=%s ref_onion=%s highlight=%s",
+            str(self.preview_mode_combo.currentData() or "animation_assist"),
+            "nearest" if mode == Qt.TransformationMode.FastTransformation else "smooth",
+            assist_mode,
+            bool(self.onion_check.isChecked()),
+            bool(self.reference_onion_check.isChecked()),
+            bool(self.highlight_check.isChecked()),
+        )
+        self._update_guide_overlays()
+        current = self.frame_list.currentItem()
+        if current is None:
+            return
+        key = str(current.data(Qt.ItemDataRole.UserRole) or "")
+        self._update_preview_for_key(key, center_row=self.sequence_list.currentRow())
+
+    def _on_current_frame_changed(self, current: QListWidgetItem | None, _previous: QListWidgetItem | None) -> None:
+        if current is None:
+            self._guide_source_size = QSize(0, 0)
+            self._update_guide_overlays()
+            self.preview_panel.set_static_pixmap(None)
+            self.preview_panel.set_overlay_layers([], QSize(0, 0))
+            self.preview_panel.set_pixmap(None, reset_zoom=False)
+            self.detail_label.setText("Select a frame to adjust")
+            self.detail_label.setToolTip("")
+            self.confidence_label.setText("Confidence: -")
+            return
+        key = str(current.data(Qt.ItemDataRole.UserRole) or "")
+        record = self._record_by_key.get(key)
+        if record is None:
+            return
+        frame = self._suggestions.get(key)
+        if frame is None:
+            return
+        nudge_x, nudge_y = self._effective_adjustment_for_key(key)
+        micro_x, micro_y = self._nudges.get(key, (0, 0))
+        macro_x, macro_y = int(self._macro_global_dx), int(self._macro_global_dy)
+        original_x, original_y = self._original_offsets.get(key, (int(record.offset_x), int(record.offset_y)))
+        final_x = int(original_x) + int(frame.suggested_dx) + int(nudge_x)
+        final_y = int(original_y) + int(frame.suggested_dy) + int(nudge_y)
+        logger.debug(
+            "pivot.ui frame_current key=%s suggested=(%s,%s) nudge=(%s,%s) original=(%s,%s) final=(%s,%s)",
+            key,
+            int(frame.suggested_dx),
+            int(frame.suggested_dy),
+            int(nudge_x),
+            int(nudge_y),
+            int(original_x),
+            int(original_y),
+            int(final_x),
+            int(final_y),
+        )
+
+        self.nudge_x_spin.blockSignals(True)
+        self.nudge_y_spin.blockSignals(True)
+        self.nudge_x_spin.setValue(int(micro_x))
+        self.nudge_y_spin.setValue(int(micro_y))
+        self.nudge_x_spin.blockSignals(False)
+        self.nudge_y_spin.blockSignals(False)
+
+        self._update_preview_for_key(key, center_row=self.sequence_list.currentRow())
+        if not self._syncing_from_sequence_selection:
+            target_row = self._best_sequence_row_for_key(key)
+            if target_row is not None and target_row >= 0:
+                self.sequence_list.blockSignals(True)
+                self.sequence_list.setCurrentRow(target_row)
+                target_item = self.sequence_list.item(target_row)
+                if target_item is not None:
+                    self.sequence_list.scrollToItem(target_item, QAbstractItemView.ScrollHint.PositionAtCenter)
+                self.sequence_list.blockSignals(False)
+        self.detail_label.setText(
+            f"{record.path.name}\n"
+            f"Suggested Δ ({frame.suggested_dx}, {frame.suggested_dy})\n"
+            f"Micro ({int(micro_x)}, {int(micro_y)})\n"
+            f"Macro ({int(macro_x)}, {int(macro_y)})\n"
+            f"Original ({original_x}, {original_y}) → Final ({final_x}, {final_y})"
+        )
+        self.detail_label.setToolTip(
+            f"{record.path.name}\n"
+            f"Suggested Δ: ({frame.suggested_dx}, {frame.suggested_dy})\n"
+            f"Micro (Individual): ({int(micro_x)}, {int(micro_y)})\n"
+            f"Macro (All): ({int(macro_x)}, {int(macro_y)})\n"
+            f"Original Local: ({original_x}, {original_y})\n"
+            f"Final Local: ({final_x}, {final_y})"
+        )
+        self.confidence_label.setText(f"Confidence: {int(round(frame.confidence * 100.0))}%")
+
+    def _on_nudge_changed(self, _value: int) -> None:
+        current = self.frame_list.currentItem()
+        if current is None:
+            return
+        key = str(current.data(Qt.ItemDataRole.UserRole) or "")
+        next_values = (int(self.nudge_x_spin.value()), int(self.nudge_y_spin.value()))
+        previous_values = self._nudges.get(key, (0, 0))
+        if previous_values == next_values:
+            return
+        if not self._drag_history_started:
+            self._push_history_before_mutation("micro-nudge")
+        self._nudges[key] = next_values
+        logger.debug("pivot.ui nudge_changed key=%s nudge=(%s,%s)", key, int(self.nudge_x_spin.value()), int(self.nudge_y_spin.value()))
+        frame = self._suggestions.get(key)
+        if frame is not None:
+            current.setText(self._list_item_text(key, frame.label, frame.confidence))
+        self._on_current_frame_changed(current, None)
+
+    def proposed_offsets(self) -> Dict[str, tuple[int, int]]:
+        updates: Dict[str, tuple[int, int]] = {}
+        for key, record in self._records:
+            frame = self._suggestions.get(key)
+            if frame is None:
+                continue
+            nudge_x, nudge_y = self._effective_adjustment_for_key(key)
+            original_x, original_y = self._original_offsets.get(key, (int(record.offset_x), int(record.offset_y)))
+            final_x = int(original_x) + int(frame.suggested_dx) + int(nudge_x)
+            final_y = int(original_y) + int(frame.suggested_dy) + int(nudge_y)
+            updates[key] = (final_x, final_y)
+        return updates
+
+    def closeEvent(self, event) -> None:  # type: ignore[override]
+        self._play_timer.stop()
+        if self._app_event_filter_installed:
+            app = QApplication.instance()
+            if app is not None:
+                app.removeEventFilter(self)
+            self._app_event_filter_installed = False
+        logger.debug("pivot.ui close_event")
+        try:
+            self._save_pivot_assist_ui_preferences()
+            self._owner._set_pref("pivot_assist/geometry", self.saveGeometry())
+        except Exception:  # noqa: BLE001
+            logger.debug("Pivot Assist geometry save failed", exc_info=True)
+        super().closeEvent(event)
+
+    def eventFilter(self, watched, event):  # type: ignore[override]
+        if event.type() in (QEvent.Type.KeyPress, QEvent.Type.KeyRelease):
+            if self._handle_focus_aware_shortcut_event(event, watched=watched):
+                return True
+        if watched in getattr(self, "_shortcut_focus_forward_widgets", []) and event.type() == QEvent.Type.MouseButtonRelease:
+            QTimer.singleShot(0, self._restore_shortcut_focus_context)
+        return super().eventFilter(watched, event)
+
+
+class AnimationUsageDialog(QDialog):
+    def __init__(
+        self,
+        owner: "SpriteToolsWindow",
+        *,
+        title: str,
+        subtitle: str,
+        rows: Sequence[tuple[str, str, int, int]],
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._owner = owner
+        self.setWindowTitle(title)
+        self.resize(720, 520)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(8, 8, 8, 8)
+        root.setSpacing(6)
+
+        hint = QLabel(subtitle)
+        hint.setWordWrap(True)
+        root.addWidget(hint)
+
+        self.list_widget = QListWidget(self)
+        self.list_widget.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        root.addWidget(self.list_widget, 1)
+
+        for tag_id, tag_name, hit_count, total_frames in rows:
+            item = QListWidgetItem(f"{tag_name}  |  matches {hit_count}/{total_frames}")
+            item.setData(Qt.ItemDataRole.UserRole, tag_id)
+            self.list_widget.addItem(item)
+
+        buttons = QHBoxLayout()
+        self.open_pivot_btn = QPushButton("Open Pivot Assist for Selected Animation")
+        self.open_pivot_btn.clicked.connect(self._open_pivot)
+        buttons.addWidget(self.open_pivot_btn)
+        buttons.addStretch(1)
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.reject)
+        buttons.addWidget(close_btn)
+        root.addLayout(buttons)
+
+        self.list_widget.itemDoubleClicked.connect(lambda _item: self._open_pivot())
+        if self.list_widget.count() > 0:
+            self.list_widget.setCurrentRow(0)
+        self._sync_state()
+        self.list_widget.currentItemChanged.connect(lambda _c, _p: self._sync_state())
+
+    def _sync_state(self) -> None:
+        current = self.list_widget.currentItem()
+        self.open_pivot_btn.setEnabled(current is not None)
+
+    def _open_pivot(self) -> None:
+        current = self.list_widget.currentItem()
+        if current is None:
+            return
+        tag_id = str(current.data(Qt.ItemDataRole.UserRole) or "").strip()
+        if not tag_id:
+            return
+        self._owner._open_pivot_assist_for_animation_tag(tag_id)
 
 
 class KeybindingsDialog(QDialog):
@@ -5308,6 +7954,240 @@ class AnimationTimelineItemDelegate(QStyledItemDelegate):
         painter.restore()
 
 
+class AnimationTagListWidget(QListWidget):
+    reorderDropRequested = Signal(int, int, str)
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._drag_source_row = -1
+
+    def supportedDropActions(self) -> Qt.DropAction:  # type: ignore[override]
+        return Qt.DropAction.MoveAction
+
+    def startDrag(self, supportedActions) -> None:  # type: ignore[override]
+        item = self.currentItem()
+        if item is None:
+            return
+        self._drag_source_row = self.row(item)
+        super().startDrag(Qt.DropAction.MoveAction)
+
+    def _nearest_row_for_point(self, point: QPoint) -> int:
+        count = int(self.count())
+        if count <= 0:
+            return -1
+        best_row = 0
+        best_distance = 10**9
+        px = int(point.x())
+        py = int(point.y())
+        for row in range(count):
+            item = self.item(row)
+            if item is None:
+                continue
+            rect = self.visualItemRect(item)
+            if not rect.isValid():
+                continue
+            if rect.contains(point):
+                return row
+            center = rect.center()
+            distance = abs(int(center.x()) - px) + abs(int(center.y()) - py)
+            if distance < best_distance:
+                best_distance = distance
+                best_row = row
+        return best_row
+
+    def _drop_mode_for_position(self, target_row: int, point: QPoint) -> str:
+        item = self.item(target_row)
+        if item is None:
+            return "after"
+        if str(item.data(_ANIM_TAG_SLOT_KIND_ROLE) or "") == "empty":
+            return "swap"
+        rect = self.visualItemRect(item)
+        if not rect.isValid():
+            return "after"
+        inner_w = max(8, int(rect.width() * 0.25))
+        inner_h = max(8, int(rect.height() * 0.25))
+        left_edge = rect.left() + inner_w
+        right_edge = rect.right() - inner_w
+        top_edge = rect.top() + inner_h
+        bottom_edge = rect.bottom() - inner_h
+        x = int(point.x())
+        y = int(point.y())
+        if x < left_edge:
+            return "before"
+        if x > right_edge:
+            return "after"
+        if y < top_edge:
+            return "before"
+        if y > bottom_edge:
+            return "after"
+        return "swap"
+
+    def dragEnterEvent(self, event) -> None:  # type: ignore[override]
+        event.setDropAction(Qt.DropAction.MoveAction)
+        super().dragEnterEvent(event)
+
+    def dragMoveEvent(self, event) -> None:  # type: ignore[override]
+        event.setDropAction(Qt.DropAction.MoveAction)
+        super().dragMoveEvent(event)
+
+    def dropEvent(self, event) -> None:  # type: ignore[override]
+        event.setDropAction(Qt.DropAction.MoveAction)
+        source_row = int(self._drag_source_row)
+        if source_row < 0:
+            source_row = int(self.currentRow())
+        point = event.position().toPoint() if hasattr(event, "position") else event.pos()
+        target_item = self.itemAt(point)
+        if target_item is not None:
+            target_row = int(self.row(target_item))
+            mode = self._drop_mode_for_position(target_row, point)
+        else:
+            target_row = self._nearest_row_for_point(point)
+            if target_row < 0:
+                target_row = max(0, self.count() - 1)
+                mode = "after"
+            else:
+                mode = self._drop_mode_for_position(target_row, point)
+        self.reorderDropRequested.emit(source_row, target_row, mode)
+        self._drag_source_row = -1
+        event.acceptProposedAction()
+
+
+class SpriteBrowserListWidget(QListWidget):
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._drag_start_pos: QPoint | None = None
+        self._drag_start_had_item = False
+        self._normalize_selection_after_drag = False
+        self._defer_press_for_drag = False
+        self._defer_press_pos: QPoint | None = None
+        self._defer_press_item: QListWidgetItem | None = None
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:  # type: ignore[override]
+        clicked_item = self.itemAt(event.pos()) if event.button() == Qt.MouseButton.LeftButton else None
+        if (
+            self._normalize_selection_after_drag
+            and event.button() == Qt.MouseButton.LeftButton
+            and event.modifiers() == Qt.KeyboardModifier.NoModifier
+        ):
+            preserve_multi_drag = clicked_item is not None and clicked_item.isSelected() and len(self.selectedItems()) > 1
+            if not preserve_multi_drag:
+                self.clearSelection()
+                if clicked_item is not None:
+                    clicked_item.setSelected(True)
+                    self.setCurrentItem(clicked_item)
+                else:
+                    self.setCurrentRow(-1)
+            self._normalize_selection_after_drag = False
+            self._drag_start_pos = event.pos()
+            self._drag_start_had_item = clicked_item is not None
+            if not preserve_multi_drag:
+                event.accept()
+                return
+
+        if event.button() != Qt.MouseButton.LeftButton:
+            self._normalize_selection_after_drag = False
+            self._defer_press_for_drag = False
+            self._defer_press_pos = None
+            self._defer_press_item = None
+
+        if event.button() == Qt.MouseButton.LeftButton:
+            if (
+                event.modifiers() == Qt.KeyboardModifier.NoModifier
+                and clicked_item is not None
+                and clicked_item.isSelected()
+                and len(self.selectedItems()) > 1
+            ):
+                self._defer_press_for_drag = True
+                self._defer_press_pos = QPoint(event.pos())
+                self._defer_press_item = clicked_item
+                self._drag_start_pos = QPoint(event.pos())
+                self._drag_start_had_item = True
+                event.accept()
+                return
+            self._defer_press_for_drag = False
+            self._defer_press_pos = None
+            self._defer_press_item = None
+            self._drag_start_pos = event.pos()
+            self._drag_start_had_item = self.itemAt(event.pos()) is not None
+        else:
+            self._drag_start_pos = None
+            self._drag_start_had_item = False
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:  # type: ignore[override]
+        if not bool(event.buttons() & Qt.MouseButton.LeftButton):
+            super().mouseMoveEvent(event)
+            return
+
+        if self._drag_start_pos is None:
+            super().mouseMoveEvent(event)
+            return
+
+        if (event.pos() - self._drag_start_pos).manhattanLength() < QApplication.startDragDistance():
+            if self._defer_press_for_drag:
+                event.accept()
+                return
+            super().mouseMoveEvent(event)
+            return
+
+        if not self._drag_start_had_item:
+            event.accept()
+            return
+
+        source_item = self.itemAt(self._drag_start_pos)
+        if source_item is not None and not source_item.isSelected():
+            self.clearSelection()
+            source_item.setSelected(True)
+            self.setCurrentItem(source_item)
+
+        if self.selectedItems():
+            self.startDrag(Qt.DropAction.CopyAction)
+            self._normalize_selection_after_drag = True
+            self._defer_press_for_drag = False
+            self._defer_press_pos = None
+            self._defer_press_item = None
+            self._drag_start_pos = None
+            self._drag_start_had_item = False
+            event.accept()
+            return
+
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # type: ignore[override]
+        if self._defer_press_for_drag and event.button() == Qt.MouseButton.LeftButton:
+            clicked_item = self._defer_press_item if self._defer_press_item is not None else self.itemAt(event.pos())
+            self.clearSelection()
+            if clicked_item is not None:
+                clicked_item.setSelected(True)
+                self.setCurrentItem(clicked_item)
+            else:
+                self.setCurrentRow(-1)
+            self._defer_press_for_drag = False
+            self._defer_press_pos = None
+            self._defer_press_item = None
+            self._drag_start_pos = None
+            self._drag_start_had_item = False
+            event.accept()
+            return
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag_start_pos = None
+            self._drag_start_had_item = False
+            self._defer_press_for_drag = False
+            self._defer_press_pos = None
+            self._defer_press_item = None
+        super().mouseReleaseEvent(event)
+
+    def event(self, event) -> bool:  # type: ignore[override]
+        if event.type() == QEvent.Type.ShortcutOverride:
+            key = int(event.key()) if hasattr(event, "key") else -1
+            mods_obj = event.modifiers() if hasattr(event, "modifiers") else Qt.KeyboardModifier.NoModifier
+            mods = int(getattr(mods_obj, "value", 0))
+            if mods == 0 and key in (int(Qt.Key.Key_Left), int(Qt.Key.Key_Right)):
+                event.accept()
+                return True
+        return super().event(event)
+
+
 class SpriteToolsWindow(QMainWindow):
     previewFutureDone = Signal()
 
@@ -5426,6 +8306,14 @@ class SpriteToolsWindow(QMainWindow):
         self._preview_onion_tint_strength = 90
         self._preview_onion_sprite_list_scope: Literal["all", "selected"] = "all"
         self._preview_onion_sprite_list_wrap = False
+        self._preview_guides_show_grid = False
+        self._preview_guides_grid_step = 8
+        self._preview_guides_show_axis = False
+        self._preview_guides_axis_x = 0
+        self._preview_guides_axis_y = 0
+        self._preview_guides_axis_layer: Literal["top", "bottom"] = "top"
+        self._preview_guides_axis_color: ColorTuple = (80, 180, 255)
+        self._project_merge_window_size: Tuple[int, int] | None = None
         self._active_offset_drag_mode: Literal["none", "global", "group", "individual"] = "none"
         self._offset_drag_live = False
         self._offset_drag_target_key: str | None = None
@@ -5476,6 +8364,19 @@ class SpriteToolsWindow(QMainWindow):
         self._assist_interaction_refresh_timer.timeout.connect(self._flush_assist_interaction_refresh)
         self._process_options_debug_next_log_at: Dict[str, float] = {}
         self._animation_frame_list_syncing = False
+        self._animation_list_view_mode: Literal["list", "grid"] = "list"
+        self._animation_list_preview_enabled = False
+        self._animation_list_preview_fps = 8
+        self._animation_list_zoom = 96
+        self._animation_list_padding = 6
+        self._animation_list_gap = 6
+        self._animation_list_slot_count = 24
+        self._animation_list_search_query = ""
+        self._animation_list_preview_phase = 0
+        self._animation_list_should_restore_visible = False
+        self._animation_tag_list_syncing = False
+        self._animation_tag_order_before_drag: List[str] | None = None
+        self._animation_tag_slots: List[str | None] = []
         self._animation_timeline_zoom = 100
         self._animation_timeline_in_frame = 0
         self._animation_timeline_out_frame = 1
@@ -5485,6 +8386,9 @@ class SpriteToolsWindow(QMainWindow):
         self._animation_timeline_range_history_commit_timer.setSingleShot(True)
         self._animation_timeline_range_history_commit_timer.setInterval(250)
         self._animation_timeline_range_history_commit_timer.timeout.connect(self._commit_animation_timeline_range_history)
+        self._animation_list_preview_timer = QTimer(self)
+        self._animation_list_preview_timer.setSingleShot(False)
+        self._animation_list_preview_timer.timeout.connect(self._advance_animation_list_preview)
         self._animation_timeline_should_restore_visible = False
         self._is_app_closing = False
         self._animation_playhead_frame: float | None = None
@@ -5501,9 +8405,16 @@ class SpriteToolsWindow(QMainWindow):
         self._animation_manual_drag_resize_right_duration = 1
         self._animation_manual_drag_changed = False
         self._animation_manual_drag_gap_target_timeline_position: int | None = None
+        self._animation_manual_drag_duplicate_mode = False
         self._animation_manual_drag_session_seq = 0
         self._animation_manual_drag_session_id = 0
+        self._animation_frame_clipboard: List[AnimationFrameEntry] = []
         self._settings = QSettings("SpriteTools", "SpriteTools")
+        self._axis_presets_dir = Path(__file__).resolve().parents[2] / "Presets" / "Axis"
+        self._axis_presets: List[AxisPreset] = []
+        self._axis_preset_warnings: List[str] = []
+        self._reload_axis_presets()
+        self._project_custom_axis_slots: List[Dict[str, Any]] = self._default_custom_axis_slots()
         self._project_service = ProjectService()
         self._project_paths: ProjectPaths | None = None
         self._project_manifest: ProjectManifest | None = None
@@ -5522,6 +8433,8 @@ class SpriteToolsWindow(QMainWindow):
         )
         self.images_panel.list_widget.installEventFilter(self)
         self.images_panel.clear_button.clicked.connect(self._clear_all_sprites)
+        self.images_panel.list_widget.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.images_panel.list_widget.customContextMenuRequested.connect(self._open_sprite_list_context_menu)
 
         self.action_import_sprites = QAction("Import Sprites...", self)
         self.action_new_project = QAction("New Project...", self)
@@ -5532,6 +8445,7 @@ class SpriteToolsWindow(QMainWindow):
         self.action_rename_group = QAction("Rename Selected Group", self)
         self.action_sprite_browser_settings = QAction("Sprite Browser Settings...", self)
         self.action_animation_timeline = QAction("Animation Timeline...", self)
+        self.action_pivot_assist = QAction("Pivot Assist...", self)
         self.action_animation_play_pause = QAction("Animation Play/Pause", self)
         self.action_animation_seek_left_1f = QAction("Animation Seek 1f Left", self)
         self.action_animation_seek_right_1f = QAction("Animation Seek 1f Right", self)
@@ -5547,6 +8461,7 @@ class SpriteToolsWindow(QMainWindow):
             ("groups/rename", self.action_rename_group, "F2"),
             ("view/sprite_browser_settings", self.action_sprite_browser_settings, "Ctrl+Alt+B"),
             ("view/animation_timeline", self.action_animation_timeline, "Ctrl+Alt+T"),
+            ("tools/pivot_assist", self.action_pivot_assist, "Ctrl+Alt+P"),
             ("animation/play_pause", self.action_animation_play_pause, "Space"),
             ("animation/seek_left_1f", self.action_animation_seek_left_1f, "Left"),
             ("animation/seek_right_1f", self.action_animation_seek_right_1f, "Right"),
@@ -5562,10 +8477,12 @@ class SpriteToolsWindow(QMainWindow):
         self.action_rename_group.triggered.connect(self._rename_selected_group)
         self.action_sprite_browser_settings.triggered.connect(self._open_sprite_browser_settings)
         self.action_animation_timeline.triggered.connect(self._open_animation_timeline_dialog)
+        self.action_pivot_assist.triggered.connect(lambda: self._open_pivot_assist_dialog(from_timeline=False))
         self.action_animation_play_pause.triggered.connect(self._toggle_animation_play_pause_shortcut)
         self.action_animation_seek_left_1f.triggered.connect(lambda: self._seek_animation_by_delta(-1))
         self.action_animation_seek_right_1f.triggered.connect(lambda: self._seek_animation_by_delta(1))
         self.action_exit.triggered.connect(self.close)
+        self._active_pivot_assist_dialog: PivotAssistDialog | None = None
         for _binding_key, action, _default_shortcut in self._action_shortcut_registry:
             self.addAction(action)
 
@@ -5663,27 +8580,6 @@ class SpriteToolsWindow(QMainWindow):
         palette_actions.addWidget(self.shift_right_button)
         palette_layout.addLayout(palette_actions)
         
-        # Auto-merge group
-        auto_merge_group = QGroupBox("Auto-Merge Similar Colors")
-        auto_merge_layout = QVBoxLayout(auto_merge_group)
-        auto_merge_layout.setContentsMargins(6, 6, 6, 6)
-        auto_merge_layout.setSpacing(4)
-        
-        tolerance_row = QHBoxLayout()
-        tolerance_row.addWidget(QLabel("Tolerance:"))
-        self.tolerance_spin = QSpinBox()
-        self.tolerance_spin.setRange(0, 255)
-        self.tolerance_spin.setValue(10)
-        self.tolerance_spin.setToolTip("Color distance threshold for auto-merge (0-255)")
-        tolerance_row.addWidget(self.tolerance_spin)
-        auto_merge_layout.addLayout(tolerance_row)
-        
-        self.auto_merge_button = QPushButton("Auto-Merge")
-        self.auto_merge_button.clicked.connect(self._auto_merge_colors)
-        auto_merge_layout.addWidget(self.auto_merge_button)
-        
-        palette_layout.addWidget(auto_merge_group)
-
         size_group = QGroupBox("Export Size")
         size_layout = QFormLayout(size_group)
         self._size_layout = size_layout
@@ -5793,6 +8689,10 @@ class SpriteToolsWindow(QMainWindow):
         self.offset_scope_combo.setCurrentIndex(0)
         self.offset_scope_combo.currentIndexChanged.connect(self._handle_offset_scope_change)
         offset_scope_row.addWidget(self.offset_scope_combo)
+        self.pivot_assist_btn = QPushButton("Pivot Assist...")
+        self.pivot_assist_btn.setToolTip("Suggest consistent local offsets for selected sprites")
+        self.pivot_assist_btn.clicked.connect(lambda: self._open_pivot_assist_dialog(from_timeline=False))
+        offset_scope_row.addWidget(self.pivot_assist_btn)
         offset_scope_row.addStretch(1)
         offset_layout.addLayout(offset_scope_row)
         
@@ -5878,6 +8778,110 @@ class SpriteToolsWindow(QMainWindow):
         
         palette_layout.addWidget(offset_group)
 
+        self.animation_list_dialog = QDialog(self)
+        self.animation_list_dialog.setWindowTitle("Animation List")
+        self.animation_list_dialog.setModal(False)
+        self.animation_list_dialog.resize(420, 540)
+        animation_list_layout = QVBoxLayout(self.animation_list_dialog)
+        animation_list_layout.setContentsMargins(8, 8, 8, 8)
+        animation_list_layout.setSpacing(6)
+
+        animation_list_controls_row1 = QHBoxLayout()
+        self.animation_list_preview_btn = QPushButton("Play Previews")
+        self.animation_list_preview_btn.setCheckable(True)
+        self.animation_list_preview_btn.setChecked(False)
+        animation_list_controls_row1.addWidget(self.animation_list_preview_btn)
+        animation_list_controls_row1.addWidget(QLabel("FPS:"))
+        self.animation_list_preview_fps_spin = QSpinBox()
+        self.animation_list_preview_fps_spin.setRange(1, 12)
+        self.animation_list_preview_fps_spin.setValue(int(self._animation_list_preview_fps))
+        self.animation_list_preview_fps_spin.setFixedWidth(56)
+        animation_list_controls_row1.addWidget(self.animation_list_preview_fps_spin)
+        animation_list_controls_row1.addWidget(QLabel("View:"))
+        self.animation_list_view_combo = QComboBox()
+        self.animation_list_view_combo.addItem("List", "list")
+        self.animation_list_view_combo.addItem("Grid", "grid")
+        animation_list_controls_row1.addWidget(self.animation_list_view_combo)
+        animation_list_controls_row1.addStretch(1)
+        animation_list_layout.addLayout(animation_list_controls_row1)
+
+        animation_list_controls_row2 = QHBoxLayout()
+        animation_list_controls_row2.addWidget(QLabel("Zoom:"))
+        self.animation_list_zoom_slider = QSlider(Qt.Orientation.Horizontal)
+        self.animation_list_zoom_slider.setRange(32, 256)
+        self.animation_list_zoom_slider.setSingleStep(2)
+        self.animation_list_zoom_slider.setPageStep(8)
+        self.animation_list_zoom_slider.setValue(int(self._animation_list_zoom))
+        self.animation_list_zoom_slider.setFixedWidth(120)
+        animation_list_controls_row2.addWidget(self.animation_list_zoom_slider)
+        self.animation_list_zoom_value_label = QLabel(f"{int(self._animation_list_zoom)}")
+        self.animation_list_zoom_value_label.setMinimumWidth(30)
+        animation_list_controls_row2.addWidget(self.animation_list_zoom_value_label)
+        animation_list_controls_row2.addWidget(QLabel("Padding:"))
+        self.animation_list_padding_spin = QSpinBox()
+        self.animation_list_padding_spin.setRange(0, 24)
+        self.animation_list_padding_spin.setValue(int(self._animation_list_padding))
+        self.animation_list_padding_spin.setFixedWidth(56)
+        animation_list_controls_row2.addWidget(self.animation_list_padding_spin)
+        animation_list_controls_row2.addWidget(QLabel("Gap:"))
+        self.animation_list_gap_spin = QSpinBox()
+        self.animation_list_gap_spin.setRange(0, 24)
+        self.animation_list_gap_spin.setValue(int(self._animation_list_gap))
+        self.animation_list_gap_spin.setFixedWidth(56)
+        animation_list_controls_row2.addWidget(self.animation_list_gap_spin)
+        animation_list_controls_row2.addWidget(QLabel("Slots:"))
+        self.animation_list_slots_spin = QSpinBox()
+        self.animation_list_slots_spin.setRange(1, 512)
+        self.animation_list_slots_spin.setValue(int(self._animation_list_slot_count))
+        self.animation_list_slots_spin.setFixedWidth(66)
+        animation_list_controls_row2.addWidget(self.animation_list_slots_spin)
+        animation_list_controls_row2.addStretch(1)
+        animation_list_layout.addLayout(animation_list_controls_row2)
+
+        animation_list_search_row = QHBoxLayout()
+        animation_list_search_row.addWidget(QLabel("Search:"))
+        self.animation_list_search_edit = QLineEdit()
+        self.animation_list_search_edit.setPlaceholderText("Filter animations by name/state...")
+        animation_list_search_row.addWidget(self.animation_list_search_edit, 1)
+        animation_list_layout.addLayout(animation_list_search_row)
+
+        self.animation_tag_list = AnimationTagListWidget()
+        self.animation_tag_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.animation_tag_list.setToolTip("Animation tags")
+        self.animation_tag_list.setDragDropMode(QAbstractItemView.DragDropMode.DragDrop)
+        self.animation_tag_list.setDefaultDropAction(Qt.DropAction.MoveAction)
+        self.animation_tag_list.setDragEnabled(True)
+        self.animation_tag_list.setAcceptDrops(True)
+        self.animation_tag_list.viewport().setAcceptDrops(True)
+        self.animation_tag_list.setDropIndicatorShown(True)
+        self.animation_tag_list.setDragDropOverwriteMode(False)
+        self.animation_tag_list.setSelectionRectVisible(False)
+        self.animation_tag_list.viewport().installEventFilter(self)
+        animation_list_layout.addWidget(self.animation_tag_list, 1)
+
+        animation_actions = QHBoxLayout()
+        self.animation_tag_new_btn = QPushButton("New")
+        self.animation_tag_new_from_selection_btn = QPushButton("New from Selection")
+        self.animation_tag_delete_btn = QPushButton("Delete")
+        self.animation_tag_sort_selection_btn = QPushButton("Sort Selection")
+        self.animation_tag_color_btn = QPushButton("Tag Color")
+        self.animation_assign_selected_btn = QPushButton("Assign Sel")
+        self.animation_clear_frames_btn = QPushButton("Clear")
+        animation_actions.addWidget(self.animation_tag_new_btn)
+        animation_actions.addWidget(self.animation_tag_new_from_selection_btn)
+        animation_actions.addWidget(self.animation_tag_delete_btn)
+        animation_actions.addWidget(self.animation_tag_sort_selection_btn)
+        animation_actions.addWidget(self.animation_tag_color_btn)
+        animation_actions.addWidget(self.animation_assign_selected_btn)
+        animation_actions.addWidget(self.animation_clear_frames_btn)
+        animation_list_layout.addLayout(animation_actions)
+
+        animation_list_footer = QHBoxLayout()
+        animation_list_footer.addStretch(1)
+        self.animation_list_close_btn = QPushButton("Close")
+        animation_list_footer.addWidget(self.animation_list_close_btn)
+        animation_list_layout.addLayout(animation_list_footer)
+
         self.animation_timeline_dialog = QDialog(self)
         self.animation_timeline_dialog.setWindowTitle("Animation Timeline")
         self.animation_timeline_dialog.setModal(False)
@@ -5885,22 +8889,6 @@ class SpriteToolsWindow(QMainWindow):
         animation_layout = QVBoxLayout(self.animation_timeline_dialog)
         animation_layout.setContentsMargins(8, 8, 8, 8)
         animation_layout.setSpacing(6)
-
-        self.animation_tag_list = QListWidget()
-        self.animation_tag_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        self.animation_tag_list.setToolTip("Animation tags")
-        animation_layout.addWidget(self.animation_tag_list, 1)
-
-        animation_actions = QHBoxLayout()
-        self.animation_tag_new_btn = QPushButton("New")
-        self.animation_tag_delete_btn = QPushButton("Delete")
-        self.animation_assign_selected_btn = QPushButton("Assign Sel")
-        self.animation_clear_frames_btn = QPushButton("Clear")
-        animation_actions.addWidget(self.animation_tag_new_btn)
-        animation_actions.addWidget(self.animation_tag_delete_btn)
-        animation_actions.addWidget(self.animation_assign_selected_btn)
-        animation_actions.addWidget(self.animation_clear_frames_btn)
-        animation_layout.addLayout(animation_actions)
 
         preview_row = QHBoxLayout()
         self.animation_play_btn = QPushButton("Play")
@@ -5948,8 +8936,8 @@ class SpriteToolsWindow(QMainWindow):
         self.animation_frame_list.setMovement(QListView.Movement.Snap)
         self.animation_frame_list.setDragDropMode(QAbstractItemView.DragDropMode.NoDragDrop)
         self.animation_frame_list.setDragEnabled(False)
-        self.animation_frame_list.setAcceptDrops(False)
-        self.animation_frame_list.viewport().setAcceptDrops(False)
+        self.animation_frame_list.setAcceptDrops(True)
+        self.animation_frame_list.viewport().setAcceptDrops(True)
         self.animation_frame_list.setDropIndicatorShown(False)
         self.animation_frame_list.setDragDropOverwriteMode(False)
         self.animation_frame_list.setDefaultDropAction(Qt.DropAction.MoveAction)
@@ -5986,6 +8974,10 @@ class SpriteToolsWindow(QMainWindow):
         self.animation_frame_duration_spin.setValue(1)
         self.animation_frame_duration_spin.setFixedWidth(70)
         frame_edit_row.addWidget(self.animation_frame_duration_spin)
+        self.animation_pivot_assist_btn = QPushButton("Pivot Assist")
+        self.animation_pivot_assist_btn.setToolTip("Use selected timeline frames to drive Pivot Assist")
+        self.animation_pivot_assist_btn.clicked.connect(lambda: self._open_pivot_assist_dialog(from_timeline=True))
+        frame_edit_row.addWidget(self.animation_pivot_assist_btn)
         self.animation_prewarm_btn = QPushButton("Prewarm")
         self.animation_prewarm_btn.setToolTip("Precompute processed timeline frames for smoother playback")
         frame_edit_row.addWidget(self.animation_prewarm_btn)
@@ -6018,10 +9010,26 @@ class SpriteToolsWindow(QMainWindow):
         animation_layout.addLayout(timeline_footer)
 
         self.animation_tag_list.currentItemChanged.connect(self._on_animation_tag_selection_changed)
+        self.animation_tag_list.itemSelectionChanged.connect(self._on_animation_tag_list_selection_changed)
+        self.animation_tag_list.reorderDropRequested.connect(self._on_animation_tag_drop_reorder)
         self.animation_tag_new_btn.clicked.connect(self._create_animation_tag)
+        self.animation_tag_new_from_selection_btn.clicked.connect(self._create_animation_tag_from_selection)
         self.animation_tag_delete_btn.clicked.connect(self._delete_selected_animation_tag)
+        self.animation_tag_sort_selection_btn.clicked.connect(self._sort_selected_animation_tags)
+        self.animation_tag_color_btn.clicked.connect(self._set_selected_animation_tag_color)
         self.animation_assign_selected_btn.clicked.connect(self._assign_selected_sprites_to_animation_tag)
         self.animation_clear_frames_btn.clicked.connect(self._clear_selected_animation_tag_frames)
+        self.animation_list_preview_btn.toggled.connect(self._on_animation_list_preview_toggled)
+        self.animation_list_preview_fps_spin.valueChanged.connect(self._on_animation_list_preview_fps_changed)
+        self.animation_list_view_combo.currentIndexChanged.connect(self._on_animation_list_view_mode_changed)
+        self.animation_list_zoom_slider.valueChanged.connect(self._on_animation_list_zoom_changed)
+        self.animation_list_padding_spin.valueChanged.connect(self._on_animation_list_padding_changed)
+        self.animation_list_gap_spin.valueChanged.connect(self._on_animation_list_gap_changed)
+        self.animation_list_slots_spin.valueChanged.connect(self._on_animation_list_slots_changed)
+        self.animation_list_search_edit.textChanged.connect(self._on_animation_list_search_text_changed)
+        self.animation_list_close_btn.clicked.connect(self.animation_list_dialog.close)
+        self.animation_tag_list.verticalScrollBar().valueChanged.connect(lambda _v: self._refresh_visible_animation_tag_icons(animated=self._animation_list_preview_enabled))
+        self.animation_tag_list.horizontalScrollBar().valueChanged.connect(lambda _v: self._refresh_visible_animation_tag_icons(animated=self._animation_list_preview_enabled))
         self.animation_play_btn.toggled.connect(self._toggle_animation_preview)
         self.animation_fps_spin.valueChanged.connect(self._on_animation_preview_fps_changed)
         self.animation_in_spin.valueChanged.connect(self._on_animation_timeline_range_changed)
@@ -6040,13 +9048,22 @@ class SpriteToolsWindow(QMainWindow):
         self.animation_frame_move_right_btn.clicked.connect(lambda: self._move_selected_animation_frame(1))
         self.animation_timeline_zoom_slider.valueChanged.connect(self._on_animation_timeline_zoom_changed)
         self.animation_timeline_close_btn.clicked.connect(self.animation_timeline_dialog.close)
+        self.animation_list_dialog.finished.connect(self._on_animation_list_dialog_finished)
         self.animation_timeline_dialog.finished.connect(self._on_animation_timeline_dialog_finished)
 
         self.animation_frame_delete_shortcut = QShortcut(QKeySequence.StandardKey.Delete, self.animation_frame_list)
         self.animation_frame_delete_shortcut.activated.connect(self._delete_selected_animation_frames)
+        self.animation_frame_copy_shortcut = QShortcut(QKeySequence.StandardKey.Copy, self.animation_frame_list)
+        self.animation_frame_copy_shortcut.activated.connect(self._copy_selected_animation_frames)
+        self.animation_frame_paste_shortcut = QShortcut(QKeySequence.StandardKey.Paste, self.animation_frame_list)
+        self.animation_frame_paste_shortcut.activated.connect(self._paste_animation_frames_at_playhead)
         self.animation_frame_list.viewport().installEventFilter(self)
+        self.animation_frame_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.animation_frame_list.customContextMenuRequested.connect(self._open_timeline_frame_context_menu)
 
         self.animation_timeline_zoom_slider.setValue(self._animation_timeline_zoom)
+        self._apply_animation_list_view_options()
+        self._update_animation_list_preview_timer_state()
 
         self._refresh_animation_tag_list()
         
@@ -6081,66 +9098,125 @@ class SpriteToolsWindow(QMainWindow):
         preview_layout.setContentsMargins(6, 6, 6, 6)
         preview_layout.setSpacing(6)
         self.preview_panel = PreviewPane()
+        self.preview_panel.title.setVisible(False)
         self.preview_panel.drag_offset_changed.connect(self._handle_drag_offset_changed)
         self.preview_panel.drag_started.connect(self._handle_drag_started)
         self.preview_panel.drag_finished.connect(self._handle_drag_finished)
         self.preview_panel.panning_changed.connect(self._handle_preview_panning_changed)
-        preview_layout.addWidget(self.preview_panel, 1)
+        top_controls_row = QHBoxLayout()
+        self.preview_view_settings_btn = QPushButton("View Settings...")
+        self.preview_view_settings_btn.setToolTip("Open full preview settings")
+        self.preview_view_settings_btn.clicked.connect(self._open_preview_view_settings)
+        top_controls_row.addWidget(self.preview_view_settings_btn)
 
-        # Single controls row: highlight checkbox, overlay settings button, and scaling
-        controls_row = QHBoxLayout()
-        controls_row.addWidget(QLabel("View:"))
-        self.preview_context_combo = QComboBox()
-        self.preview_context_combo.addItem("Sprite Edit", "sprite_edit")
-        self.preview_context_combo.addItem("Animation Assist", "animation_assist")
-        self.preview_context_combo.setToolTip("Choose whether preview follows sprite edits or animation timeline assistance")
-        self.preview_context_combo.currentIndexChanged.connect(self._on_preview_context_changed)
-        controls_row.addWidget(self.preview_context_combo)
-
-        self.preview_animation_follow_selection_check = QCheckBox("Follow Selection")
+        self.preview_animation_follow_selection_check = QCheckBox("Follow")
         self.preview_animation_follow_selection_check.setToolTip(
-            "Animation Assist: when enabled, selection changes move onion source/playhead; when disabled, source stays locked"
+            "Animation Assist: follow selection/playhead when enabled"
         )
         self.preview_animation_follow_selection_check.toggled.connect(self._on_preview_animation_follow_selection_changed)
-        controls_row.addWidget(self.preview_animation_follow_selection_check)
+        top_controls_row.addWidget(self.preview_animation_follow_selection_check)
 
-        controls_row.addWidget(QLabel("Onion Source:"))
+        top_controls_row.addWidget(QLabel("Onion Src"))
         self.preview_onion_source_combo = QComboBox()
         self.preview_onion_source_combo.addItem("Timeline", "timeline")
         self.preview_onion_source_combo.addItem("Sprite List", "sprite_list")
-        self.preview_onion_source_combo.setToolTip("Select onion source model")
         self.preview_onion_source_combo.currentIndexChanged.connect(self._on_preview_onion_source_changed)
-        controls_row.addWidget(self.preview_onion_source_combo)
-
-        self.preview_onion_enabled_check = QCheckBox("Onion")
-        self.preview_onion_enabled_check.setToolTip("Enable onion skin compositing in Animation Assist view")
-        self.preview_onion_enabled_check.toggled.connect(self._on_preview_onion_enabled_changed)
-        controls_row.addWidget(self.preview_onion_enabled_check)
+        top_controls_row.addWidget(self.preview_onion_source_combo)
 
         self.preview_onion_settings_btn = QPushButton("Onion Settings...")
         self.preview_onion_settings_btn.clicked.connect(self._open_onion_settings)
-        controls_row.addWidget(self.preview_onion_settings_btn)
+        top_controls_row.addWidget(self.preview_onion_settings_btn)
 
-        self.highlight_checkbox = QCheckBox("Highlight selected color")
-        self.highlight_checkbox.setChecked(True)
-        self.highlight_checkbox.toggled.connect(self._on_highlight_checkbox_toggled)
-        controls_row.addWidget(self.highlight_checkbox)
-        self.hover_highlight_checkbox = QCheckBox("Highlight hover color")
-        self.hover_highlight_checkbox.setChecked(True)
-        self.hover_highlight_checkbox.toggled.connect(self._on_hover_highlight_checkbox_toggled)
-        controls_row.addWidget(self.hover_highlight_checkbox)
-        
+        self.axis_preset_btn = QPushButton("Axis Preset...")
+        self.axis_preset_btn.clicked.connect(self._open_axis_preset_picker)
+        top_controls_row.addWidget(self.axis_preset_btn)
+
+        self.custom_axis_slots_btn = QPushButton("Custom Axis...")
+        self.custom_axis_slots_btn.clicked.connect(self._open_custom_axis_slots_dialog)
+        top_controls_row.addWidget(self.custom_axis_slots_btn)
+
         self.overlay_settings_btn = QPushButton("Overlay Settings...")
         self.overlay_settings_btn.clicked.connect(self._open_overlay_settings)
-        controls_row.addWidget(self.overlay_settings_btn)
-        
-        controls_row.addStretch(1)
-        controls_row.addWidget(QLabel("Scaling:"))
-        self.filter_combo = QComboBox()
+        top_controls_row.addWidget(self.overlay_settings_btn)
+
+        top_controls_row.addStretch(1)
+        top_controls_row.addWidget(QLabel("Scale"))
+        self.filter_combo = QComboBox(self)
         self.filter_combo.addItem("Nearest")
         self.filter_combo.addItem("Bilinear")
         self.filter_combo.currentIndexChanged.connect(self._handle_filter_mode_change)
-        controls_row.addWidget(self.filter_combo)
+        top_controls_row.addWidget(self.filter_combo)
+        preview_layout.addLayout(top_controls_row)
+
+        preview_layout.addWidget(self.preview_panel, 1)
+
+        # Bottom live controls row
+        controls_row = QHBoxLayout()
+        self.preview_context_combo = QComboBox(self)
+        self.preview_context_combo.addItem("Sprite Edit", "sprite_edit")
+        self.preview_context_combo.addItem("Animation Assist", "animation_assist")
+        self.preview_context_combo.currentIndexChanged.connect(self._on_preview_context_changed)
+        controls_row.addWidget(QLabel("Mode"))
+        controls_row.addWidget(self.preview_context_combo)
+
+        self.preview_onion_enabled_check = QCheckBox("Onion", self)
+        self.preview_onion_enabled_check.toggled.connect(self._on_preview_onion_enabled_changed)
+        controls_row.addWidget(self.preview_onion_enabled_check)
+
+        self.preview_grid_check = QCheckBox("Grid", self)
+        self.preview_grid_check.setToolTip("Toggle grid overlay")
+        self.preview_grid_check.toggled.connect(self._on_preview_guide_options_changed)
+        controls_row.addWidget(self.preview_grid_check)
+        controls_row.addWidget(QLabel("Step"))
+
+        self.preview_grid_step_spin = QSpinBox(self)
+        self.preview_grid_step_spin.setRange(1, 64)
+        self.preview_grid_step_spin.setFixedWidth(56)
+        self.preview_grid_step_spin.valueChanged.connect(self._on_preview_guide_options_changed)
+        controls_row.addWidget(self.preview_grid_step_spin)
+
+        self.preview_axis_check = QCheckBox("Axis", self)
+        self.preview_axis_check.setToolTip("Toggle base axis")
+        self.preview_axis_check.toggled.connect(self._on_preview_guide_options_changed)
+        controls_row.addWidget(self.preview_axis_check)
+        controls_row.addWidget(QLabel("X"))
+
+        self.preview_axis_x_spin = QSpinBox(self)
+        self.preview_axis_x_spin.setRange(-4096, 4096)
+        self.preview_axis_x_spin.setFixedWidth(64)
+        self.preview_axis_x_spin.valueChanged.connect(self._on_preview_guide_options_changed)
+        controls_row.addWidget(self.preview_axis_x_spin)
+        controls_row.addWidget(QLabel("Y"))
+
+        self.preview_axis_y_spin = QSpinBox(self)
+        self.preview_axis_y_spin.setRange(-4096, 4096)
+        self.preview_axis_y_spin.setFixedWidth(64)
+        self.preview_axis_y_spin.valueChanged.connect(self._on_preview_guide_options_changed)
+        controls_row.addWidget(self.preview_axis_y_spin)
+        controls_row.addWidget(QLabel("Layer"))
+        self.preview_axis_layer_combo = QComboBox(self)
+        self.preview_axis_layer_combo.addItem("Top", "top")
+        self.preview_axis_layer_combo.addItem("Bottom", "bottom")
+        self.preview_axis_layer_combo.setFixedWidth(88)
+        self.preview_axis_layer_combo.currentIndexChanged.connect(self._on_preview_guide_options_changed)
+        controls_row.addWidget(self.preview_axis_layer_combo)
+        self.preview_axis_color_btn = QPushButton("Color", self)
+        self.preview_axis_color_btn.setFixedWidth(56)
+        self.preview_axis_color_btn.setToolTip("Pick base axis color")
+        self.preview_axis_color_btn.clicked.connect(self._open_base_axis_color_picker)
+        self._set_color_button_preview(self.preview_axis_color_btn, self._preview_guides_axis_color)
+        controls_row.addWidget(self.preview_axis_color_btn)
+
+        self.highlight_checkbox = QCheckBox("Sel Hi", self)
+        self.highlight_checkbox.setChecked(True)
+        self.highlight_checkbox.toggled.connect(self._on_highlight_checkbox_toggled)
+        controls_row.addWidget(self.highlight_checkbox)
+
+        self.hover_highlight_checkbox = QCheckBox("Hover Hi", self)
+        self.hover_highlight_checkbox.setChecked(True)
+        self.hover_highlight_checkbox.toggled.connect(self._on_hover_highlight_checkbox_toggled)
+        controls_row.addWidget(self.hover_highlight_checkbox)
+        controls_row.addStretch(1)
         preview_layout.addLayout(controls_row)
 
         output_row = QHBoxLayout()
@@ -6212,6 +9288,49 @@ class SpriteToolsWindow(QMainWindow):
     def _set_pref(self, key: str, value: Any) -> None:
         self._settings.setValue(key, value)
 
+    @staticmethod
+    def _normalize_rgb_color(raw: Any, fallback: ColorTuple) -> ColorTuple:
+        if isinstance(raw, (list, tuple)) and len(raw) >= 3:
+            try:
+                return (
+                    max(0, min(255, int(raw[0]))),
+                    max(0, min(255, int(raw[1]))),
+                    max(0, min(255, int(raw[2]))),
+                )
+            except (TypeError, ValueError):
+                return fallback
+        if isinstance(raw, str):
+            parts = [part.strip() for part in raw.split(",")]
+            if len(parts) >= 3:
+                try:
+                    return (
+                        max(0, min(255, int(parts[0]))),
+                        max(0, min(255, int(parts[1]))),
+                        max(0, min(255, int(parts[2]))),
+                    )
+                except ValueError:
+                    return fallback
+        return fallback
+
+    @staticmethod
+    def _set_color_button_preview(button: QPushButton, color: ColorTuple) -> None:
+        r, g, b = int(color[0]), int(color[1]), int(color[2])
+        button.setProperty("axis_color", (r, g, b))
+        button.setStyleSheet(f"background-color: rgb({r}, {g}, {b}); border: 1px solid #666;")
+
+    def _reload_axis_presets(self) -> None:
+        presets, warnings = load_axis_presets_from_directory(self._axis_presets_dir)
+        self._axis_presets = presets
+        self._axis_preset_warnings = warnings
+        logger.debug(
+            "axis.presets loaded dir=%s count=%s warnings=%s",
+            str(self._axis_presets_dir),
+            len(self._axis_presets),
+            len(self._axis_preset_warnings),
+        )
+        for warning in self._axis_preset_warnings:
+            logger.debug("axis.presets warning: %s", warning)
+
     def _build_menu_bar(self) -> None:
         menu_bar = self.menuBar()
         menu_bar.clear()
@@ -6235,6 +9354,7 @@ class SpriteToolsWindow(QMainWindow):
         edit_menu = menu_bar.addMenu("&Edit")
         edit_menu.addAction(self.action_keyboard_shortcuts)
         edit_menu.addAction(self.action_rename_group)
+        edit_menu.addAction(self.action_pivot_assist)
 
         view_menu = menu_bar.addMenu("&View")
         view_menu.addAction(self.action_sprite_browser_settings)
@@ -6312,6 +9432,18 @@ class SpriteToolsWindow(QMainWindow):
             ("browser/sprites_zoom_in", "Sprite Browser: Zoom In", "Ctrl+="),
             ("browser/sprites_zoom_out", "Sprite Browser: Zoom Out", "Ctrl+-"),
             ("browser/sprites_zoom_reset", "Sprite Browser: Reset Zoom", "Ctrl+0"),
+            ("pivot_assist/play_pause", "Pivot Assist: Play/Pause", "Space"),
+            ("pivot_assist/seek_left_1f", "Pivot Assist: Seek 1f Left", "Left"),
+            ("pivot_assist/seek_right_1f", "Pivot Assist: Seek 1f Right", "Right"),
+            ("pivot_assist/nudge_left", "Pivot Assist: Micro Nudge Left", "Shift+Left"),
+            ("pivot_assist/nudge_right", "Pivot Assist: Micro Nudge Right", "Shift+Right"),
+            ("pivot_assist/nudge_up", "Pivot Assist: Micro Nudge Up", "Shift+Up"),
+            ("pivot_assist/nudge_down", "Pivot Assist: Micro Nudge Down", "Shift+Down"),
+            ("pivot_assist/reset_micro", "Pivot Assist: Reset Micro Adjustments", "Shift+R"),
+            ("pivot_assist/macro_left", "Pivot Assist: Macro Nudge Left", "Ctrl+Left"),
+            ("pivot_assist/macro_right", "Pivot Assist: Macro Nudge Right", "Ctrl+Right"),
+            ("pivot_assist/macro_up", "Pivot Assist: Macro Nudge Up", "Ctrl+Up"),
+            ("pivot_assist/macro_down", "Pivot Assist: Macro Nudge Down", "Ctrl+Down"),
         ]
         for binding_id, label, default_value in extra_bindings:
             default_norm = KeybindingsDialog._normalize_shortcut_text(default_value)
@@ -6349,7 +9481,20 @@ class SpriteToolsWindow(QMainWindow):
     def _open_sprite_browser_settings(self) -> None:
         self.images_panel.open_browser_settings_dialog()
 
+    def _open_animation_list_dialog(self) -> None:
+        if self.animation_list_dialog.isVisible():
+            self.animation_list_dialog.raise_()
+            self.animation_list_dialog.activateWindow()
+            return
+        self._animation_list_should_restore_visible = True
+        self.animation_list_dialog.show()
+        self.animation_list_dialog.raise_()
+        self.animation_list_dialog.activateWindow()
+        self._update_animation_list_preview_timer_state()
+        self._save_animation_timeline_ui_settings()
+
     def _open_animation_timeline_dialog(self) -> None:
+        self._open_animation_list_dialog()
         if self.animation_timeline_dialog.isVisible():
             self.animation_timeline_dialog.raise_()
             self.animation_timeline_dialog.activateWindow()
@@ -6360,11 +9505,145 @@ class SpriteToolsWindow(QMainWindow):
         self.animation_timeline_dialog.activateWindow()
         self._save_animation_timeline_ui_settings()
 
+    def _on_animation_list_dialog_finished(self, _result: int) -> None:
+        if self._is_app_closing:
+            return
+        self._animation_list_should_restore_visible = False
+        self._update_animation_list_preview_timer_state()
+        self._save_animation_timeline_ui_settings()
+
     def _on_animation_timeline_dialog_finished(self, _result: int) -> None:
         if self._is_app_closing:
             return
         self._animation_timeline_should_restore_visible = False
         self._save_animation_timeline_ui_settings()
+
+    def _apply_ctrl_wheel_zoom(self, slider: QSlider, event: QWheelEvent) -> bool:
+        if not bool(event.modifiers() & Qt.KeyboardModifier.ControlModifier):
+            return False
+        delta_y = int(event.angleDelta().y())
+        if delta_y == 0:
+            return False
+        steps = max(1, abs(delta_y) // 120)
+        direction = 1 if delta_y > 0 else -1
+        step_size = max(1, int(slider.singleStep()))
+        slider.setValue(int(slider.value()) + (direction * steps * step_size))
+        event.accept()
+        return True
+
+    def _on_animation_list_preview_toggled(self, enabled: bool) -> None:
+        self._animation_list_preview_enabled = bool(enabled)
+        if hasattr(self, "animation_list_preview_btn"):
+            self.animation_list_preview_btn.setText("Stop Previews" if self._animation_list_preview_enabled else "Play Previews")
+        self._update_animation_list_preview_timer_state()
+        self._save_animation_timeline_ui_settings()
+
+    def _on_animation_list_preview_fps_changed(self, value: int) -> None:
+        self._animation_list_preview_fps = max(1, min(12, int(value)))
+        self._update_animation_list_preview_timer_state()
+        self._save_animation_timeline_ui_settings()
+
+    def _on_animation_list_view_mode_changed(self, _index: int) -> None:
+        selected_view = str(self.animation_list_view_combo.currentData() or "list").strip().lower()
+        self._animation_list_view_mode = "grid" if selected_view == "grid" else "list"
+        self._apply_animation_list_view_options()
+        self._refresh_animation_tag_list()
+        self._save_animation_timeline_ui_settings()
+
+    def _on_animation_list_zoom_changed(self, value: int) -> None:
+        self._animation_list_zoom = max(32, min(256, int(value)))
+        self.animation_list_zoom_value_label.setText(str(int(self._animation_list_zoom)))
+        self._apply_animation_list_view_options()
+        self._refresh_animation_tag_list()
+        self._save_animation_timeline_ui_settings()
+
+    def _on_animation_list_padding_changed(self, value: int) -> None:
+        self._animation_list_padding = max(0, min(24, int(value)))
+        self._apply_animation_list_view_options()
+        self._refresh_animation_tag_list()
+        self._save_animation_timeline_ui_settings()
+
+    def _on_animation_list_gap_changed(self, value: int) -> None:
+        self._animation_list_gap = max(0, min(24, int(value)))
+        self._apply_animation_list_view_options()
+        self._refresh_animation_tag_list()
+        self._save_animation_timeline_ui_settings()
+
+    def _on_animation_list_slots_changed(self, value: int) -> None:
+        self._animation_list_slot_count = max(1, min(512, int(value)))
+        self._refresh_animation_tag_list()
+        self._save_animation_timeline_ui_settings()
+
+    def _on_animation_list_search_text_changed(self, text: str) -> None:
+        self._animation_list_search_query = str(text or "").strip()
+        self._refresh_animation_tag_list()
+        self._save_animation_timeline_ui_settings()
+
+    def _animation_list_icon_side(self) -> int:
+        return max(24, min(256, int(self._animation_list_zoom)))
+
+    def _apply_animation_list_view_options(self) -> None:
+        if not hasattr(self, "animation_tag_list"):
+            return
+        list_widget = self.animation_tag_list
+        icon_side = self._animation_list_icon_side()
+        padding = max(0, int(self._animation_list_padding))
+        gap = max(0, int(self._animation_list_gap))
+        list_widget.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        list_widget.setHorizontalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        if self._animation_list_view_mode == "grid":
+            list_widget.setViewMode(QListView.ViewMode.IconMode)
+            list_widget.setFlow(QListView.Flow.LeftToRight)
+            list_widget.setWrapping(True)
+            list_widget.setResizeMode(QListView.ResizeMode.Adjust)
+            list_widget.setMovement(QListView.Movement.Snap)
+            list_widget.setUniformItemSizes(False)
+            list_widget.setIconSize(QSize(icon_side, icon_side))
+            grid_w = max(icon_side + (padding * 2), icon_side + 16)
+            grid_h = max(icon_side + (padding * 2) + 24, icon_side + 36)
+            list_widget.setGridSize(QSize(grid_w, grid_h))
+            list_widget.setSpacing(gap)
+            list_widget.verticalScrollBar().setSingleStep(max(16, grid_h // 4))
+            list_widget.verticalScrollBar().setPageStep(max(grid_h, 96))
+        else:
+            list_widget.setViewMode(QListView.ViewMode.ListMode)
+            list_widget.setFlow(QListView.Flow.TopToBottom)
+            list_widget.setWrapping(False)
+            list_widget.setResizeMode(QListView.ResizeMode.Adjust)
+            list_widget.setMovement(QListView.Movement.Snap)
+            list_widget.setIconSize(QSize(icon_side, icon_side))
+            list_widget.setGridSize(QSize())
+            list_widget.setSpacing(gap)
+            row_h = max(icon_side + (padding * 2), icon_side + 10)
+            list_widget.verticalScrollBar().setSingleStep(max(12, row_h // 4))
+            list_widget.verticalScrollBar().setPageStep(max(row_h, 84))
+
+    def _animation_list_preview_interval_ms(self) -> int:
+        fps = max(1, min(12, int(self._animation_list_preview_fps)))
+        return max(84, int(round(1000.0 / float(fps))))
+
+    def _update_animation_list_preview_timer_state(self) -> None:
+        should_run = (
+            bool(self._animation_list_preview_enabled)
+            and hasattr(self, "animation_list_dialog")
+            and self.animation_list_dialog.isVisible()
+            and bool(self._animation_tags)
+        )
+        if should_run:
+            self._animation_list_preview_timer.start(self._animation_list_preview_interval_ms())
+        else:
+            self._animation_list_preview_timer.stop()
+
+    def _advance_animation_list_preview(self) -> None:
+        if not self._animation_list_preview_enabled:
+            self._animation_list_preview_timer.stop()
+            return
+        if not self.animation_list_dialog.isVisible() or not self._animation_tags:
+            self._animation_list_preview_timer.stop()
+            return
+        self._animation_list_preview_phase += 1
+        self._refresh_visible_animation_tag_icons(animated=True)
+        self._animation_list_preview_timer.start(self._animation_list_preview_interval_ms())
 
     def _save_window_ui_settings(self) -> None:
         self._set_pref("window/geometry", self.saveGeometry())
@@ -6534,16 +9813,33 @@ class SpriteToolsWindow(QMainWindow):
 
     def _save_animation_timeline_ui_settings(self) -> None:
         actual_visible = bool(getattr(self, "animation_timeline_dialog", None) is not None and self.animation_timeline_dialog.isVisible())
+        list_actual_visible = bool(getattr(self, "animation_list_dialog", None) is not None and self.animation_list_dialog.isVisible())
         self._set_pref("animation/timeline_zoom", int(self._animation_timeline_zoom))
         self._set_pref("animation/timeline_in", int(self._animation_timeline_in_frame))
         self._set_pref("animation/timeline_out", int(self._animation_timeline_out_frame))
+        self._set_pref("animation/list_view_mode", str(self._animation_list_view_mode))
+        self._set_pref("animation/list_preview_enabled", bool(self._animation_list_preview_enabled))
+        self._set_pref("animation/list_preview_fps", int(self._animation_list_preview_fps))
+        self._set_pref("animation/list_zoom", int(self._animation_list_zoom))
+        self._set_pref("animation/list_padding", int(self._animation_list_padding))
+        self._set_pref("animation/list_gap", int(self._animation_list_gap))
+        self._set_pref("animation/list_slot_count", int(self._animation_list_slot_count))
+        self._set_pref("animation/list_search", str(self._animation_list_search_query))
+        self._set_pref("animation/list_visible", bool(self._animation_list_should_restore_visible))
         self._set_pref("animation/timeline_visible", bool(self._animation_timeline_should_restore_visible))
         logger.debug(
-            "Save timeline UI settings desired_visible=%s actual_visible=%s app_closing=%s",
+            "Save timeline UI settings desired_visible=%s actual_visible=%s list_desired=%s list_actual=%s app_closing=%s",
             self._animation_timeline_should_restore_visible,
             actual_visible,
+            self._animation_list_should_restore_visible,
+            list_actual_visible,
             self._is_app_closing,
         )
+        if hasattr(self, "animation_list_dialog"):
+            try:
+                self._set_pref("window/animation_list_geometry", self.animation_list_dialog.saveGeometry())
+            except Exception:  # noqa: BLE001
+                logger.debug("Failed to save animation list geometry", exc_info=True)
         if hasattr(self, "animation_timeline_dialog"):
             try:
                 self._set_pref("window/animation_timeline_geometry", self.animation_timeline_dialog.saveGeometry())
@@ -6554,6 +9850,54 @@ class SpriteToolsWindow(QMainWindow):
         self._animation_timeline_zoom = max(50, min(220, self._get_pref_int("animation/timeline_zoom", self._animation_timeline_zoom)))
         self._animation_timeline_in_frame = max(0, self._get_pref_int("animation/timeline_in", self._animation_timeline_in_frame))
         self._animation_timeline_out_frame = max(1, self._get_pref_int("animation/timeline_out", self._animation_timeline_out_frame))
+        list_view_mode = str(self._settings.value("animation/list_view_mode", self._animation_list_view_mode) or self._animation_list_view_mode).strip().lower()
+        self._animation_list_view_mode = "grid" if list_view_mode == "grid" else "list"
+        self._animation_list_preview_enabled = self._get_pref_bool("animation/list_preview_enabled", self._animation_list_preview_enabled)
+        self._animation_list_preview_fps = max(1, min(12, self._get_pref_int("animation/list_preview_fps", self._animation_list_preview_fps)))
+        self._animation_list_zoom = max(32, min(256, self._get_pref_int("animation/list_zoom", self._animation_list_zoom)))
+        self._animation_list_padding = max(0, min(24, self._get_pref_int("animation/list_padding", self._animation_list_padding)))
+        self._animation_list_gap = max(0, min(24, self._get_pref_int("animation/list_gap", self._animation_list_gap)))
+        self._animation_list_slot_count = max(1, min(512, self._get_pref_int("animation/list_slot_count", self._animation_list_slot_count)))
+        self._animation_list_search_query = str(self._settings.value("animation/list_search", self._animation_list_search_query) or "").strip()
+
+        if hasattr(self, "animation_list_view_combo"):
+            blocked = self.animation_list_view_combo.blockSignals(True)
+            idx = self.animation_list_view_combo.findData(self._animation_list_view_mode)
+            self.animation_list_view_combo.setCurrentIndex(max(0, idx))
+            self.animation_list_view_combo.blockSignals(blocked)
+        if hasattr(self, "animation_list_preview_btn"):
+            blocked = self.animation_list_preview_btn.blockSignals(True)
+            self.animation_list_preview_btn.setChecked(bool(self._animation_list_preview_enabled))
+            self.animation_list_preview_btn.blockSignals(blocked)
+            self.animation_list_preview_btn.setText("Stop Previews" if self._animation_list_preview_enabled else "Play Previews")
+        if hasattr(self, "animation_list_preview_fps_spin"):
+            blocked = self.animation_list_preview_fps_spin.blockSignals(True)
+            self.animation_list_preview_fps_spin.setValue(int(self._animation_list_preview_fps))
+            self.animation_list_preview_fps_spin.blockSignals(blocked)
+        if hasattr(self, "animation_list_zoom_slider"):
+            blocked = self.animation_list_zoom_slider.blockSignals(True)
+            self.animation_list_zoom_slider.setValue(int(self._animation_list_zoom))
+            self.animation_list_zoom_slider.blockSignals(blocked)
+        if hasattr(self, "animation_list_zoom_value_label"):
+            self.animation_list_zoom_value_label.setText(str(int(self._animation_list_zoom)))
+        if hasattr(self, "animation_list_padding_spin"):
+            blocked = self.animation_list_padding_spin.blockSignals(True)
+            self.animation_list_padding_spin.setValue(int(self._animation_list_padding))
+            self.animation_list_padding_spin.blockSignals(blocked)
+        if hasattr(self, "animation_list_gap_spin"):
+            blocked = self.animation_list_gap_spin.blockSignals(True)
+            self.animation_list_gap_spin.setValue(int(self._animation_list_gap))
+            self.animation_list_gap_spin.blockSignals(blocked)
+        if hasattr(self, "animation_list_slots_spin"):
+            blocked = self.animation_list_slots_spin.blockSignals(True)
+            self.animation_list_slots_spin.setValue(int(self._animation_list_slot_count))
+            self.animation_list_slots_spin.blockSignals(blocked)
+        if hasattr(self, "animation_list_search_edit"):
+            blocked = self.animation_list_search_edit.blockSignals(True)
+            self.animation_list_search_edit.setText(self._animation_list_search_query)
+            self.animation_list_search_edit.blockSignals(blocked)
+
+        self._apply_animation_list_view_options()
         if hasattr(self, "animation_timeline_zoom_slider"):
             blocked = self.animation_timeline_zoom_slider.blockSignals(True)
             self.animation_timeline_zoom_slider.setValue(self._animation_timeline_zoom)
@@ -6561,6 +9905,12 @@ class SpriteToolsWindow(QMainWindow):
         if hasattr(self, "animation_timeline_zoom_value_label"):
             self.animation_timeline_zoom_value_label.setText(f"{self._animation_timeline_zoom}%")
         self._sync_animation_timeline_range_controls()
+        list_geometry = self._settings.value("window/animation_list_geometry")
+        if list_geometry is not None and hasattr(self, "animation_list_dialog"):
+            try:
+                self.animation_list_dialog.restoreGeometry(list_geometry)
+            except Exception:  # noqa: BLE001
+                logger.debug("Failed to restore animation list geometry", exc_info=True)
         geometry = self._settings.value("window/animation_timeline_geometry")
         if geometry is not None and hasattr(self, "animation_timeline_dialog"):
             try:
@@ -6568,17 +9918,34 @@ class SpriteToolsWindow(QMainWindow):
             except Exception:  # noqa: BLE001
                 logger.debug("Failed to restore animation timeline geometry", exc_info=True)
 
+        should_show_list = self._get_pref_bool("animation/list_visible", False)
+        self._animation_list_should_restore_visible = bool(should_show_list)
         should_show_timeline = self._get_pref_bool("animation/timeline_visible", False)
         self._animation_timeline_should_restore_visible = bool(should_show_timeline)
         logger.debug(
-            "Load timeline UI settings desired_visible=%s zoom=%s in=%s out=%s",
+            "Load timeline UI settings desired_visible=%s list_visible=%s zoom=%s in=%s out=%s",
             self._animation_timeline_should_restore_visible,
+            self._animation_list_should_restore_visible,
             self._animation_timeline_zoom,
             self._animation_timeline_in_frame,
             self._animation_timeline_out_frame,
         )
+        if should_show_list and hasattr(self, "animation_list_dialog"):
+            QTimer.singleShot(0, self._restore_animation_list_visibility)
         if should_show_timeline and hasattr(self, "animation_timeline_dialog"):
             QTimer.singleShot(0, self._restore_animation_timeline_visibility)
+
+    def _restore_animation_list_visibility(self) -> None:
+        if not hasattr(self, "animation_list_dialog"):
+            return
+        if not self._animation_list_should_restore_visible:
+            return
+        if not self.isVisible() or self._is_loading_sprites:
+            QTimer.singleShot(40, self._restore_animation_list_visibility)
+            return
+        if self.animation_list_dialog.isVisible():
+            return
+        self._open_animation_list_dialog()
 
     def _restore_animation_timeline_visibility(self) -> None:
         if not hasattr(self, "animation_timeline_dialog"):
@@ -6684,6 +10051,16 @@ class SpriteToolsWindow(QMainWindow):
         self._set_pref("preview/onion_tint_strength", int(self._preview_onion_tint_strength))
         self._set_pref("preview/onion_sprite_list_scope", str(self._preview_onion_sprite_list_scope))
         self._set_pref("preview/onion_sprite_list_wrap", bool(self._preview_onion_sprite_list_wrap))
+        self._set_pref("preview/guides_show_grid", bool(self._preview_guides_show_grid))
+        self._set_pref("preview/guides_grid_step", int(self._preview_guides_grid_step))
+        self._set_pref("preview/guides_show_axis", bool(self._preview_guides_show_axis))
+        self._set_pref("preview/guides_axis_x", int(self._preview_guides_axis_x))
+        self._set_pref("preview/guides_axis_y", int(self._preview_guides_axis_y))
+        self._set_pref("preview/guides_axis_layer", str(self._preview_guides_axis_layer))
+        self._set_pref(
+            "preview/guides_axis_color",
+            f"{int(self._preview_guides_axis_color[0])},{int(self._preview_guides_axis_color[1])},{int(self._preview_guides_axis_color[2])}",
+        )
         self._set_pref("preview/highlight_enabled", bool(self.highlight_checkbox.isChecked()))
         self._set_pref("preview/highlight_hover_enabled", bool(self.hover_highlight_checkbox.isChecked()))
         self._set_pref("preview/overlay_selected_color", f"{self._selected_overlay_color[0]},{self._selected_overlay_color[1]},{self._selected_overlay_color[2]}")
@@ -6833,6 +10210,48 @@ class SpriteToolsWindow(QMainWindow):
             "preview/onion_sprite_list_wrap",
             self._preview_onion_sprite_list_wrap,
         )
+        self._preview_guides_show_grid = self._get_pref_bool("preview/guides_show_grid", self._preview_guides_show_grid)
+        self._preview_guides_grid_step = max(1, min(64, self._get_pref_int("preview/guides_grid_step", self._preview_guides_grid_step)))
+        self._preview_guides_show_axis = self._get_pref_bool("preview/guides_show_axis", self._preview_guides_show_axis)
+        self._preview_guides_axis_x = max(-4096, min(4096, self._get_pref_int("preview/guides_axis_x", self._preview_guides_axis_x)))
+        self._preview_guides_axis_y = max(-4096, min(4096, self._get_pref_int("preview/guides_axis_y", self._preview_guides_axis_y)))
+        axis_layer_raw = str(self._settings.value("preview/guides_axis_layer", self._preview_guides_axis_layer) or self._preview_guides_axis_layer).strip().lower()
+        self._preview_guides_axis_layer = "bottom" if axis_layer_raw == "bottom" else "top"
+        axis_color_raw = self._settings.value(
+            "preview/guides_axis_color",
+            f"{self._preview_guides_axis_color[0]},{self._preview_guides_axis_color[1]},{self._preview_guides_axis_color[2]}",
+        )
+        self._preview_guides_axis_color = self._normalize_rgb_color(axis_color_raw, self._preview_guides_axis_color)
+
+        if hasattr(self, "preview_grid_check"):
+            blocked = self.preview_grid_check.blockSignals(True)
+            self.preview_grid_check.setChecked(bool(self._preview_guides_show_grid))
+            self.preview_grid_check.blockSignals(blocked)
+        if hasattr(self, "preview_grid_step_spin"):
+            blocked = self.preview_grid_step_spin.blockSignals(True)
+            self.preview_grid_step_spin.setValue(int(self._preview_guides_grid_step))
+            self.preview_grid_step_spin.blockSignals(blocked)
+        if hasattr(self, "preview_axis_check"):
+            blocked = self.preview_axis_check.blockSignals(True)
+            self.preview_axis_check.setChecked(bool(self._preview_guides_show_axis))
+            self.preview_axis_check.blockSignals(blocked)
+        if hasattr(self, "preview_axis_x_spin"):
+            blocked = self.preview_axis_x_spin.blockSignals(True)
+            self.preview_axis_x_spin.setValue(int(self._preview_guides_axis_x))
+            self.preview_axis_x_spin.blockSignals(blocked)
+        if hasattr(self, "preview_axis_y_spin"):
+            blocked = self.preview_axis_y_spin.blockSignals(True)
+            self.preview_axis_y_spin.setValue(int(self._preview_guides_axis_y))
+            self.preview_axis_y_spin.blockSignals(blocked)
+        if hasattr(self, "preview_axis_layer_combo"):
+            layer_idx = self.preview_axis_layer_combo.findData(self._preview_guides_axis_layer)
+            if layer_idx < 0:
+                layer_idx = 0
+            blocked = self.preview_axis_layer_combo.blockSignals(True)
+            self.preview_axis_layer_combo.setCurrentIndex(layer_idx)
+            self.preview_axis_layer_combo.blockSignals(blocked)
+        if hasattr(self, "preview_axis_color_btn"):
+            self._set_color_button_preview(self.preview_axis_color_btn, self._preview_guides_axis_color)
 
         highlight_enabled = self._get_pref_bool("preview/highlight_enabled", self.highlight_checkbox.isChecked())
         hover_highlight_enabled = self._get_pref_bool("preview/highlight_hover_enabled", self.hover_highlight_checkbox.isChecked())
@@ -6904,9 +10323,437 @@ class SpriteToolsWindow(QMainWindow):
             self.preview_onion_enabled_check.setEnabled(self._is_animation_assist_view_active())
         if hasattr(self, "preview_onion_settings_btn"):
             self.preview_onion_settings_btn.setEnabled(self._is_animation_assist_view_active())
+        if hasattr(self, "preview_grid_check"):
+            self.preview_grid_check.setEnabled(True)
+        if hasattr(self, "preview_grid_step_spin"):
+            self.preview_grid_step_spin.setEnabled(True)
+        if hasattr(self, "preview_axis_check"):
+            self.preview_axis_check.setEnabled(True)
+        if hasattr(self, "preview_axis_x_spin"):
+            self.preview_axis_x_spin.setEnabled(True)
+        if hasattr(self, "preview_axis_y_spin"):
+            self.preview_axis_y_spin.setEnabled(True)
+        if hasattr(self, "preview_axis_color_btn"):
+            self.preview_axis_color_btn.setEnabled(True)
+        if hasattr(self, "axis_preset_btn"):
+            self.axis_preset_btn.setEnabled(True)
+        if hasattr(self, "custom_axis_slots_btn"):
+            self.custom_axis_slots_btn.setEnabled(True)
+        if hasattr(self, "preview_view_settings_btn"):
+            self.preview_view_settings_btn.setEnabled(True)
         self.highlight_checkbox.setEnabled(True)
         self.hover_highlight_checkbox.setEnabled(True)
-        self.overlay_settings_btn.setEnabled(True)
+        if hasattr(self, "overlay_settings_btn"):
+            self.overlay_settings_btn.setEnabled(True)
+
+    def _open_preview_guides_menu(self) -> None:
+        if not hasattr(self, "guides_menu_btn"):
+            return
+        menu = QMenu(self)
+        custom_axis_action = menu.addAction("Custom Axis...")
+        custom_axis_action.triggered.connect(self._open_custom_axis_slots_dialog)
+        axis_preset_action = menu.addAction("Axis Preset...")
+        axis_preset_action.triggered.connect(self._open_axis_preset_picker)
+        reload_presets_action = menu.addAction("Reload Axis Presets")
+        reload_presets_action.triggered.connect(self._reload_axis_presets)
+        menu.addSeparator()
+        overlay_action = menu.addAction("Overlay Settings...")
+        overlay_action.triggered.connect(self._open_overlay_settings)
+        menu.exec(self.guides_menu_btn.mapToGlobal(self.guides_menu_btn.rect().bottomLeft()))
+
+    def _open_preview_view_settings(self) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("View Settings")
+        dialog.setModal(True)
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(8)
+
+        mode_row = QHBoxLayout()
+        mode_row.addWidget(QLabel("Mode"))
+        mode_combo = QComboBox(dialog)
+        mode_combo.addItem("Sprite Edit", "sprite_edit")
+        mode_combo.addItem("Animation Assist", "animation_assist")
+        current_mode_idx = mode_combo.findData(self._preview_view_mode)
+        if current_mode_idx >= 0:
+            mode_combo.setCurrentIndex(current_mode_idx)
+        mode_row.addWidget(mode_combo)
+        follow_check = QCheckBox("Follow selection", dialog)
+        follow_check.setChecked(bool(self._preview_animation_follow_selection))
+        mode_row.addWidget(follow_check)
+        mode_row.addStretch(1)
+        layout.addLayout(mode_row)
+
+        onion_row = QHBoxLayout()
+        onion_source_combo = QComboBox(dialog)
+        onion_source_combo.addItem("Timeline", "timeline")
+        onion_source_combo.addItem("Sprite List", "sprite_list")
+        onion_source_idx = onion_source_combo.findData(self._preview_onion_source_mode)
+        if onion_source_idx >= 0:
+            onion_source_combo.setCurrentIndex(onion_source_idx)
+        onion_row.addWidget(QLabel("Onion source"))
+        onion_row.addWidget(onion_source_combo)
+        onion_enabled_check = QCheckBox("Onion enabled", dialog)
+        onion_enabled_check.setChecked(bool(self._preview_onion_enabled))
+        onion_row.addWidget(onion_enabled_check)
+        onion_settings_btn = QPushButton("Onion Settings...", dialog)
+        onion_settings_btn.clicked.connect(self._open_onion_settings)
+        onion_row.addWidget(onion_settings_btn)
+        onion_row.addStretch(1)
+        layout.addLayout(onion_row)
+
+        guide_row = QHBoxLayout()
+        grid_check = QCheckBox("Grid", dialog)
+        grid_check.setChecked(bool(self._preview_guides_show_grid))
+        guide_row.addWidget(grid_check)
+        guide_row.addWidget(QLabel("Step"))
+        grid_step_spin = QSpinBox(dialog)
+        grid_step_spin.setRange(1, 64)
+        grid_step_spin.setValue(int(self._preview_guides_grid_step))
+        grid_step_spin.setFixedWidth(60)
+        guide_row.addWidget(grid_step_spin)
+        axis_check = QCheckBox("Axis", dialog)
+        axis_check.setChecked(bool(self._preview_guides_show_axis))
+        guide_row.addWidget(axis_check)
+        guide_row.addWidget(QLabel("X"))
+        axis_x_spin = QSpinBox(dialog)
+        axis_x_spin.setRange(-4096, 4096)
+        axis_x_spin.setValue(int(self._preview_guides_axis_x))
+        axis_x_spin.setFixedWidth(72)
+        guide_row.addWidget(axis_x_spin)
+        guide_row.addWidget(QLabel("Y"))
+        axis_y_spin = QSpinBox(dialog)
+        axis_y_spin.setRange(-4096, 4096)
+        axis_y_spin.setValue(int(self._preview_guides_axis_y))
+        axis_y_spin.setFixedWidth(72)
+        guide_row.addWidget(axis_y_spin)
+        guide_row.addWidget(QLabel("Layer"))
+        axis_layer_combo = QComboBox(dialog)
+        axis_layer_combo.addItem("Top", "top")
+        axis_layer_combo.addItem("Bottom", "bottom")
+        axis_layer_idx = axis_layer_combo.findData(str(self._preview_guides_axis_layer))
+        if axis_layer_idx >= 0:
+            axis_layer_combo.setCurrentIndex(axis_layer_idx)
+        guide_row.addWidget(axis_layer_combo)
+        axis_color_btn = QPushButton("Color", dialog)
+        axis_color_btn.setFixedWidth(72)
+        self._set_color_button_preview(axis_color_btn, self._preview_guides_axis_color)
+        guide_row.addWidget(axis_color_btn)
+        guide_row.addStretch(1)
+        layout.addLayout(guide_row)
+
+        axis_row = QHBoxLayout()
+        axis_preset_btn = QPushButton("Axis Preset...", dialog)
+        axis_preset_btn.clicked.connect(lambda: (self._open_axis_preset_picker(), axis_x_spin.setValue(int(self._preview_guides_axis_x)), axis_y_spin.setValue(int(self._preview_guides_axis_y)), axis_check.setChecked(bool(self._preview_guides_show_axis))))
+        axis_row.addWidget(axis_preset_btn)
+        custom_axis_btn = QPushButton("Custom Axis...", dialog)
+        custom_axis_btn.clicked.connect(self._open_custom_axis_slots_dialog)
+        axis_row.addWidget(custom_axis_btn)
+        reload_presets_btn = QPushButton("Reload Presets", dialog)
+        reload_presets_btn.clicked.connect(self._reload_axis_presets)
+        axis_row.addWidget(reload_presets_btn)
+        axis_row.addStretch(1)
+        layout.addLayout(axis_row)
+
+        visual_row = QHBoxLayout()
+        visual_row.addWidget(QLabel("Scaling"))
+        scaling_combo = QComboBox(dialog)
+        scaling_combo.addItem("Nearest")
+        scaling_combo.addItem("Bilinear")
+        scaling_combo.setCurrentIndex(int(self.filter_combo.currentIndex()))
+        visual_row.addWidget(scaling_combo)
+        highlight_check = QCheckBox("Highlight selected", dialog)
+        highlight_check.setChecked(bool(self.highlight_checkbox.isChecked()))
+        visual_row.addWidget(highlight_check)
+        hover_highlight_check = QCheckBox("Highlight hover", dialog)
+        hover_highlight_check.setChecked(bool(self.hover_highlight_checkbox.isChecked()))
+        visual_row.addWidget(hover_highlight_check)
+        overlay_settings_btn = QPushButton("Overlay Settings...", dialog)
+        overlay_settings_btn.clicked.connect(self._open_overlay_settings)
+        visual_row.addWidget(overlay_settings_btn)
+        visual_row.addStretch(1)
+        layout.addLayout(visual_row)
+
+        close_row = QHBoxLayout()
+        close_row.addStretch(1)
+        close_btn = QPushButton("Close", dialog)
+        close_btn.clicked.connect(dialog.accept)
+        close_row.addWidget(close_btn)
+        layout.addLayout(close_row)
+
+        def _apply_mode_from_dialog() -> None:
+            target = str(mode_combo.currentData() or "sprite_edit")
+            index = self.preview_context_combo.findData(target)
+            if index >= 0:
+                self.preview_context_combo.setCurrentIndex(index)
+            assist = target == "animation_assist"
+            follow_check.setEnabled(assist)
+            onion_source_combo.setEnabled(assist)
+            onion_enabled_check.setEnabled(assist)
+            onion_settings_btn.setEnabled(assist)
+
+        def _apply_guide_from_dialog() -> None:
+            axis_color = self._preview_guides_axis_color
+            axis_color_raw = axis_color_btn.property("axis_color")
+            if isinstance(axis_color_raw, (list, tuple)) and len(axis_color_raw) >= 3:
+                axis_color = self._normalize_rgb_color(axis_color_raw, axis_color)
+            self._set_global_guide_state(
+                show_grid=bool(grid_check.isChecked()),
+                grid_step=int(grid_step_spin.value()),
+                show_axis=bool(axis_check.isChecked()),
+                axis_x=int(axis_x_spin.value()),
+                axis_y=int(axis_y_spin.value()),
+                axis_layer=str(axis_layer_combo.currentData() or "top"),
+                axis_color=axis_color,
+                source="main",
+            )
+
+        def _pick_axis_color_from_dialog() -> None:
+            current = self._normalize_rgb_color(axis_color_btn.property("axis_color"), self._preview_guides_axis_color)
+            chosen = QColorDialog.getColor(QColor(int(current[0]), int(current[1]), int(current[2])), dialog, "Base Axis Color")
+            if not chosen.isValid():
+                return
+            self._set_color_button_preview(axis_color_btn, (int(chosen.red()), int(chosen.green()), int(chosen.blue())))
+            _apply_guide_from_dialog()
+
+        mode_combo.currentIndexChanged.connect(lambda _i: _apply_mode_from_dialog())
+        follow_check.toggled.connect(lambda checked: self.preview_animation_follow_selection_check.setChecked(bool(checked)))
+        onion_source_combo.currentIndexChanged.connect(
+            lambda _i: self.preview_onion_source_combo.setCurrentIndex(onion_source_combo.currentIndex())
+        )
+        onion_enabled_check.toggled.connect(lambda checked: self.preview_onion_enabled_check.setChecked(bool(checked)))
+        grid_check.toggled.connect(lambda _v: _apply_guide_from_dialog())
+        grid_step_spin.valueChanged.connect(lambda _v: _apply_guide_from_dialog())
+        axis_check.toggled.connect(lambda _v: _apply_guide_from_dialog())
+        axis_x_spin.valueChanged.connect(lambda _v: _apply_guide_from_dialog())
+        axis_y_spin.valueChanged.connect(lambda _v: _apply_guide_from_dialog())
+        axis_layer_combo.currentIndexChanged.connect(lambda _v: _apply_guide_from_dialog())
+        axis_color_btn.clicked.connect(_pick_axis_color_from_dialog)
+        scaling_combo.currentIndexChanged.connect(lambda index: self.filter_combo.setCurrentIndex(int(index)))
+        highlight_check.toggled.connect(lambda checked: self.highlight_checkbox.setChecked(bool(checked)))
+        hover_highlight_check.toggled.connect(lambda checked: self.hover_highlight_checkbox.setChecked(bool(checked)))
+
+        _apply_mode_from_dialog()
+        dialog.exec()
+
+    def _open_axis_preset_picker(self) -> None:
+        self._reload_axis_presets()
+        if not self._axis_presets:
+            QMessageBox.information(
+                self,
+                "Axis Presets",
+                f"No axis presets found in:\n{self._axis_presets_dir}",
+            )
+            return
+
+        labels = [f"{preset.name}  (X:{int(preset.x)}  Y:{int(preset.y)})" for preset in self._axis_presets]
+        selected_label, ok = QInputDialog.getItem(self, "Axis Preset", "Select preset", labels, 0, False)
+        if not ok:
+            return
+        selected_index = labels.index(str(selected_label)) if str(selected_label) in labels else -1
+        if selected_index < 0:
+            return
+        preset = self._axis_presets[selected_index]
+        self._set_global_guide_state(
+            show_grid=bool(self._preview_guides_show_grid),
+            grid_step=int(self._preview_guides_grid_step),
+            show_axis=True,
+            axis_x=int(preset.x),
+            axis_y=int(preset.y),
+            axis_color=self._preview_guides_axis_color,
+            source="main",
+        )
+        self.statusBar().showMessage(f"Applied axis preset: {preset.name} (X={int(preset.x)}, Y={int(preset.y)})", 2500)
+
+    def _open_base_axis_color_picker(self) -> None:
+        current = QColor(
+            int(self._preview_guides_axis_color[0]),
+            int(self._preview_guides_axis_color[1]),
+            int(self._preview_guides_axis_color[2]),
+        )
+        chosen = QColorDialog.getColor(current, self, "Base Axis Color")
+        if not chosen.isValid():
+            return
+        self._set_global_guide_state(
+            show_grid=bool(self._preview_guides_show_grid),
+            grid_step=int(self._preview_guides_grid_step),
+            show_axis=bool(self._preview_guides_show_axis),
+            axis_x=int(self._preview_guides_axis_x),
+            axis_y=int(self._preview_guides_axis_y),
+            axis_layer=str(self._preview_guides_axis_layer),
+            axis_color=(int(chosen.red()), int(chosen.green()), int(chosen.blue())),
+            source="main",
+        )
+
+    def _enabled_custom_axis_guides(self) -> List[Dict[str, Any]]:
+        slots = self._sanitize_custom_axis_slots(self._project_custom_axis_slots)
+        guides: List[Dict[str, Any]] = []
+        for index, slot in enumerate(slots):
+            if not bool(slot.get("enabled", False)):
+                continue
+            color = self._normalize_rgb_color(slot.get("color", (255, 190, 120)), (255, 190, 120))
+            guides.append(
+                {
+                    "slot": int(slot.get("slot", index + 1)),
+                    "name": str(slot.get("name", f"Slot {index + 1}")),
+                    "x": int(slot.get("x", 0)),
+                    "y": int(slot.get("y", 0)),
+                    "layer": str(slot.get("layer", "top") or "top"),
+                    "color": (int(color[0]), int(color[1]), int(color[2]), 220),
+                }
+            )
+        return guides
+
+    def _build_main_preview_guide_options(self, source_w: int, source_h: int) -> Dict[str, object]:
+        return {
+            "source_w": int(max(1, source_w)),
+            "source_h": int(max(1, source_h)),
+            "show_grid": bool(self._preview_guides_show_grid),
+            "grid_step": int(self._preview_guides_grid_step),
+            "show_axis": bool(self._preview_guides_show_axis),
+            "axis_x": int(self._preview_guides_axis_x),
+            "axis_y": int(self._preview_guides_axis_y),
+            "axis_layer": str(self._preview_guides_axis_layer),
+            "axis_color": (
+                int(self._preview_guides_axis_color[0]),
+                int(self._preview_guides_axis_color[1]),
+                int(self._preview_guides_axis_color[2]),
+            ),
+            "show_ground": False,
+            "custom_axes": self._enabled_custom_axis_guides(),
+        }
+
+    def _on_preview_guide_options_changed(self, _value: object) -> None:
+        axis_layer = "top"
+        if hasattr(self, "preview_axis_layer_combo"):
+            axis_layer = "bottom" if str(self.preview_axis_layer_combo.currentData() or "top") == "bottom" else "top"
+        self._set_global_guide_state(
+            show_grid=bool(self.preview_grid_check.isChecked()),
+            grid_step=int(self.preview_grid_step_spin.value()),
+            show_axis=bool(self.preview_axis_check.isChecked()),
+            axis_x=int(self.preview_axis_x_spin.value()),
+            axis_y=int(self.preview_axis_y_spin.value()),
+            axis_layer=axis_layer,
+            axis_color=self._preview_guides_axis_color,
+            source="main",
+        )
+
+    def _set_global_guide_state(
+        self,
+        *,
+        show_grid: bool,
+        grid_step: int,
+        show_axis: bool,
+        axis_x: int,
+        axis_y: int,
+        axis_layer: str | None = None,
+        axis_color: ColorTuple | None = None,
+        source: str,
+    ) -> None:
+        next_show_grid = bool(show_grid)
+        next_grid_step = max(1, min(64, int(grid_step)))
+        next_show_axis = bool(show_axis)
+        next_axis_x = max(-4096, min(4096, int(axis_x)))
+        next_axis_y = max(-4096, min(4096, int(axis_y)))
+        next_axis_layer = str(axis_layer or self._preview_guides_axis_layer or "top").strip().lower()
+        if next_axis_layer not in {"top", "bottom"}:
+            next_axis_layer = "top"
+        next_axis_color = self._normalize_rgb_color(axis_color, self._preview_guides_axis_color)
+
+        changed = (
+            self._preview_guides_show_grid != next_show_grid
+            or self._preview_guides_grid_step != next_grid_step
+            or self._preview_guides_show_axis != next_show_axis
+            or self._preview_guides_axis_x != next_axis_x
+            or self._preview_guides_axis_y != next_axis_y
+            or self._preview_guides_axis_layer != next_axis_layer
+            or self._preview_guides_axis_color != next_axis_color
+        )
+        if not changed:
+            return
+
+        self._preview_guides_show_grid = next_show_grid
+        self._preview_guides_grid_step = next_grid_step
+        self._preview_guides_show_axis = next_show_axis
+        self._preview_guides_axis_x = next_axis_x
+        self._preview_guides_axis_y = next_axis_y
+        self._preview_guides_axis_layer = next_axis_layer
+        self._preview_guides_axis_color = next_axis_color
+
+        if hasattr(self, "preview_grid_check"):
+            blocked = self.preview_grid_check.blockSignals(True)
+            self.preview_grid_check.setChecked(bool(self._preview_guides_show_grid))
+            self.preview_grid_check.blockSignals(blocked)
+        if hasattr(self, "preview_grid_step_spin"):
+            blocked = self.preview_grid_step_spin.blockSignals(True)
+            self.preview_grid_step_spin.setValue(int(self._preview_guides_grid_step))
+            self.preview_grid_step_spin.blockSignals(blocked)
+        if hasattr(self, "preview_axis_check"):
+            blocked = self.preview_axis_check.blockSignals(True)
+            self.preview_axis_check.setChecked(bool(self._preview_guides_show_axis))
+            self.preview_axis_check.blockSignals(blocked)
+        if hasattr(self, "preview_axis_x_spin"):
+            blocked = self.preview_axis_x_spin.blockSignals(True)
+            self.preview_axis_x_spin.setValue(int(self._preview_guides_axis_x))
+            self.preview_axis_x_spin.blockSignals(blocked)
+        if hasattr(self, "preview_axis_y_spin"):
+            blocked = self.preview_axis_y_spin.blockSignals(True)
+            self.preview_axis_y_spin.setValue(int(self._preview_guides_axis_y))
+            self.preview_axis_y_spin.blockSignals(blocked)
+        if hasattr(self, "preview_axis_layer_combo"):
+            layer_idx = self.preview_axis_layer_combo.findData(self._preview_guides_axis_layer)
+            if layer_idx < 0:
+                layer_idx = 0
+            blocked = self.preview_axis_layer_combo.blockSignals(True)
+            self.preview_axis_layer_combo.setCurrentIndex(layer_idx)
+            self.preview_axis_layer_combo.blockSignals(blocked)
+        if hasattr(self, "preview_axis_color_btn"):
+            self._set_color_button_preview(self.preview_axis_color_btn, self._preview_guides_axis_color)
+
+        if self._merge_dialog is not None and self._merge_dialog.isVisible() and source != "merge":
+            self._merge_dialog.apply_external_guide_state(
+                show_grid=bool(self._preview_guides_show_grid),
+                grid_step=int(self._preview_guides_grid_step),
+                show_axis=bool(self._preview_guides_show_axis),
+                axis_x=int(self._preview_guides_axis_x),
+                axis_y=int(self._preview_guides_axis_y),
+            )
+
+        pivot_dialog = self._active_pivot_assist_dialog
+        if pivot_dialog is not None and pivot_dialog.isVisible() and source != "pivot":
+            pivot_dialog.apply_external_guide_state(
+                show_grid=bool(self._preview_guides_show_grid),
+                grid_step=int(self._preview_guides_grid_step),
+                show_axis=bool(self._preview_guides_show_axis),
+                axis_x=int(self._preview_guides_axis_x),
+                axis_y=int(self._preview_guides_axis_y),
+                axis_layer=str(self._preview_guides_axis_layer),
+                axis_color=self._preview_guides_axis_color,
+            )
+
+        if source != "project-load" and self._project_manifest is not None and self._project_paths is not None:
+            self._mark_project_dirty("preview-guides")
+
+        self._save_preview_ui_settings()
+        self._refresh_all_guide_previews()
+
+    def _refresh_all_guide_previews(self) -> None:
+        if self._is_animation_assist_view_active():
+            self._refresh_animation_assist_preview_frame()
+        else:
+            self._update_preview_pixmap()
+
+        if self._merge_dialog is not None and self._merge_dialog.isVisible():
+            self._merge_dialog._refresh_preview_from_state()
+
+        pivot_dialog = self._active_pivot_assist_dialog
+        if pivot_dialog is not None and pivot_dialog.isVisible():
+            pivot_dialog._update_guide_overlays()
+            current = pivot_dialog.frame_list.currentItem() if hasattr(pivot_dialog, "frame_list") else None
+            if current is not None:
+                key = str(current.data(Qt.ItemDataRole.UserRole) or "")
+                if key:
+                    pivot_dialog._update_preview_for_key(key, center_row=pivot_dialog.sequence_list.currentRow())
 
     def _refresh_animation_assist_preview_frame(self) -> None:
         if not self._is_animation_assist_view_active():
@@ -7336,6 +11183,7 @@ class SpriteToolsWindow(QMainWindow):
         self._next_group_id = 1
         self._next_slot_id = 0
         self._slot_color_lookup = {}
+        self._project_custom_axis_slots = self._default_custom_axis_slots()
         self._invalidate_used_index_cache("clear-all")
         self._sync_palette_model()
         self._refresh_group_overview()
@@ -7343,6 +11191,7 @@ class SpriteToolsWindow(QMainWindow):
         self.statusBar().clearMessage()
         self._update_export_buttons()
         self._refresh_animation_tag_list()
+        self._update_animation_list_preview_timer_state()
         self._reset_history()
 
     def _clear_sprite_icon_cache(self, reason: str) -> None:
@@ -7675,6 +11524,10 @@ class SpriteToolsWindow(QMainWindow):
     def _activate_project(self, paths: ProjectPaths, manifest: ProjectManifest) -> None:
         self._project_paths = paths
         self._project_manifest = manifest
+        self._apply_project_canvas_offset_settings_from_manifest()
+        self._load_custom_axis_slots_from_manifest_settings()
+        self._load_preview_guides_from_manifest_settings()
+        self._load_merge_window_from_manifest_settings()
         self._load_animation_tags_from_manifest_settings()
         self._autosave_dirty = False
         self._autosave_last_status_ts = 0.0
@@ -7704,6 +11557,586 @@ class SpriteToolsWindow(QMainWindow):
         self._update_project_action_buttons()
         self.statusBar().showMessage(f"Active project: {manifest.project_name}", 3000)
 
+    def _apply_project_canvas_offset_settings_from_manifest(self) -> None:
+        manifest = self._project_manifest
+        if manifest is None:
+            return
+        settings = manifest.settings if isinstance(manifest.settings, dict) else {}
+
+        def _as_int(value: Any, fallback: int) -> int:
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return int(fallback)
+
+        if hasattr(self, "offset_scope_combo"):
+            desired_scope = str(settings.get("offset_scope", self.offset_scope_combo.currentData() or "combined") or "combined").strip().lower()
+            self._set_combo_data(self.offset_scope_combo, desired_scope)
+        if hasattr(self, "global_offset_x_spin"):
+            self._set_spin_value(self.global_offset_x_spin, _as_int(settings.get("global_offset_x", self.global_offset_x_spin.value()), self.global_offset_x_spin.value()))
+        if hasattr(self, "global_offset_y_spin"):
+            self._set_spin_value(self.global_offset_y_spin, _as_int(settings.get("global_offset_y", self.global_offset_y_spin.value()), self.global_offset_y_spin.value()))
+
+        if hasattr(self, "output_size_mode"):
+            desired_mode = str(settings.get("canvas_mode", self.output_size_mode.currentData() or "custom") or "custom").strip().lower()
+            self._set_combo_data(self.output_size_mode, desired_mode)
+        if hasattr(self, "canvas_scope_combo"):
+            desired_canvas_scope = str(settings.get("canvas_scope", self.canvas_scope_combo.currentData() or "combined") or "combined").strip().lower()
+            self._set_combo_data(self.canvas_scope_combo, desired_canvas_scope)
+        if hasattr(self, "canvas_width_spin"):
+            width = max(1, min(4096, _as_int(settings.get("global_canvas_width", self.canvas_width_spin.value()), self.canvas_width_spin.value())))
+            self._set_spin_value(self.canvas_width_spin, width)
+        if hasattr(self, "canvas_height_spin"):
+            height = max(1, min(4096, _as_int(settings.get("global_canvas_height", self.canvas_height_spin.value()), self.canvas_height_spin.value())))
+            self._set_spin_value(self.canvas_height_spin, height)
+
+        self._update_canvas_inputs()
+        self._update_sprite_offset_controls(self._current_record())
+
+    def _default_custom_axis_slots(self) -> List[Dict[str, Any]]:
+        default_colors: List[ColorTuple] = [
+            (255, 190, 120),
+            (170, 220, 255),
+            (180, 255, 170),
+            (255, 220, 170),
+            (230, 180, 255),
+            (255, 170, 210),
+            (210, 255, 210),
+            (255, 200, 140),
+            (160, 210, 255),
+        ]
+        slots: List[Dict[str, Any]] = []
+        for index in range(9):
+            color = default_colors[index % len(default_colors)]
+            slots.append(
+                {
+                    "slot": int(index + 1),
+                    "name": f"Slot {index + 1}",
+                    "enabled": False,
+                    "x": 0,
+                    "y": 0,
+                    "layer": "top",
+                    "color": [int(color[0]), int(color[1]), int(color[2])],
+                }
+            )
+        return slots
+
+    def _sanitize_custom_axis_slots(self, raw: Any) -> List[Dict[str, Any]]:
+        defaults = self._default_custom_axis_slots()
+        payload = raw if isinstance(raw, list) else []
+        sanitized: List[Dict[str, Any]] = []
+        for index in range(9):
+            fallback = defaults[index]
+            item = payload[index] if index < len(payload) and isinstance(payload[index], dict) else {}
+            name = str(item.get("name", fallback["name"]) or fallback["name"]).strip()
+            if not name:
+                name = str(fallback["name"])
+            try:
+                x = int(item.get("x", fallback["x"]))
+            except (TypeError, ValueError):
+                x = int(fallback["x"])
+            try:
+                y = int(item.get("y", fallback["y"]))
+            except (TypeError, ValueError):
+                y = int(fallback["y"])
+            layer_raw = str(item.get("layer", fallback.get("layer", "top")) or "top").strip().lower()
+            layer = "bottom" if layer_raw == "bottom" else "top"
+            color = self._normalize_rgb_color(item.get("color", fallback.get("color", (255, 190, 120))), (255, 190, 120))
+            sanitized.append(
+                {
+                    "slot": int(index + 1),
+                    "name": name,
+                    "enabled": bool(item.get("enabled", fallback["enabled"])),
+                    "x": max(-4096, min(4096, int(x))),
+                    "y": max(-4096, min(4096, int(y))),
+                    "layer": layer,
+                    "color": [int(color[0]), int(color[1]), int(color[2])],
+                }
+            )
+        return sanitized
+
+    def _load_custom_axis_slots_from_manifest_settings(self) -> None:
+        manifest = self._project_manifest
+        if manifest is None or not isinstance(manifest.settings, dict):
+            self._project_custom_axis_slots = self._default_custom_axis_slots()
+            return
+        raw = manifest.settings.get("custom_axis_slots", [])
+        self._project_custom_axis_slots = self._sanitize_custom_axis_slots(raw)
+        enabled_count = sum(1 for slot in self._project_custom_axis_slots if bool(slot.get("enabled", False)))
+        logger.debug("axis.custom_slots loaded total=%s enabled=%s", len(self._project_custom_axis_slots), enabled_count)
+
+    def _custom_axis_slots_for_manifest_settings(self) -> List[Dict[str, Any]]:
+        return self._sanitize_custom_axis_slots(self._project_custom_axis_slots)
+
+    def _preview_guides_for_manifest_settings(self) -> Dict[str, Any]:
+        return {
+            "show_grid": bool(self._preview_guides_show_grid),
+            "grid_step": int(self._preview_guides_grid_step),
+            "show_axis": bool(self._preview_guides_show_axis),
+            "axis_x": int(self._preview_guides_axis_x),
+            "axis_y": int(self._preview_guides_axis_y),
+            "axis_layer": str(self._preview_guides_axis_layer),
+            "axis_color": [
+                int(self._preview_guides_axis_color[0]),
+                int(self._preview_guides_axis_color[1]),
+                int(self._preview_guides_axis_color[2]),
+            ],
+        }
+
+    def _load_preview_guides_from_manifest_settings(self) -> None:
+        manifest = self._project_manifest
+        if manifest is None or not isinstance(manifest.settings, dict):
+            return
+        raw = manifest.settings.get("preview_guides", {})
+        if not isinstance(raw, dict):
+            return
+        axis_layer = str(raw.get("axis_layer", self._preview_guides_axis_layer) or self._preview_guides_axis_layer).strip().lower()
+        if axis_layer not in {"top", "bottom"}:
+            axis_layer = "top"
+        axis_color = self._normalize_rgb_color(raw.get("axis_color", self._preview_guides_axis_color), self._preview_guides_axis_color)
+        self._set_global_guide_state(
+            show_grid=bool(raw.get("show_grid", self._preview_guides_show_grid)),
+            grid_step=int(raw.get("grid_step", self._preview_guides_grid_step)),
+            show_axis=bool(raw.get("show_axis", self._preview_guides_show_axis)),
+            axis_x=int(raw.get("axis_x", self._preview_guides_axis_x)),
+            axis_y=int(raw.get("axis_y", self._preview_guides_axis_y)),
+            axis_layer=axis_layer,
+            axis_color=axis_color,
+            source="project-load",
+        )
+
+    def _get_merge_dialog_size(self) -> Tuple[int, int]:
+        if self._project_merge_window_size is not None:
+            return self._project_merge_window_size
+        width = max(700, min(2600, self._get_pref_int("merge/window_width", 1160)))
+        height = max(420, min(1800, self._get_pref_int("merge/window_height", 700)))
+        return (int(width), int(height))
+
+    def _load_merge_window_from_manifest_settings(self) -> None:
+        self._project_merge_window_size = None
+        manifest = self._project_manifest
+        if manifest is None or not isinstance(manifest.settings, dict):
+            return
+        raw = manifest.settings.get("merge_window_size")
+        width: int | None = None
+        height: int | None = None
+        if isinstance(raw, (list, tuple)) and len(raw) >= 2:
+            try:
+                width = int(raw[0])
+                height = int(raw[1])
+            except (TypeError, ValueError):
+                width = None
+                height = None
+        elif isinstance(raw, dict):
+            try:
+                width = int(raw.get("width", 0))
+                height = int(raw.get("height", 0))
+            except (TypeError, ValueError):
+                width = None
+                height = None
+        if width is None or height is None:
+            return
+        width = max(700, min(2600, int(width)))
+        height = max(420, min(1800, int(height)))
+        self._project_merge_window_size = (width, height)
+
+    def _store_merge_dialog_size(self, size: QSize) -> None:
+        width = max(700, min(2600, int(size.width())))
+        height = max(420, min(1800, int(size.height())))
+        self._set_pref("merge/window_width", width)
+        self._set_pref("merge/window_height", height)
+        next_size = (width, height)
+        if self._project_merge_window_size != next_size:
+            self._project_merge_window_size = next_size
+            if self._project_manifest is not None and self._project_paths is not None:
+                self._mark_project_dirty("merge-window-size")
+
+    def _open_custom_axis_slots_dialog(self) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Custom Axis Slots")
+        dialog.setModal(True)
+        dialog.resize(760, 420)
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
+        layout.addWidget(QLabel("Configure 9 project-level custom axis slots. Enabled slots are stored in the project."))
+
+        slots = self._sanitize_custom_axis_slots(self._project_custom_axis_slots)
+
+        table = QTableWidget(dialog)
+        table.setColumnCount(7)
+        table.setRowCount(9)
+        table.setHorizontalHeaderLabels(["Slot", "Enabled", "Name", "X", "Y", "Color", "Layer"])
+        table.verticalHeader().setVisible(False)
+        table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        table.setEditTriggers(QAbstractItemView.EditTrigger.DoubleClicked | QAbstractItemView.EditTrigger.SelectedClicked)
+        table.setAlternatingRowColors(True)
+        table.setSortingEnabled(False)
+
+        for row in range(9):
+            slot_data = slots[row]
+
+            slot_item = QTableWidgetItem(str(int(row + 1)))
+            slot_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+            table.setItem(row, 0, slot_item)
+
+            enabled_item = QTableWidgetItem("")
+            enabled_item.setFlags(
+                Qt.ItemFlag.ItemIsEnabled
+                | Qt.ItemFlag.ItemIsSelectable
+                | Qt.ItemFlag.ItemIsUserCheckable
+            )
+            enabled_item.setCheckState(
+                Qt.CheckState.Checked if bool(slot_data.get("enabled", False)) else Qt.CheckState.Unchecked
+            )
+            table.setItem(row, 1, enabled_item)
+
+            name_item = QTableWidgetItem(str(slot_data.get("name", f"Slot {row + 1}")))
+            name_item.setFlags(
+                Qt.ItemFlag.ItemIsEnabled
+                | Qt.ItemFlag.ItemIsSelectable
+                | Qt.ItemFlag.ItemIsEditable
+            )
+            table.setItem(row, 2, name_item)
+
+            x_spin = QSpinBox(table)
+            x_spin.setRange(-4096, 4096)
+            x_spin.setValue(int(slot_data.get("x", 0)))
+            table.setCellWidget(row, 3, x_spin)
+
+            y_spin = QSpinBox(table)
+            y_spin.setRange(-4096, 4096)
+            y_spin.setValue(int(slot_data.get("y", 0)))
+            table.setCellWidget(row, 4, y_spin)
+
+            color_btn = QPushButton("Pick", table)
+            slot_color = self._normalize_rgb_color(slot_data.get("color", (255, 190, 120)), (255, 190, 120))
+            self._set_color_button_preview(color_btn, slot_color)
+
+            def _pick_custom_axis_color(_checked: bool = False, button: QPushButton = color_btn) -> None:
+                current = self._normalize_rgb_color(button.property("axis_color"), (255, 190, 120))
+                chosen = QColorDialog.getColor(
+                    QColor(int(current[0]), int(current[1]), int(current[2])),
+                    dialog,
+                    "Custom Axis Color",
+                )
+                if not chosen.isValid():
+                    return
+                self._set_color_button_preview(button, (int(chosen.red()), int(chosen.green()), int(chosen.blue())))
+
+            color_btn.clicked.connect(_pick_custom_axis_color)
+            table.setCellWidget(row, 5, color_btn)
+
+            layer_combo = QComboBox(table)
+            layer_combo.addItem("Top", "top")
+            layer_combo.addItem("Bottom", "bottom")
+            layer_idx = layer_combo.findData(str(slot_data.get("layer", "top")))
+            if layer_idx >= 0:
+                layer_combo.setCurrentIndex(layer_idx)
+            table.setCellWidget(row, 6, layer_combo)
+
+        header = table.horizontalHeader()
+        if header is not None:
+            header.setStretchLastSection(False)
+            header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+            header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+            header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+            header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+            header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+            header.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
+            header.setSectionResizeMode(6, QHeaderView.ResizeMode.ResizeToContents)
+
+        layout.addWidget(table, 1)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel,
+            parent=dialog,
+        )
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        updated_slots: List[Dict[str, Any]] = []
+        for row in range(9):
+            enabled_item = table.item(row, 1)
+            name_item = table.item(row, 2)
+            x_spin = table.cellWidget(row, 3)
+            y_spin = table.cellWidget(row, 4)
+            color_btn = table.cellWidget(row, 5)
+            layer_combo = table.cellWidget(row, 6)
+            name_text = str(name_item.text()).strip() if name_item is not None else ""
+            if not name_text:
+                name_text = f"Slot {row + 1}"
+            custom_color = self._normalize_rgb_color(
+                color_btn.property("axis_color") if isinstance(color_btn, QPushButton) else (255, 190, 120),
+                (255, 190, 120),
+            )
+            updated_slots.append(
+                {
+                    "slot": int(row + 1),
+                    "enabled": bool(enabled_item is not None and enabled_item.checkState() == Qt.CheckState.Checked),
+                    "name": name_text,
+                    "x": int(x_spin.value()) if isinstance(x_spin, QSpinBox) else 0,
+                    "y": int(y_spin.value()) if isinstance(y_spin, QSpinBox) else 0,
+                    "color": [int(custom_color[0]), int(custom_color[1]), int(custom_color[2])],
+                    "layer": str(layer_combo.currentData() if isinstance(layer_combo, QComboBox) else "top"),
+                }
+            )
+
+        normalized = self._sanitize_custom_axis_slots(updated_slots)
+        if normalized == self._sanitize_custom_axis_slots(self._project_custom_axis_slots):
+            return
+
+        self._project_custom_axis_slots = normalized
+        enabled_count = sum(1 for slot in self._project_custom_axis_slots if bool(slot.get("enabled", False)))
+        logger.debug("axis.custom_slots updated total=%s enabled=%s", len(self._project_custom_axis_slots), enabled_count)
+        if self._project_manifest is not None and self._project_paths is not None:
+            self._mark_project_dirty("custom-axis-slots")
+        self._refresh_all_guide_previews()
+        self.statusBar().showMessage(f"Custom axis slots updated ({enabled_count} enabled)", 2500)
+
+    def _group_state_payload_for_manifest_settings(self, runtime_to_source_key: Dict[str, str]) -> Dict[str, Any]:
+        groups: Dict[str, Dict[str, Any]] = {}
+        for group_id, group in self._palette_groups.items():
+            groups[group_id] = {
+                "group_id": str(group.group_id),
+                "mode": str(group.mode),
+                "signature": str(group.signature or ""),
+                "display_name": str(group.display_name or ""),
+                "color": [int(group.color[0]), int(group.color[1]), int(group.color[2])],
+                "member_sprite_ids": [
+                    runtime_to_source_key[key]
+                    for key in sorted(group.member_keys)
+                    if key in runtime_to_source_key
+                ],
+                "offset_x": int(group.offset_x),
+                "offset_y": int(group.offset_y),
+                "canvas_width": int(group.canvas_width),
+                "canvas_height": int(group.canvas_height),
+                "canvas_override_enabled": bool(group.canvas_override_enabled),
+                "detect_palette_colors": [
+                    [int(color[0]), int(color[1]), int(color[2])]
+                    for color in group.detect_palette_colors
+                ],
+                "detect_palette_alphas": [int(alpha) for alpha in group.detect_palette_alphas],
+                "detect_palette_slot_ids": [int(slot_id) for slot_id in group.detect_palette_slot_ids],
+            }
+        record_groups: Dict[str, str] = {}
+        for runtime_key, record in self.sprite_records.items():
+            source_key = runtime_to_source_key.get(runtime_key)
+            if source_key is None or not record.group_id:
+                continue
+            record_groups[source_key] = str(record.group_id)
+        return {
+            "groups": groups,
+            "record_groups": record_groups,
+            "group_key_to_id": {str(key): str(value) for key, value in self._group_key_to_id.items()},
+            "next_group_id": int(self._next_group_id),
+        }
+
+    def _group_state_map_for_manifest_settings(self) -> Dict[str, Dict[str, Any]]:
+        payload: Dict[str, Dict[str, Any]] = {}
+        for group in self._palette_groups.values():
+            signature = str(group.signature or "").strip()
+            if not signature:
+                continue
+            payload[signature] = {
+                "offset_x": int(group.offset_x),
+                "offset_y": int(group.offset_y),
+                "canvas_width": int(group.canvas_width),
+                "canvas_height": int(group.canvas_height),
+                "canvas_override_enabled": bool(group.canvas_override_enabled),
+            }
+        return payload
+
+    def _apply_group_state_from_manifest_settings(self) -> None:
+        manifest = self._project_manifest
+        if manifest is None:
+            return
+        if isinstance(manifest.settings, dict):
+            full_payload = manifest.settings.get("group_state_full")
+            if isinstance(full_payload, dict) and self._apply_full_group_state_from_manifest_payload(full_payload):
+                return
+        raw_map = manifest.settings.get("group_state_map", {}) if isinstance(manifest.settings, dict) else {}
+        if not isinstance(raw_map, dict):
+            return
+        applied = 0
+        for group in self._palette_groups.values():
+            payload = raw_map.get(group.signature)
+            if not isinstance(payload, dict):
+                continue
+            try:
+                group.offset_x = int(payload.get("offset_x", group.offset_x))
+                group.offset_y = int(payload.get("offset_y", group.offset_y))
+                group.canvas_width = max(1, int(payload.get("canvas_width", group.canvas_width)))
+                group.canvas_height = max(1, int(payload.get("canvas_height", group.canvas_height)))
+                group.canvas_override_enabled = bool(payload.get("canvas_override_enabled", group.canvas_override_enabled))
+                applied += 1
+            except (TypeError, ValueError):
+                continue
+        if applied:
+            self._update_canvas_inputs()
+            self._update_sprite_offset_controls(self._current_record())
+            logger.debug("Applied group state from manifest count=%s", applied)
+
+    def _apply_full_group_state_from_manifest_payload(self, payload: Dict[str, Any]) -> bool:
+        if self._project_manifest is None or self._project_paths is None:
+            return False
+        raw_groups = payload.get("groups", {})
+        if not isinstance(raw_groups, dict):
+            return False
+
+        runtime_to_source: Dict[str, str] = {}
+        source_to_runtime: Dict[str, str] = {}
+        for runtime_key in self._ordered_sprite_keys():
+            record = self.sprite_records.get(runtime_key)
+            if record is None:
+                continue
+            source_key: str
+            if self._project_manifest.project_mode == "managed":
+                try:
+                    source_key = record.path.resolve().relative_to(self._project_paths.root).as_posix()
+                except ValueError:
+                    source_key = record.path.resolve().as_posix()
+            else:
+                source_key = record.path.resolve().as_posix()
+            runtime_to_source[runtime_key] = source_key
+            source_to_runtime[source_key] = runtime_key
+
+        restored_groups: Dict[str, PaletteGroup] = {}
+        for group_id, raw_group in raw_groups.items():
+            if not isinstance(raw_group, dict):
+                continue
+            normalized_group_id = str(raw_group.get("group_id", group_id) or group_id).strip()
+            if not normalized_group_id:
+                continue
+            mode = str(raw_group.get("mode", "detect") or "detect").strip().lower()
+            mode_literal: Literal["detect", "preserve"] = "preserve" if mode == "preserve" else "detect"
+            signature = str(raw_group.get("signature", "") or "")
+            display_name = str(raw_group.get("display_name", "") or "")
+            raw_color = raw_group.get("color", [120, 120, 120])
+            color: ColorTuple = (120, 120, 120)
+            if isinstance(raw_color, (list, tuple)) and len(raw_color) >= 3:
+                try:
+                    color = (
+                        max(0, min(255, int(raw_color[0]))),
+                        max(0, min(255, int(raw_color[1]))),
+                        max(0, min(255, int(raw_color[2]))),
+                    )
+                except (TypeError, ValueError):
+                    color = (120, 120, 120)
+
+            detect_palette_colors: List[ColorTuple] = []
+            for raw_entry in raw_group.get("detect_palette_colors", []) or []:
+                if not isinstance(raw_entry, (list, tuple)) or len(raw_entry) < 3:
+                    continue
+                try:
+                    detect_palette_colors.append(
+                        (
+                            max(0, min(255, int(raw_entry[0]))),
+                            max(0, min(255, int(raw_entry[1]))),
+                            max(0, min(255, int(raw_entry[2]))),
+                        )
+                    )
+                except (TypeError, ValueError):
+                    continue
+            detect_palette_alphas: List[int] = []
+            for raw_alpha in raw_group.get("detect_palette_alphas", []) or []:
+                try:
+                    detect_palette_alphas.append(max(0, min(255, int(raw_alpha))))
+                except (TypeError, ValueError):
+                    continue
+            detect_palette_slot_ids: List[int] = []
+            for raw_slot in raw_group.get("detect_palette_slot_ids", []) or []:
+                try:
+                    detect_palette_slot_ids.append(int(raw_slot))
+                except (TypeError, ValueError):
+                    continue
+
+            restored_groups[normalized_group_id] = PaletteGroup(
+                group_id=normalized_group_id,
+                mode=mode_literal,
+                signature=signature,
+                display_name=display_name,
+                color=color,
+                member_keys=set(),
+                detect_palette_colors=detect_palette_colors,
+                detect_palette_alphas=detect_palette_alphas,
+                detect_palette_slot_ids=detect_palette_slot_ids,
+                canvas_width=max(1, int(raw_group.get("canvas_width", 304))),
+                canvas_height=max(1, int(raw_group.get("canvas_height", 224))),
+                offset_x=int(raw_group.get("offset_x", 0)),
+                offset_y=int(raw_group.get("offset_y", 0)),
+                canvas_override_enabled=bool(raw_group.get("canvas_override_enabled", False)),
+            )
+
+        if not restored_groups:
+            return False
+
+        self._palette_groups = restored_groups
+        for record in self.sprite_records.values():
+            record.group_id = None
+
+        raw_record_groups = payload.get("record_groups", {})
+        if isinstance(raw_record_groups, dict):
+            for source_key, raw_group_id in raw_record_groups.items():
+                runtime_key = source_to_runtime.get(str(source_key))
+                if runtime_key is None:
+                    continue
+                record = self.sprite_records.get(runtime_key)
+                group_id = str(raw_group_id or "").strip()
+                if record is None or not group_id or group_id not in self._palette_groups:
+                    continue
+                record.group_id = group_id
+
+        for group in self._palette_groups.values():
+            for source_key in payload.get("groups", {}).get(group.group_id, {}).get("member_sprite_ids", []):
+                runtime_key = source_to_runtime.get(str(source_key))
+                if runtime_key is None:
+                    continue
+                record = self.sprite_records.get(runtime_key)
+                if record is not None and (not record.group_id or record.group_id == group.group_id):
+                    record.group_id = group.group_id
+
+        for group in self._palette_groups.values():
+            group.member_keys.clear()
+        for runtime_key, record in self.sprite_records.items():
+            if record.group_id and record.group_id in self._palette_groups:
+                self._palette_groups[record.group_id].member_keys.add(runtime_key)
+
+        raw_group_key_to_id = payload.get("group_key_to_id", {})
+        restored_group_key_to_id: Dict[str, str] = {}
+        if isinstance(raw_group_key_to_id, dict):
+            for key, value in raw_group_key_to_id.items():
+                normalized_key = str(key)
+                normalized_group_id = str(value)
+                if normalized_group_id in self._palette_groups:
+                    restored_group_key_to_id[normalized_key] = normalized_group_id
+        self._group_key_to_id = restored_group_key_to_id
+
+        inferred_next_group_id = 1
+        for group_id in self._palette_groups.keys():
+            if group_id.startswith("G"):
+                try:
+                    inferred_next_group_id = max(inferred_next_group_id, int(group_id[1:]) + 1)
+                except ValueError:
+                    continue
+        try:
+            requested_next_group_id = int(payload.get("next_group_id", inferred_next_group_id))
+        except (TypeError, ValueError):
+            requested_next_group_id = inferred_next_group_id
+        self._next_group_id = max(1, inferred_next_group_id, requested_next_group_id)
+
+        self._refresh_group_overview()
+        self._update_canvas_inputs()
+        self._update_sprite_offset_controls(self._current_record())
+        logger.debug("Applied full group state from manifest groups=%s", len(self._palette_groups))
+        return True
+
     def _animation_tags_for_manifest_settings(self, runtime_to_source_key: Dict[str, str]) -> List[Dict[str, Any]]:
         payload: List[Dict[str, Any]] = []
         for tag in self._animation_tags.values():
@@ -7728,6 +12161,10 @@ class SpriteToolsWindow(QMainWindow):
                     state_label=tag.state_label,
                     frames=remapped_frames,
                     notes=tag.notes,
+                    color=tag.color,
+                    in_frame=int(tag.in_frame),
+                    out_frame=int(tag.out_frame),
+                    created_at_utc=str(tag.created_at_utc or ""),
                 ).to_dict()
             )
         return payload
@@ -7736,10 +12173,13 @@ class SpriteToolsWindow(QMainWindow):
         manifest = self._project_manifest
         if manifest is None:
             self._animation_tags = {}
+            self._animation_tag_slots = []
             if hasattr(self, "animation_tag_list"):
                 self._refresh_animation_tag_list()
             return
         raw = manifest.settings.get("animation_tags", [])
+        raw_slots = manifest.settings.get("animation_tag_slots", [])
+        raw_slot_count = manifest.settings.get("animation_list_slot_count", self._animation_list_slot_count)
         tags: Dict[str, AnimationTag] = {}
         if isinstance(raw, list):
             for item in raw:
@@ -7751,34 +12191,353 @@ class SpriteToolsWindow(QMainWindow):
                     continue
                 tags[parsed.tag_id] = parsed
         self._animation_tags = tags
+
+        slots: List[str | None] = []
+        if isinstance(raw_slots, list):
+            for slot in raw_slots:
+                if slot is None:
+                    slots.append(None)
+                    continue
+                tag_id = str(slot or "").strip()
+                if tag_id and tag_id in tags:
+                    slots.append(tag_id)
+        self._animation_tag_slots = slots
+
+        try:
+            self._animation_list_slot_count = max(1, min(512, int(raw_slot_count)))
+        except Exception:  # noqa: BLE001
+            self._animation_list_slot_count = max(1, min(512, int(self._animation_list_slot_count)))
+
+        self._normalize_animation_tag_sort_indices()
         logger.debug("Loaded animation tags count=%s", len(self._animation_tags))
+        if hasattr(self, "animation_list_slots_spin"):
+            blocked = self.animation_list_slots_spin.blockSignals(True)
+            self.animation_list_slots_spin.setValue(int(self._animation_list_slot_count))
+            self.animation_list_slots_spin.blockSignals(blocked)
         if hasattr(self, "animation_tag_list"):
             self._refresh_animation_tag_list()
+            self._update_animation_list_preview_timer_state()
+
+    def _ordered_animation_tag_ids(self) -> List[str]:
+        self._sync_animation_tag_slots_with_tags()
+        ordered_from_slots = [slot for slot in self._animation_tag_slots if isinstance(slot, str) and slot in self._animation_tags]
+        if ordered_from_slots:
+            return ordered_from_slots
+        return sorted(
+            self._animation_tags.keys(),
+            key=lambda key: (int(getattr(self._animation_tags[key], "sort_index", 0)), self._animation_tags[key].name.lower(), key),
+        )
+
+    def _sync_animation_tag_slots_with_tags(self) -> None:
+        desired_total = max(1, int(self._animation_list_slot_count))
+        if not self._animation_tags:
+            self._animation_tag_slots = [None] * desired_total
+            return
+        seen: set[str] = set()
+        normalized: List[str | None] = []
+        for slot in self._animation_tag_slots:
+            if slot is None:
+                normalized.append(None)
+                continue
+            tag_id = str(slot).strip()
+            if not tag_id or tag_id not in self._animation_tags or tag_id in seen:
+                continue
+            normalized.append(tag_id)
+            seen.add(tag_id)
+        for tag_id in sorted(
+            self._animation_tags.keys(),
+            key=lambda key: (int(getattr(self._animation_tags[key], "sort_index", 0)), self._animation_tags[key].name.lower(), key),
+        ):
+            if tag_id in seen:
+                continue
+            normalized.append(tag_id)
+            seen.add(tag_id)
+
+        desired_total = max(len(self._animation_tags), desired_total)
+        if len(normalized) < desired_total:
+            normalized.extend([None] * (desired_total - len(normalized)))
+        elif len(normalized) > desired_total:
+            trim_needed = len(normalized) - desired_total
+            idx = len(normalized) - 1
+            while trim_needed > 0 and idx >= 0:
+                if normalized[idx] is None:
+                    normalized.pop(idx)
+                    trim_needed -= 1
+                idx -= 1
+        self._animation_tag_slots = normalized
+
+    def _animation_tag_slots_for_manifest_settings(self) -> List[str | None]:
+        self._sync_animation_tag_slots_with_tags()
+        payload: List[str | None] = []
+        for slot in self._animation_tag_slots:
+            if slot is None:
+                payload.append(None)
+                continue
+            tag_id = str(slot).strip()
+            if tag_id and tag_id in self._animation_tags:
+                payload.append(tag_id)
+        return payload
+
+    def _normalize_animation_tag_sort_indices(self) -> None:
+        self._sync_animation_tag_slots_with_tags()
+        ordered_ids = self._ordered_animation_tag_ids()
+        now_iso = datetime.now(timezone.utc).isoformat()
+        for index, tag_id in enumerate(ordered_ids):
+            tag = self._animation_tags.get(tag_id)
+            if tag is None:
+                continue
+            tag.sort_index = int(index)
+            if not str(getattr(tag, "created_at_utc", "") or "").strip():
+                tag.created_at_utc = now_iso
+
+    def _selected_animation_tag_ids(self) -> List[str]:
+        selected: List[str] = []
+        for item in self.animation_tag_list.selectedItems():
+            tag_id = str(item.data(Qt.ItemDataRole.UserRole) or "").strip()
+            if tag_id and tag_id in self._animation_tags and tag_id not in selected:
+                selected.append(tag_id)
+        return selected
+
+    def _selected_sprite_keys_in_view_order(self) -> List[str]:
+        keys: List[str] = []
+        list_widget = self.images_panel.list_widget
+        for row in range(list_widget.count()):
+            item = list_widget.item(row)
+            if item is None or item.isHidden() or not item.isSelected():
+                continue
+            key = item.data(Qt.ItemDataRole.UserRole)
+            if not key:
+                continue
+            key_text = str(key)
+            if key_text in self.sprite_records:
+                keys.append(key_text)
+        return keys
+
+    def _preferred_new_animation_tag_slot_index(self) -> int:
+        self._sync_animation_tag_slots_with_tags()
+        slots = list(self._animation_tag_slots)
+        if not slots:
+            return 0
+
+        current_row = self.animation_tag_list.currentRow() if hasattr(self, "animation_tag_list") else -1
+        if 0 <= current_row < len(slots):
+            if slots[current_row] is None:
+                return int(current_row)
+            for idx in range(current_row + 1, len(slots)):
+                if slots[idx] is None:
+                    return int(idx)
+            return len(slots)
+
+        for idx, slot in enumerate(slots):
+            if slot is None:
+                return int(idx)
+        return len(slots)
+
+    def _animation_tag_slot_row_from_point(self, point: QPoint) -> int | None:
+        list_widget = self.animation_tag_list
+        item = list_widget.itemAt(point)
+        if item is not None:
+            return int(list_widget.row(item))
+        if list_widget.count() <= 0:
+            return 0
+        nearest_row = list_widget.currentRow() if list_widget.currentRow() >= 0 else 0
+        nearest_distance = 10**9
+        px = int(point.x())
+        py = int(point.y())
+        for row in range(list_widget.count()):
+            candidate = list_widget.item(row)
+            if candidate is None:
+                continue
+            rect = list_widget.visualItemRect(candidate)
+            if not rect.isValid():
+                continue
+            center = rect.center()
+            distance = abs(int(center.x()) - px) + abs(int(center.y()) - py)
+            if distance < nearest_distance:
+                nearest_distance = distance
+                nearest_row = row
+        return int(nearest_row)
+
+    def _insert_sprite_keys_into_animation_tag(
+        self,
+        tag: AnimationTag,
+        insert_index: int,
+        sprite_keys: Sequence[str],
+    ) -> int:
+        keys = [str(key) for key in sprite_keys if str(key) in self.sprite_records]
+        if not keys:
+            return 0
+        index = max(0, min(len(tag.frames), int(insert_index)))
+        new_frames = [AnimationFrameEntry(sprite_key=key, duration_frames=1, notes="") for key in keys]
+
+        self._record_history("animation-tags-before-insert-sprites", include_fields=["animation_tags"])
+        tag.frames = tag.frames[:index] + new_frames + tag.frames[index:]
+        self._refresh_animation_frame_list()
+
+        selection_model = self.animation_frame_list.selectionModel()
+        if selection_model is not None:
+            selection_model.clearSelection()
+            for frame_row in range(index, index + len(new_frames)):
+                item_row = self._timeline_row_for_frame_index(frame_row)
+                if item_row is None:
+                    continue
+                idx = self.animation_frame_list.model().index(item_row, 0)
+                selection_model.select(idx, QItemSelectionModel.SelectionFlag.Select)
+            first_row = self._timeline_row_for_frame_index(index)
+            if first_row is not None:
+                self._set_animation_timeline_current_row(first_row, preserve_selection=True)
+
+        if not self.animation_play_btn.isChecked():
+            self._set_animation_playhead_from_selected_frame()
+        self._record_history("animation-tags-insert-sprites", include_fields=["animation_tags"], force=True)
+        self._mark_project_dirty("animation-tags-insert-sprites")
+        return len(new_frames)
+
+    def _sprite_list_is_drop_source(self, event) -> bool:
+        source_widget = event.source() if hasattr(event, "source") else None
+        return source_widget is self.images_panel.list_widget or source_widget is self.images_panel.list_widget.viewport()
 
     def _refresh_animation_tag_list(self) -> None:
         list_widget = self.animation_tag_list
         current_item = list_widget.currentItem()
         selected_id = str(current_item.data(Qt.ItemDataRole.UserRole)) if current_item is not None else ""
+        selected_ids = set(self._selected_animation_tag_ids())
+        search_text = str(self._animation_list_search_query or "").strip().lower()
+        icon_side = self._animation_list_icon_side()
+        padding = max(0, int(self._animation_list_padding))
+        self._sync_animation_tag_slots_with_tags()
+        self._animation_tag_list_syncing = True
         blocked = list_widget.blockSignals(True)
         list_widget.clear()
-        for tag_id in sorted(self._animation_tags.keys(), key=lambda key: self._animation_tags[key].name.lower()):
-            tag = self._animation_tags[tag_id]
+        for slot in self._animation_tag_slots:
+            if slot is None:
+                if search_text:
+                    continue
+                empty_item = QListWidgetItem("— Empty —")
+                empty_item.setData(_ANIM_TAG_SLOT_KIND_ROLE, "empty")
+                empty_item.setData(Qt.ItemDataRole.UserRole, "")
+                empty_item.setFlags(
+                    Qt.ItemFlag.ItemIsEnabled
+                    | Qt.ItemFlag.ItemIsSelectable
+                    | Qt.ItemFlag.ItemIsDropEnabled
+                )
+                empty_item.setBackground(QColor(42, 42, 42, 65))
+                empty_item.setForeground(QColor(165, 165, 165))
+                if self._animation_list_view_mode == "grid":
+                    empty_item.setTextAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter)
+                    empty_item.setSizeHint(QSize(max(icon_side + (padding * 2), icon_side + 16), max(icon_side + (padding * 2) + 24, icon_side + 36)))
+                else:
+                    empty_item.setSizeHint(QSize(0, max(icon_side + (padding * 2), icon_side + 10)))
+                list_widget.addItem(empty_item)
+                continue
+
+            tag_id = str(slot).strip()
+            tag = self._animation_tags.get(tag_id)
+            if tag is None:
+                continue
+            if search_text:
+                haystack = f"{tag.name} {tag.state_label} {tag.notes}".lower()
+                if search_text not in haystack:
+                    continue
             label = f"{tag.name} ({len(tag.frames)})"
             item = QListWidgetItem(label)
             item.setData(Qt.ItemDataRole.UserRole, tag.tag_id)
-            item.setToolTip(f"State: {tag.state_label or '—'}\nFrames: {len(tag.frames)}")
+            item.setData(_ANIM_TAG_SLOT_KIND_ROLE, "tag")
+            item.setFlags(
+                Qt.ItemFlag.ItemIsEnabled
+                | Qt.ItemFlag.ItemIsSelectable
+                | Qt.ItemFlag.ItemIsDragEnabled
+                | Qt.ItemFlag.ItemIsDropEnabled
+            )
+            tag_color = AnimationTag._parse_color(tag.color)
+            item.setBackground(QColor(tag_color[0], tag_color[1], tag_color[2], 82))
+            item.setToolTip(
+                f"State: {tag.state_label or '—'}\n"
+                f"Frames: {len(tag.frames)}\n"
+                f"Color: rgb({tag_color[0]}, {tag_color[1]}, {tag_color[2]})"
+            )
+            if self._animation_list_view_mode == "grid":
+                item.setTextAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop)
+                item.setSizeHint(QSize(max(icon_side + (padding * 2), icon_side + 16), max(icon_side + (padding * 2) + 24, icon_side + 36)))
+            else:
+                item.setSizeHint(QSize(0, max(icon_side + (padding * 2), icon_side + 10)))
             list_widget.addItem(item)
+            if tag.tag_id in selected_ids:
+                item.setSelected(True)
             if selected_id and tag.tag_id == selected_id:
                 list_widget.setCurrentItem(item)
         if list_widget.currentItem() is None and list_widget.count() > 0:
             list_widget.setCurrentRow(0)
         list_widget.blockSignals(blocked)
+        self._animation_tag_list_syncing = False
+        logger.debug(
+            "anim.tag refresh search=%s item_count=%s model_count=%s selected=%s current=%s",
+            str(search_text),
+            int(list_widget.count()),
+            len(self._animation_tags),
+            len(self._selected_animation_tag_ids()),
+            str(list_widget.currentItem().data(Qt.ItemDataRole.UserRole)) if list_widget.currentItem() is not None else "",
+        )
+        self._refresh_visible_animation_tag_icons(animated=False)
         self._update_animation_tag_controls()
+        self._update_animation_list_preview_timer_state()
+
+    def _animation_list_preview_icon_for_tag(self, tag: AnimationTag, *, phase: int = 0) -> QIcon | None:
+        if not tag.frames:
+            return None
+        frame_count = len(tag.frames)
+        if frame_count <= 0:
+            return None
+        index = int(phase) % frame_count
+        frame = tag.frames[index]
+        runtime_key = self._resolve_animation_runtime_key(frame.sprite_key)
+        if runtime_key is None:
+            return None
+        record = self.sprite_records.get(runtime_key)
+        if record is None:
+            return None
+        pixmap = self._get_animation_preview_pixmap(record)
+        if pixmap is None:
+            return None
+        side = self._animation_list_icon_side()
+        icon_size = QSize(side, side)
+        thumb = pixmap.scaled(icon_size, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.FastTransformation)
+        return QIcon(thumb)
+
+    def _refresh_visible_animation_tag_icons(self, *, animated: bool) -> None:
+        if not hasattr(self, "animation_tag_list"):
+            return
+        list_widget = self.animation_tag_list
+        viewport_rect = list_widget.viewport().rect()
+        if viewport_rect.isEmpty():
+            return
+        phase = int(self._animation_list_preview_phase) if animated else 0
+        for row in range(list_widget.count()):
+            item = list_widget.item(row)
+            if item is None:
+                continue
+            if str(item.data(_ANIM_TAG_SLOT_KIND_ROLE) or "") == "empty":
+                item.setIcon(QIcon())
+                continue
+            rect = list_widget.visualItemRect(item)
+            if not rect.isValid() or not rect.intersects(viewport_rect):
+                continue
+            tag_id = str(item.data(Qt.ItemDataRole.UserRole) or "").strip()
+            tag = self._animation_tags.get(tag_id)
+            if tag is None:
+                item.setIcon(QIcon())
+                continue
+            icon = self._animation_list_preview_icon_for_tag(tag, phase=phase)
+            if icon is None:
+                item.setIcon(QIcon())
+                continue
+            item.setIcon(icon)
 
     def _refresh_animation_frame_list(self) -> None:
         frame_list = self.animation_frame_list
         tag = self._selected_animation_tag()
         self._sync_animation_timeline_range_controls(tag)
+        selected_frame_rows = self._selected_animation_frame_rows()
         selected_frame_index = self._selected_animation_frame_index()
         zoom_scale = max(0.50, min(2.20, float(self._animation_timeline_zoom) / 100.0))
         icon_side = max(38, min(90, int(round(52 * zoom_scale))))
@@ -7851,15 +12610,30 @@ class SpriteToolsWindow(QMainWindow):
                 frame_widths.append(self._animation_timeline_frame_block_width(tail_gap))
                 frame_durations.append(tail_gap)
         if frame_list.count() > 0:
+            restored_selection_rows: List[int] = []
+            selection_model = frame_list.selectionModel()
+            if selection_model is not None and selected_frame_rows:
+                selection_model.clearSelection()
+                for frame_index in selected_frame_rows:
+                    selected_row = self._timeline_row_for_frame_index(frame_index)
+                    if selected_row is None:
+                        continue
+                    idx = frame_list.model().index(selected_row, 0)
+                    selection_model.select(idx, QItemSelectionModel.SelectionFlag.Select)
+                    restored_selection_rows.append(selected_row)
+
+            current_row: int | None = None
             if selected_frame_index is not None:
-                selected_row = self._timeline_row_for_frame_index(selected_frame_index)
-                if selected_row is not None:
-                    frame_list.setCurrentRow(selected_row)
+                current_row = self._timeline_row_for_frame_index(selected_frame_index)
+            if current_row is None and restored_selection_rows:
+                current_row = restored_selection_rows[0]
+            if current_row is not None:
+                self._set_animation_timeline_current_row(current_row, preserve_selection=bool(restored_selection_rows))
             if frame_list.currentItem() is None:
                 for row in range(frame_list.count()):
                     item = frame_list.item(row)
                     if item is not None and str(item.data(_TIMELINE_ITEM_KIND_ROLE) or "") == "frame":
-                        frame_list.setCurrentRow(row)
+                        self._set_animation_timeline_current_row(row)
                         break
         frame_list.blockSignals(blocked)
         self._animation_frame_list_syncing = False
@@ -7962,6 +12736,22 @@ class SpriteToolsWindow(QMainWindow):
             return rows
         frame_index = self._selected_animation_frame_index()
         return [frame_index] if frame_index is not None else []
+
+    def _set_animation_timeline_current_row(self, item_row: int, *, preserve_selection: bool = False) -> None:
+        row = int(item_row)
+        if row < 0:
+            return
+        model = self.animation_frame_list.model()
+        if model is None:
+            return
+        index = model.index(row, 0)
+        if not index.isValid():
+            return
+        selection_model = self.animation_frame_list.selectionModel()
+        if preserve_selection and selection_model is not None:
+            selection_model.setCurrentIndex(index, QItemSelectionModel.SelectionFlag.NoUpdate)
+            return
+        self.animation_frame_list.setCurrentRow(row)
 
     def _selected_animation_tag(self) -> AnimationTag | None:
         item = self.animation_tag_list.currentItem()
@@ -8205,7 +12995,13 @@ class SpriteToolsWindow(QMainWindow):
         viewport = self.animation_frame_list.viewport()
         if count <= 0:
             return 0, 0
-        item = self.animation_frame_list.itemAt(point)
+        viewport_w = max(1, int(viewport.width()))
+        viewport_h = max(1, int(viewport.height()))
+        clamped_point = QPoint(
+            max(0, min(int(point.x()), viewport_w - 1)),
+            max(0, min(int(point.y()), viewport_h - 1)),
+        )
+        item = self.animation_frame_list.itemAt(clamped_point)
         if item is not None:
             kind = str(item.data(_TIMELINE_ITEM_KIND_ROLE) or "")
             rect = self.animation_frame_list.visualItemRect(item)
@@ -8214,7 +13010,7 @@ class SpriteToolsWindow(QMainWindow):
                     frame_index = int(item.data(Qt.ItemDataRole.UserRole))
                 except (TypeError, ValueError):
                     frame_index = 0
-                before = int(point.x()) < int(rect.center().x())
+                before = int(clamped_point.x()) < int(rect.center().x())
                 return (frame_index if before else frame_index + 1), (rect.left() if before else rect.right() + 1)
             if kind == "gap":
                 for row in range(self.animation_frame_list.row(item) + 1, count):
@@ -8228,7 +13024,7 @@ class SpriteToolsWindow(QMainWindow):
                     except (TypeError, ValueError):
                         frame_index = 0
                     return frame_index, rect.left()
-                marker_x = max(rect.left(), min(int(point.x()), rect.right() + 1))
+                marker_x = max(rect.left(), min(int(clamped_point.x()), rect.right() + 1))
                 frame_total = 0
                 for scan_row in range(count):
                     scan_item = self.animation_frame_list.item(scan_row)
@@ -8250,11 +13046,18 @@ class SpriteToolsWindow(QMainWindow):
             return 0, 0
         first_rect = self.animation_frame_list.visualItemRect(first_item)
         last_rect = self.animation_frame_list.visualItemRect(last_item)
-        if point.x() <= first_rect.left():
+        if clamped_point.x() <= first_rect.left():
             return 0, first_rect.left()
-        if point.x() >= last_rect.right():
+        if clamped_point.x() >= last_rect.right():
             return len(frame_rows), last_rect.right() + 1
-        return len(frame_rows), min(max(int(point.x()), 0), viewport.width() - 1)
+        for insert_index, row in enumerate(frame_rows):
+            frame_item = self.animation_frame_list.item(row)
+            if frame_item is None:
+                continue
+            frame_rect = self.animation_frame_list.visualItemRect(frame_item)
+            if clamped_point.x() < frame_rect.center().x():
+                return insert_index, frame_rect.left()
+        return len(frame_rows), last_rect.right() + 1
 
     def _apply_animation_manual_resize_delta(self, row: int, edge: Literal["left", "right"], delta_frames: int) -> bool:
         tag = self._selected_animation_tag()
@@ -8644,7 +13447,7 @@ class SpriteToolsWindow(QMainWindow):
         frame = tag.frames[frame_index]
         runtime_key = self._resolve_animation_runtime_key(frame.sprite_key)
         if runtime_key is not None:
-            self._set_animation_preview_frame_by_key(runtime_key, source="seek-playhead")
+            self._set_animation_preview_frame_by_key(runtime_key, source="seek-playhead", sync_palette=True)
         self._animation_preview_frame_index = frame_index
         self._animation_preview_subframe_step = max(0, min(max(0, max(1, int(frame.duration_frames)) - 1), int(frame_step)))
         self._animation_preview_displayed_frame_index = frame_index
@@ -8662,15 +13465,255 @@ class SpriteToolsWindow(QMainWindow):
                 return candidate
             next_index += 1
 
+    def _on_animation_tag_list_selection_changed(self) -> None:
+        self._update_animation_tag_controls()
+
+    def _on_animation_tag_drop_reorder(self, source_row: int, target_row: int, mode: str) -> None:
+        if self._animation_tag_list_syncing:
+            return
+        if str(self._animation_list_search_query or "").strip():
+            self.statusBar().showMessage("Clear search filter before drag reordering tags", 2500)
+            self._refresh_animation_tag_list()
+            return
+
+        self._sync_animation_tag_slots_with_tags()
+        slots = list(self._animation_tag_slots)
+        if not slots:
+            return
+        src = max(0, min(int(source_row), len(slots) - 1))
+        dst = max(0, min(int(target_row), len(slots) - 1))
+        if src == dst and mode == "swap":
+            return
+        moving = slots[src]
+        if moving is None:
+            return
+        if slots[dst] is None:
+            mode = "swap"
+
+        self._record_history("animation-tags-before-reorder-dnd", include_fields=["animation_tags"], force=True)
+        logger.debug("anim.tag drop_reorder src=%s dst=%s mode=%s slots=%s", src, dst, mode, len(slots))
+
+        if mode == "swap":
+            slots[src], slots[dst] = slots[dst], slots[src]
+        else:
+            value = slots.pop(src)
+            insert_at = dst
+            if src < dst:
+                insert_at -= 1
+            if mode == "after":
+                insert_at += 1
+            insert_at = max(0, min(insert_at, len(slots)))
+            slots.insert(insert_at, value)
+
+        self._animation_tag_slots = slots
+        self._sync_animation_tag_slots_with_tags()
+        ordered_ids = [slot for slot in self._animation_tag_slots if isinstance(slot, str) and slot in self._animation_tags]
+        logger.debug("anim.tag drop_reorder order_after=%s", ordered_ids)
+        for index, tag_id in enumerate(ordered_ids):
+            tag = self._animation_tags.get(tag_id)
+            if tag is not None:
+                tag.sort_index = int(index)
+        self._normalize_animation_tag_sort_indices()
+        self._refresh_animation_tag_list()
+        QTimer.singleShot(0, self._refresh_animation_tag_list)
+        self._record_history("animation-tags-reorder-dnd", include_fields=["animation_tags"], force=True)
+        self._mark_project_dirty("animation-tags-reorder-dnd")
+
+    def _on_animation_tag_rows_about_to_be_moved(self, *args: Any) -> None:
+        if self._animation_tag_list_syncing:
+            return
+        self._animation_tag_order_before_drag = list(self._ordered_animation_tag_ids())
+        before_preview = self._animation_tag_order_before_drag[:20]
+        logger.debug(
+            "anim.tag reorder_about_to_move args=%s count=%s preview=%s more=%s search=%s",
+            args,
+            len(self._animation_tag_order_before_drag),
+            before_preview,
+            max(0, len(self._animation_tag_order_before_drag) - len(before_preview)),
+            str(self._animation_list_search_query or "").strip(),
+        )
+
+    def _on_animation_tag_rows_moved(self, *args: Any) -> None:
+        if self._animation_tag_list_syncing:
+            return
+        logger.debug("anim.tag reorder_rows_moved args=%s", args)
+        if str(self._animation_list_search_query or "").strip():
+            logger.debug("anim.tag reorder_blocked reason=active-search")
+            self._refresh_animation_tag_list()
+            self.statusBar().showMessage("Clear search filter before drag reordering tags", 2500)
+            self._animation_tag_order_before_drag = None
+            return
+        all_ids_source = list(self._ordered_animation_tag_ids())
+        if self._animation_tag_order_before_drag and len(self._animation_tag_order_before_drag) == len(all_ids_source):
+            all_ids_source = list(self._animation_tag_order_before_drag)
+        if not all_ids_source:
+            self._animation_tag_order_before_drag = None
+            return
+
+        for index, tag_id in enumerate(all_ids_source):
+            tag = self._animation_tags.get(tag_id)
+            if tag is not None:
+                tag.sort_index = int(index)
+        self._normalize_animation_tag_sort_indices()
+        self._record_history("animation-tags-before-reorder-dnd", include_fields=["animation_tags"], force=True)
+
+        combined: List[str] = list(all_ids_source)
+        start_row = int(args[1]) if len(args) >= 2 else -1
+        end_row = int(args[2]) if len(args) >= 3 else -1
+        destination_child = int(args[4]) if len(args) >= 5 else -1
+        move_count = (end_row - start_row) + 1 if start_row >= 0 and end_row >= start_row else 0
+
+        if move_count > 0 and destination_child >= 0:
+            moved_block = list(all_ids_source[start_row : end_row + 1])
+            remaining_ids = [tag_id for index, tag_id in enumerate(all_ids_source) if not (start_row <= index <= end_row)]
+            insert_at = int(destination_child)
+            if destination_child > start_row:
+                insert_at -= move_count
+            insert_at = max(0, min(insert_at, len(remaining_ids)))
+            combined = remaining_ids[:insert_at] + moved_block + remaining_ids[insert_at:]
+            logger.debug(
+                "anim.tag reorder_normalized start=%s end=%s dest=%s insert=%s moved=%s",
+                start_row,
+                end_row,
+                destination_child,
+                insert_at,
+                moved_block,
+            )
+        else:
+            logger.error(
+                "anim.tag reorder_invalid_indices start=%s end=%s dest=%s source_count=%s",
+                start_row,
+                end_row,
+                destination_child,
+                len(all_ids_source),
+            )
+
+        combined_unique_count = len(set(combined))
+        source_unique_count = len(set(all_ids_source))
+        model_count = len(self._animation_tags)
+        if combined_unique_count != model_count or source_unique_count != model_count:
+            logger.error(
+                "anim.tag reorder_integrity_fail combined_unique=%s source_unique=%s model_count=%s; restoring previous order",
+                combined_unique_count,
+                source_unique_count,
+                model_count,
+            )
+            combined = list(all_ids_source)
+        for index, tag_id in enumerate(combined):
+            tag = self._animation_tags.get(tag_id)
+            if tag is not None:
+                tag.sort_index = int(index)
+        self._normalize_animation_tag_sort_indices()
+        self._refresh_animation_tag_list()
+
+        after_ids = self._ordered_animation_tag_ids()
+        logger.debug(
+            "anim.tag reorder_after count=%s preview=%s more=%s",
+            len(after_ids),
+            after_ids[:20],
+            max(0, len(after_ids) - min(20, len(after_ids))),
+        )
+        if len(after_ids) != len(self._animation_tags):
+            logger.error(
+                "anim.tag reorder_post_refresh_mismatch after_count=%s model_count=%s; forcing restore",
+                len(after_ids),
+                len(self._animation_tags),
+            )
+            for index, tag_id in enumerate(all_ids_source):
+                tag = self._animation_tags.get(tag_id)
+                if tag is not None:
+                    tag.sort_index = int(index)
+            self._normalize_animation_tag_sort_indices()
+            self._refresh_animation_tag_list()
+            self._animation_tag_order_before_drag = None
+            return
+
+        self._record_history("animation-tags-reorder-dnd", include_fields=["animation_tags"], force=True)
+        self._mark_project_dirty("animation-tags-reorder-dnd")
+        self._animation_tag_order_before_drag = None
+
+    def _sort_selected_animation_tags(self) -> None:
+        selected_ids = self._selected_animation_tag_ids()
+        if len(selected_ids) <= 1:
+            self.statusBar().showMessage("Select at least two animation tags to sort", 2200)
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Sort Selection")
+        layout = QFormLayout(dialog)
+
+        criterion_combo = QComboBox(dialog)
+        criterion_combo.addItem("Name", "name")
+        criterion_combo.addItem("Date Created", "created")
+        criterion_combo.addItem("Animation Duration", "duration")
+
+        order_combo = QComboBox(dialog)
+        order_combo.addItem("Ascending", "asc")
+        order_combo.addItem("Descending", "desc")
+
+        layout.addRow("Sort by", criterion_combo)
+        layout.addRow("Order", order_combo)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel, parent=dialog)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addRow(buttons)
+
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        criterion = str(criterion_combo.currentData() or "name")
+        descending = str(order_combo.currentData() or "asc") == "desc"
+
+        def sort_key(tag_id: str) -> Any:
+            tag = self._animation_tags[tag_id]
+            if criterion == "duration":
+                return int(self._animation_tag_total_timeline_frames(tag))
+            if criterion == "created":
+                stamp = str(getattr(tag, "created_at_utc", "") or "")
+                return (stamp, int(getattr(tag, "sort_index", 0)))
+            return _natural_sort_parts(str(tag.name or ""))
+
+        ordered_ids = self._ordered_animation_tag_ids()
+        selected_set = set(selected_ids)
+        selected_ordered = [tag_id for tag_id in ordered_ids if tag_id in selected_set]
+        selected_sorted = sorted(selected_ordered, key=sort_key, reverse=descending)
+        selected_positions = [index for index, tag_id in enumerate(ordered_ids) if tag_id in selected_set]
+        for position, tag_id in zip(selected_positions, selected_sorted):
+            ordered_ids[position] = tag_id
+        self._sync_animation_tag_slots_with_tags()
+        sorted_iter = iter(ordered_ids)
+        rebuilt_slots: List[str | None] = []
+        for slot in self._animation_tag_slots:
+            if slot is None:
+                rebuilt_slots.append(None)
+            else:
+                rebuilt_slots.append(next(sorted_iter, slot))
+        self._animation_tag_slots = rebuilt_slots
+        for index, tag_id in enumerate(ordered_ids):
+            tag = self._animation_tags.get(tag_id)
+            if tag is not None:
+                tag.sort_index = int(index)
+
+        self._refresh_animation_tag_list()
+        self._record_history("animation-tags-sort-selection", include_fields=["animation_tags"], force=True)
+        self._mark_project_dirty("animation-tags-sort-selection")
+
     def _update_animation_tag_controls(self) -> None:
         tag = self._selected_animation_tag()
         has_tag = tag is not None
+        selected_tag_ids = self._selected_animation_tag_ids()
+        has_selected_tags = len(selected_tag_ids) > 0
         selected_count = len(self.images_panel.list_widget.selectedItems())
-        self.animation_tag_delete_btn.setEnabled(has_tag)
+        self.animation_tag_delete_btn.setEnabled(has_selected_tags)
+        self.animation_tag_sort_selection_btn.setEnabled(len(selected_tag_ids) > 1)
+        self.animation_tag_color_btn.setEnabled(has_tag)
         self.animation_assign_selected_btn.setEnabled(has_tag and selected_count > 0)
         self.animation_clear_frames_btn.setEnabled(has_tag and bool(tag.frames if tag else False))
         self.animation_prewarm_btn.setEnabled(has_tag and bool(tag.frames if tag else False))
         self.animation_frame_delete_btn.setEnabled(has_tag and bool(tag.frames if tag else False))
+        if hasattr(self, "animation_pivot_assist_btn"):
+            self.animation_pivot_assist_btn.setEnabled(has_tag and bool(tag.frames if tag else False))
         self._sync_animation_timeline_range_controls(tag)
         self._refresh_animation_frame_list()
         if not has_tag:
@@ -8704,8 +13747,33 @@ class SpriteToolsWindow(QMainWindow):
         current: QListWidgetItem | None,
         previous: QListWidgetItem | None,
     ) -> None:
+        is_frame_selection = bool(current is not None and str(current.data(_TIMELINE_ITEM_KIND_ROLE) or "") == "frame")
+
+        if is_frame_selection and self._preview_view_mode != "animation_assist":
+            self._preview_view_mode = "animation_assist"
+            self._sync_preview_context_controls()
+            self._save_preview_ui_settings()
+
         if not self.animation_play_btn.isChecked():
-            self._set_animation_playhead_from_selected_frame()
+            if is_frame_selection:
+                tag = self._selected_animation_tag()
+                frame_index = self._selected_animation_frame_index()
+                if tag is not None and frame_index is not None and 0 <= frame_index < len(tag.frames):
+                    position = self._animation_frame_start_offset(tag, int(frame_index))
+                    self._seek_animation_playhead(float(position), from_user_scrub=False)
+                else:
+                    self._set_animation_playhead_from_selected_frame()
+            else:
+                self._set_animation_playhead_from_selected_frame()
+        elif is_frame_selection:
+            try:
+                frame_index = int(current.data(Qt.ItemDataRole.UserRole)) if current is not None else -1
+            except (TypeError, ValueError):
+                frame_index = -1
+            tag = self._selected_animation_tag()
+            if tag is not None and 0 <= frame_index < len(tag.frames):
+                runtime_key = self._resolve_animation_runtime_key(tag.frames[frame_index].sprite_key)
+                self._refresh_palette_for_runtime_key(runtime_key)
         self._update_animation_tag_controls()
 
     def _on_animation_frame_duration_changed(self, value: int) -> None:
@@ -8733,7 +13801,7 @@ class SpriteToolsWindow(QMainWindow):
             if changed_rows:
                 current_row = self._timeline_row_for_frame_index(changed_rows[0])
                 if current_row is not None:
-                    self.animation_frame_list.setCurrentRow(current_row)
+                    self._set_animation_timeline_current_row(current_row, preserve_selection=True)
         if not self.animation_play_btn.isChecked():
             self._set_animation_playhead_from_selected_frame()
         self._record_history("animation-tags-duration", include_fields=["animation_tags"], force=True)
@@ -8751,7 +13819,7 @@ class SpriteToolsWindow(QMainWindow):
         tag = self._selected_animation_tag()
         if tag is None or not tag.frames:
             return
-        selected_rows = sorted({index.row() for index in self.animation_frame_list.selectedIndexes()})
+        selected_rows = self._selected_animation_frame_rows()
         if not selected_rows:
             frame_index = self._selected_animation_frame_index()
             if frame_index is None:
@@ -8766,13 +13834,136 @@ class SpriteToolsWindow(QMainWindow):
         if self._animation_preview_tag_id == tag.tag_id and not tag.frames:
             self._stop_animation_preview()
         self._refresh_animation_frame_list()
-        if self.animation_frame_list.count() > 0:
-            target_row = max(0, min(selected_rows[0], self.animation_frame_list.count() - 1))
-            self.animation_frame_list.setCurrentRow(target_row)
+        if tag.frames:
+            target_frame_index = max(0, min(selected_rows[0], len(tag.frames) - 1))
+            target_row = self._timeline_row_for_frame_index(target_frame_index)
+            if target_row is not None:
+                self.animation_frame_list.setCurrentRow(target_row)
         if not self.animation_play_btn.isChecked():
             self._set_animation_playhead_from_selected_frame()
         self._record_history("animation-tags-delete-frames", include_fields=["animation_tags"], force=True)
         self._mark_project_dirty("animation-tags-delete-frames")
+
+    def _clone_animation_frame_entry(self, frame: AnimationFrameEntry) -> AnimationFrameEntry:
+        return AnimationFrameEntry(
+            sprite_key=str(frame.sprite_key),
+            duration_frames=max(1, int(frame.duration_frames)),
+            gap_before_frames=max(0, int(getattr(frame, "gap_before_frames", 0))),
+            notes=str(frame.notes or ""),
+        )
+
+    def _animation_insert_index_from_playhead(self, tag: AnimationTag) -> int:
+        if not tag.frames:
+            return 0
+        if self._animation_playhead_frame is None:
+            selected = self._selected_animation_frame_index()
+            if selected is None:
+                return len(tag.frames)
+            return max(0, min(len(tag.frames), int(selected) + 1))
+
+        cursor = max(0.0, float(self._animation_playhead_frame))
+        elapsed = 0.0
+        for index, frame in enumerate(tag.frames):
+            gap = float(self._animation_frame_gap_before(frame))
+            duration = float(max(1, int(frame.duration_frames)))
+            frame_start = elapsed + gap
+            frame_end = frame_start + duration
+            if cursor < frame_start:
+                return index
+            if frame_start <= cursor < frame_end:
+                return index + 1
+            elapsed = frame_end
+        return len(tag.frames)
+
+    def _copy_selected_animation_frames(self) -> None:
+        tag = self._selected_animation_tag()
+        rows = self._selected_animation_frame_rows()
+        if tag is None or not rows:
+            return
+        copied: List[AnimationFrameEntry] = []
+        for row in rows:
+            if row < 0 or row >= len(tag.frames):
+                continue
+            copied.append(self._clone_animation_frame_entry(tag.frames[row]))
+        if not copied:
+            return
+        self._animation_frame_clipboard = copied
+        self.statusBar().showMessage(f"Copied {len(copied)} frame(s)", 2000)
+
+    def _paste_animation_frames_at_playhead(self) -> None:
+        tag = self._selected_animation_tag()
+        if tag is None:
+            return
+        if not self._animation_frame_clipboard:
+            self.statusBar().showMessage("Timeline clipboard is empty", 2000)
+            return
+
+        insert_index = self._animation_insert_index_from_playhead(tag)
+        paste_frames = [self._clone_animation_frame_entry(frame) for frame in self._animation_frame_clipboard]
+        if not paste_frames:
+            return
+        paste_frames[0].gap_before_frames = 0
+
+        self._record_history("animation-tags-before-paste", include_fields=["animation_tags"])
+        tag.frames = tag.frames[:insert_index] + paste_frames + tag.frames[insert_index:]
+        self._refresh_animation_frame_list()
+
+        selection_model = self.animation_frame_list.selectionModel()
+        if selection_model is not None:
+            selection_model.clearSelection()
+            for frame_row in range(insert_index, insert_index + len(paste_frames)):
+                item_row = self._timeline_row_for_frame_index(frame_row)
+                if item_row is None:
+                    continue
+                index = self.animation_frame_list.model().index(item_row, 0)
+                selection_model.select(index, QItemSelectionModel.SelectionFlag.Select)
+            current_row = self._timeline_row_for_frame_index(insert_index)
+            if current_row is not None:
+                self._set_animation_timeline_current_row(current_row, preserve_selection=True)
+
+        if not self.animation_play_btn.isChecked():
+            self._set_animation_playhead_from_selected_frame()
+        self._record_history("animation-tags-paste", include_fields=["animation_tags"], force=True)
+        self._mark_project_dirty("animation-tags-paste")
+        self.statusBar().showMessage(f"Pasted {len(paste_frames)} frame(s)", 2500)
+
+    def _duplicate_animation_frames_to_index(self, rows: Sequence[int], insert_index: int) -> bool:
+        tag = self._selected_animation_tag()
+        if tag is None:
+            return False
+        valid_rows = sorted({int(row) for row in rows if 0 <= int(row) < len(tag.frames)})
+        if not valid_rows:
+            return False
+        insert_index = max(0, min(len(tag.frames), int(insert_index)))
+
+        duplicates = [self._clone_animation_frame_entry(tag.frames[row]) for row in valid_rows]
+        if not duplicates:
+            return False
+        duplicates[0].gap_before_frames = 0
+
+        self._record_history("animation-tags-before-duplicate", include_fields=["animation_tags"])
+        tag.frames = tag.frames[:insert_index] + duplicates + tag.frames[insert_index:]
+        self._refresh_animation_frame_list()
+
+        selection_model = self.animation_frame_list.selectionModel()
+        if selection_model is not None:
+            selection_model.clearSelection()
+            for frame_row in range(insert_index, insert_index + len(duplicates)):
+                item_row = self._timeline_row_for_frame_index(frame_row)
+                if item_row is None:
+                    continue
+                idx = self.animation_frame_list.model().index(item_row, 0)
+                selection_model.select(idx, QItemSelectionModel.SelectionFlag.Select)
+            current_row = self._timeline_row_for_frame_index(insert_index)
+            if current_row is not None:
+                self._set_animation_timeline_current_row(current_row, preserve_selection=True)
+
+        if not self.animation_play_btn.isChecked():
+            self._set_animation_playhead_from_selected_frame()
+        self._record_history("animation-tags-duplicate", include_fields=["animation_tags"], force=True)
+        self._mark_project_dirty("animation-tags-duplicate")
+        self.statusBar().showMessage(f"Duplicated {len(duplicates)} frame(s)", 2500)
+        return True
 
     def _move_selected_animation_frame(self, delta: int) -> None:
         if delta == 0:
@@ -8854,37 +14045,146 @@ class SpriteToolsWindow(QMainWindow):
                 warmed += 1
         self.statusBar().showMessage(f"Animation prewarm complete: {warmed}/{len(tag.frames)} frame(s)", 2500)
 
-    def _create_animation_tag(self) -> None:
+    def _create_animation_tag(
+        self,
+        initial_sprite_keys: Sequence[str] | None = None,
+        *,
+        target_slot_override: int | None = None,
+    ) -> None:
         name, accepted = QInputDialog.getText(self, "New Animation Tag", "Tag name:")
         if not accepted:
             return
         text = str(name).strip()
         if not text:
             return
+
+        sprite_keys = [str(key) for key in (initial_sprite_keys or []) if str(key) in self.sprite_records]
         tag_id = self._next_animation_tag_id()
+        next_sort_index = len(self._animation_tags)
+        if target_slot_override is None:
+            target_slot = self._preferred_new_animation_tag_slot_index()
+        else:
+            target_slot = max(0, int(target_slot_override))
+        out_frame = max(1, len(sprite_keys))
+        created_at = datetime.now(timezone.utc).isoformat()
         self._record_history("animation-tags-before-create", include_fields=["animation_tags"])
-        self._animation_tags[tag_id] = AnimationTag(tag_id=tag_id, name=text)
+        self._animation_tags[tag_id] = AnimationTag(
+            tag_id=tag_id,
+            name=text,
+            frames=[AnimationFrameEntry(sprite_key=key, duration_frames=1, notes="") for key in sprite_keys],
+            in_frame=0,
+            out_frame=int(out_frame),
+            sort_index=int(next_sort_index),
+            created_at_utc=created_at,
+        )
+
+        self._sync_animation_tag_slots_with_tags()
+        if target_slot >= len(self._animation_tag_slots):
+            self._animation_tag_slots.extend([None] * (target_slot - len(self._animation_tag_slots) + 1))
+        if 0 <= target_slot < len(self._animation_tag_slots):
+            self._animation_tag_slots[target_slot] = tag_id
+        self._animation_list_slot_count = max(int(self._animation_list_slot_count), len(self._animation_tag_slots))
+
+        ordered_ids = [slot for slot in self._animation_tag_slots if isinstance(slot, str) and slot in self._animation_tags]
+        for index, ordered_tag_id in enumerate(ordered_ids):
+            tag = self._animation_tags.get(ordered_tag_id)
+            if tag is not None:
+                tag.sort_index = int(index)
+
         self._refresh_animation_tag_list()
+        for row in range(self.animation_tag_list.count()):
+            item = self.animation_tag_list.item(row)
+            if item is None:
+                continue
+            if str(item.data(Qt.ItemDataRole.UserRole) or "") == tag_id:
+                self.animation_tag_list.setCurrentRow(row)
+                break
         self._record_history("animation-tags-create", include_fields=["animation_tags"], force=True)
         self._mark_project_dirty("animation-tags-create")
 
-    def _delete_selected_animation_tag(self) -> None:
-        tag = self._selected_animation_tag()
-        if tag is None:
+    def _create_animation_tag_from_selection(self) -> None:
+        sprite_keys = self._selected_sprite_keys_in_view_order()
+        if not sprite_keys:
+            self.statusBar().showMessage("Select one or more sprites first", 2500)
             return
+        self._create_animation_tag(initial_sprite_keys=sprite_keys)
+
+    def _set_selected_animation_tag_color(self) -> None:
+        selected_ids = self._selected_animation_tag_ids()
+        if not selected_ids:
+            tag = self._selected_animation_tag()
+            if tag is not None:
+                selected_ids = [str(tag.tag_id)]
+        if not selected_ids:
+            self.statusBar().showMessage("Select one or more animation tags to recolor", 2500)
+            return
+
+        sample_tag = self._animation_tags.get(selected_ids[0])
+        if sample_tag is None:
+            self.statusBar().showMessage("Select one or more animation tags to recolor", 2500)
+            return
+
+        current = AnimationTag._parse_color(sample_tag.color)
+        title = f"Animation Tag Color ({len(selected_ids)} selected)" if len(selected_ids) > 1 else f"Animation Tag Color: {sample_tag.name}"
+        chosen = QColorDialog.getColor(QColor(current[0], current[1], current[2]), self, title)
+        if not chosen.isValid():
+            return
+        next_color = (chosen.red(), chosen.green(), chosen.blue())
+
+        changed_ids: List[str] = []
+        for tag_id in selected_ids:
+            tag = self._animation_tags.get(tag_id)
+            if tag is None:
+                continue
+            old_color = AnimationTag._parse_color(tag.color)
+            if tuple(old_color) == tuple(next_color):
+                continue
+            changed_ids.append(tag_id)
+
+        if not changed_ids:
+            return
+
+        self._record_history("animation-tags-before-color", include_fields=["animation_tags"])
+        for tag_id in changed_ids:
+            tag = self._animation_tags.get(tag_id)
+            if tag is not None:
+                tag.color = next_color
+        self._refresh_animation_tag_list()
+        self._record_history("animation-tags-color", include_fields=["animation_tags"], force=True)
+        self._mark_project_dirty("animation-tags-color")
+        if len(changed_ids) == 1:
+            changed_tag = self._animation_tags.get(changed_ids[0])
+            label = changed_tag.name if changed_tag is not None else changed_ids[0]
+            self.statusBar().showMessage(f"Tag '{label}' color set", 2000)
+        else:
+            self.statusBar().showMessage(f"Color set for {len(changed_ids)} animation tags", 2000)
+
+    def _delete_selected_animation_tag(self) -> None:
+        selected_ids = self._selected_animation_tag_ids()
+        if not selected_ids:
+            return
+        selected_names = [self._animation_tags[tag_id].name for tag_id in selected_ids if tag_id in self._animation_tags]
+        if not selected_names:
+            return
+        if len(selected_names) == 1:
+            prompt = f"Delete animation tag '{selected_names[0]}'?"
+        else:
+            prompt = f"Delete {len(selected_names)} selected animation tags?"
         reply = QMessageBox.question(
             self,
             "Delete Animation Tag",
-            f"Delete animation tag '{tag.name}'?",
+            prompt,
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
         if reply != QMessageBox.StandardButton.Yes:
             return
         self._record_history("animation-tags-before-delete", include_fields=["animation_tags"])
-        if self._animation_preview_tag_id == tag.tag_id:
+        if self._animation_preview_tag_id is not None and self._animation_preview_tag_id in selected_ids:
             self._stop_animation_preview()
-        self._animation_tags.pop(tag.tag_id, None)
+        for tag_id in selected_ids:
+            self._animation_tags.pop(tag_id, None)
+        self._normalize_animation_tag_sort_indices()
         self._refresh_animation_tag_list()
         if not self.animation_play_btn.isChecked():
             self._set_animation_playhead_from_selected_frame()
@@ -8954,14 +14254,25 @@ class SpriteToolsWindow(QMainWindow):
 
     def _timeline_total_frames_for_tag(self, tag: AnimationTag | None) -> int:
         content_total = self._animation_tag_total_timeline_frames(tag) if tag is not None else 0
-        return max(1, int(content_total), int(self._animation_timeline_out_frame))
+        if tag is None:
+            return max(1, int(content_total), int(self._animation_timeline_out_frame))
+        return max(1, int(content_total), int(getattr(tag, "out_frame", 1)))
 
     def _sync_animation_timeline_range_controls(self, tag: AnimationTag | None = None) -> None:
         active_tag = tag if tag is not None else self._selected_animation_tag()
-        out_value = max(1, int(self._animation_timeline_out_frame))
-        in_value = max(0, min(int(self._animation_timeline_in_frame), out_value - 1))
+        if active_tag is not None:
+            out_value = max(1, int(getattr(active_tag, "out_frame", self._animation_timeline_out_frame)))
+            in_value = max(0, min(int(getattr(active_tag, "in_frame", self._animation_timeline_in_frame)), out_value - 1))
+            active_tag.in_frame = in_value
+            active_tag.out_frame = out_value
+        else:
+            out_value = max(1, int(self._animation_timeline_out_frame))
+            in_value = max(0, min(int(self._animation_timeline_in_frame), out_value - 1))
         out_min = max(1, in_value + 1)
         out_value = max(out_min, out_value)
+        if active_tag is not None:
+            active_tag.in_frame = in_value
+            active_tag.out_frame = out_value
         self._animation_timeline_in_frame = in_value
         self._animation_timeline_out_frame = out_value
 
@@ -8983,6 +14294,10 @@ class SpriteToolsWindow(QMainWindow):
         if self._history_manager is not None and self._history_manager.is_restoring:
             return
         if self._animation_timeline_range_history_before is None:
+            tag = self._selected_animation_tag()
+            if tag is not None:
+                self._animation_timeline_range_history_before = (int(tag.in_frame), int(tag.out_frame))
+                return
             self._animation_timeline_range_history_before = (
                 int(self._animation_timeline_in_frame),
                 int(self._animation_timeline_out_frame),
@@ -8995,6 +14310,11 @@ class SpriteToolsWindow(QMainWindow):
         if self._history_manager is not None and self._history_manager.is_restoring:
             return
         if self._animation_timeline_range_history_before is None:
+            tag = self._selected_animation_tag()
+            if tag is not None:
+                self._animation_timeline_range_history_before = (int(tag.in_frame), int(tag.out_frame))
+                self._animation_timeline_range_history_commit_timer.start()
+                return
             self._animation_timeline_range_history_before = (
                 int(self._animation_timeline_in_frame),
                 int(self._animation_timeline_out_frame),
@@ -9011,25 +14331,39 @@ class SpriteToolsWindow(QMainWindow):
         self._animation_timeline_range_history_before = None
         if before is None:
             return
-        after = (int(self._animation_timeline_in_frame), int(self._animation_timeline_out_frame))
+        tag = self._selected_animation_tag()
+        if tag is not None:
+            after = (int(tag.in_frame), int(tag.out_frame))
+        else:
+            after = (int(self._animation_timeline_in_frame), int(self._animation_timeline_out_frame))
         if before == after:
             return
-        self._record_history(
-            "animation-timeline-range",
-            include_fields=["animation_timeline_range"],
-            force=True,
-            mark_dirty=False,
-        )
+        if tag is not None:
+            self._record_history("animation-tags-range", include_fields=["animation_tags"], force=True)
+        else:
+            self._record_history(
+                "animation-timeline-range",
+                include_fields=["animation_timeline_range"],
+                force=True,
+                mark_dirty=False,
+            )
 
     def _on_animation_timeline_range_changed(self, _value: int) -> None:
         if self._animation_timeline_range_syncing:
             return
         self._on_animation_timeline_range_edit_started()
+        active_tag = self._selected_animation_tag()
         new_in = int(self.animation_in_spin.value()) if hasattr(self, "animation_in_spin") else int(self._animation_timeline_in_frame)
         new_out = int(self.animation_out_spin.value()) if hasattr(self, "animation_out_spin") else int(self._animation_timeline_out_frame)
-        self._animation_timeline_in_frame = max(0, new_in)
-        self._animation_timeline_out_frame = max(1, new_out)
-        self._sync_animation_timeline_range_controls()
+        next_in = max(0, int(new_in))
+        next_out = max(next_in + 1, int(new_out))
+        if active_tag is not None:
+            active_tag.in_frame = next_in
+            active_tag.out_frame = next_out
+        else:
+            self._animation_timeline_in_frame = next_in
+            self._animation_timeline_out_frame = next_out
+        self._sync_animation_timeline_range_controls(active_tag)
         self._save_animation_timeline_ui_settings()
         if self.animation_play_btn.isChecked():
             pos = max(self._animation_timeline_in_frame, min(self._animation_timeline_out_frame - 1, int(self._animation_preview_timeline_position)))
@@ -9043,9 +14377,16 @@ class SpriteToolsWindow(QMainWindow):
         if self._animation_timeline_range_syncing:
             return
         self._on_animation_timeline_range_edit_started()
-        self._animation_timeline_in_frame = max(0, int(in_frame))
-        self._animation_timeline_out_frame = max(self._animation_timeline_in_frame + 1, int(out_frame))
-        self._sync_animation_timeline_range_controls()
+        active_tag = self._selected_animation_tag()
+        next_in = max(0, int(in_frame))
+        next_out = max(next_in + 1, int(out_frame))
+        if active_tag is not None:
+            active_tag.in_frame = next_in
+            active_tag.out_frame = next_out
+        else:
+            self._animation_timeline_in_frame = next_in
+            self._animation_timeline_out_frame = next_out
+        self._sync_animation_timeline_range_controls(active_tag)
         self._save_animation_timeline_ui_settings()
         if self.animation_play_btn.isChecked():
             pos = max(self._animation_timeline_in_frame, min(self._animation_timeline_out_frame - 1, int(self._animation_preview_timeline_position)))
@@ -9066,6 +14407,10 @@ class SpriteToolsWindow(QMainWindow):
             self._stop_animation_preview()
 
     def _toggle_animation_play_pause_shortcut(self) -> None:
+        pivot_dialog = self._active_pivot_assist_dialog
+        if pivot_dialog is not None and pivot_dialog.isVisible() and pivot_dialog.isActiveWindow():
+            logger.debug("animation.shortcut play_pause ignored (owned by pivot dialog)")
+            return
         if not hasattr(self, "animation_play_btn"):
             return
         if not self.animation_timeline_dialog.isVisible():
@@ -9076,6 +14421,10 @@ class SpriteToolsWindow(QMainWindow):
 
     def _seek_animation_by_delta(self, delta: int) -> None:
         if delta == 0:
+            return
+        pivot_dialog = self._active_pivot_assist_dialog
+        if pivot_dialog is not None and pivot_dialog.isVisible() and pivot_dialog.isActiveWindow():
+            logger.debug("animation.shortcut seek ignored (owned by pivot dialog) delta=%s", int(delta))
             return
         tag = self._selected_animation_tag()
         if tag is None or not tag.frames:
@@ -9119,6 +14468,8 @@ class SpriteToolsWindow(QMainWindow):
         self._advance_animation_preview()
 
     def _stop_animation_preview(self) -> None:
+        landed_playhead = float(self._animation_playhead_frame) if self._animation_playhead_frame is not None else None
+        landed_tag = self._selected_animation_tag()
         self._animation_preview_timer.stop()
         self._assist_interaction_refresh_timer.stop()
         self._assist_interaction_refresh_pending = False
@@ -9134,7 +14485,10 @@ class SpriteToolsWindow(QMainWindow):
         self.animation_play_btn.setChecked(False)
         self.animation_play_btn.blockSignals(False)
         self.animation_play_btn.setText("Play")
-        self._set_animation_playhead_from_selected_frame()
+        if landed_playhead is not None and landed_tag is not None and bool(landed_tag.frames):
+            self._seek_animation_playhead(float(landed_playhead), from_user_scrub=False)
+        else:
+            self._set_animation_playhead_from_selected_frame()
         self._schedule_preview_update()
 
     def _resolve_animation_runtime_key(self, sprite_key: str) -> str | None:
@@ -9231,7 +14585,7 @@ class SpriteToolsWindow(QMainWindow):
             return
         self._set_animation_playhead_from_selected_frame()
 
-    def _set_animation_preview_frame_by_key(self, key: str, *, source: str = "unknown") -> bool:
+    def _set_animation_preview_frame_by_key(self, key: str, *, source: str = "unknown", sync_palette: bool = False) -> bool:
         assist_active = self._is_animation_assist_view_active() or self.animation_play_btn.isChecked()
         if not assist_active:
             return True
@@ -9255,10 +14609,18 @@ class SpriteToolsWindow(QMainWindow):
         current_pixmap, onion_pixmap = layers
         overlay_layers, overlay_source_size, overlay_sig = self._animation_assist_overlay_layers_for_key(key)
         self.preview_panel.set_static_pixmap(onion_pixmap)
+        self.preview_panel.set_guide_options(
+            self._build_main_preview_guide_options(
+                max(1, int(current_pixmap.width())),
+                max(1, int(current_pixmap.height())),
+            )
+        )
         self.preview_panel.set_overlay_layers(overlay_layers, overlay_source_size)
         self.preview_panel.set_pixmap(current_pixmap, reset_zoom=False)
         self._animation_last_preview_size = QSize(current_pixmap.size())
         self._animation_preview_visible_sprite_key = key
+        if sync_palette:
+            self._refresh_palette_for_runtime_key(key)
         self._last_preview_render_signature = (
             "assist",
             key,
@@ -9274,12 +14636,19 @@ class SpriteToolsWindow(QMainWindow):
         size = QSize(self._animation_last_preview_size)
         if size.width() <= 0 or size.height() <= 0:
             self.preview_panel.set_static_pixmap(None)
+            self.preview_panel.set_guide_options({})
             self.preview_panel.set_overlay_layers([], QSize(0, 0))
             self.preview_panel.set_pixmap(None, reset_zoom=False)
             return
         blank = QPixmap(size)
         blank.fill(Qt.GlobalColor.transparent)
         self.preview_panel.set_static_pixmap(None)
+        self.preview_panel.set_guide_options(
+            self._build_main_preview_guide_options(
+                max(1, int(blank.width())),
+                max(1, int(blank.height())),
+            )
+        )
         self.preview_panel.set_overlay_layers([], QSize(0, 0))
         self.preview_panel.set_pixmap(blank, reset_zoom=False)
 
@@ -9449,10 +14818,24 @@ class SpriteToolsWindow(QMainWindow):
                 item.setData(_SPRITE_BASE_NAME_ROLE, new_path.name)
                 item.setText(new_path.name)
                 break
+        self._remap_animation_frame_sources(old_key, new_key)
+
+    def _remap_animation_frame_sources(self, old_runtime_key: str, new_runtime_key: str) -> int:
+        old_key = str(old_runtime_key or "")
+        new_key = str(new_runtime_key or "")
+        if not old_key or not new_key:
+            return 0
+        remapped = 0
         for tag in self._animation_tags.values():
             for frame in tag.frames:
-                if frame.sprite_key == old_key:
+                current_key = str(frame.sprite_key or "")
+                if not current_key:
+                    continue
+                resolved_key = self._resolve_animation_runtime_key(current_key)
+                if current_key == old_key or resolved_key == old_key:
                     frame.sprite_key = new_key
+                    remapped += 1
+        return remapped
 
     def _project_output_dir_setting(self, paths: ProjectPaths) -> str:
         try:
@@ -9571,8 +14954,25 @@ class SpriteToolsWindow(QMainWindow):
                 **dict(manifest.settings),
                 "load_mode": self.images_panel.selected_load_mode(),
                 "output_dir": self._project_output_dir_setting(paths),
+                "offset_scope": str(self.offset_scope_combo.currentData() if hasattr(self, "offset_scope_combo") else "combined"),
+                "global_offset_x": int(self.global_offset_x_spin.value() if hasattr(self, "global_offset_x_spin") else 0),
+                "global_offset_y": int(self.global_offset_y_spin.value() if hasattr(self, "global_offset_y_spin") else 0),
+                "canvas_mode": str(self.output_size_mode.currentData() if hasattr(self, "output_size_mode") else "custom"),
+                "canvas_scope": str(self.canvas_scope_combo.currentData() if hasattr(self, "canvas_scope_combo") else "combined"),
+                "global_canvas_width": int(self.canvas_width_spin.value() if hasattr(self, "canvas_width_spin") else 304),
+                "global_canvas_height": int(self.canvas_height_spin.value() if hasattr(self, "canvas_height_spin") else 224),
+                "group_state_full": self._group_state_payload_for_manifest_settings(runtime_to_source_key),
+                "group_state_map": self._group_state_map_for_manifest_settings(),
                 "group_name_map": self._group_name_map_for_manifest_settings(),
                 "animation_tags": self._animation_tags_for_manifest_settings(runtime_to_source_key),
+                "animation_tag_slots": self._animation_tag_slots_for_manifest_settings(),
+                "animation_list_slot_count": int(self._animation_list_slot_count),
+                "custom_axis_slots": self._custom_axis_slots_for_manifest_settings(),
+                "preview_guides": self._preview_guides_for_manifest_settings(),
+                "merge_window_size": [
+                    int(self._get_merge_dialog_size()[0]),
+                    int(self._get_merge_dialog_size()[1]),
+                ],
             },
         }
         return {
@@ -9707,7 +15107,7 @@ class SpriteToolsWindow(QMainWindow):
                 "color": [int(color[0]), int(color[1]), int(color[2])],
                 "alpha": int(alpha),
             }
-        return {
+        metadata: Dict[str, Any] = {
             "offset_x": int(record.offset_x),
             "offset_y": int(record.offset_y),
             "canvas_width": int(record.canvas_width),
@@ -9715,6 +15115,18 @@ class SpriteToolsWindow(QMainWindow):
             "canvas_override_enabled": bool(record.canvas_override_enabled),
             "local_overrides": local_overrides,
         }
+        if record.load_mode == "preserve":
+            palette_data = list(record.indexed_image.getpalette() or [])
+            if len(palette_data) < 768:
+                palette_data.extend([0] * (768 - len(palette_data)))
+            metadata["preserve_palette_rgb"] = [
+                max(0, min(255, int(channel))) for channel in palette_data[:768]
+            ]
+            alpha_data = self._extract_palette_alphas_from_image(record.indexed_image, 256)
+            metadata["preserve_palette_alpha"] = [
+                max(0, min(255, int(alpha))) for alpha in alpha_data[:256]
+            ]
+        return metadata
 
     def _apply_project_metadata_to_loaded_records(self) -> None:
         if not self._pending_project_sprite_metadata:
@@ -9724,6 +15136,7 @@ class SpriteToolsWindow(QMainWindow):
         if self._project_paths is None:
             return
         applied = 0
+        preserve_palette_restored = 0
         for key, record in self.sprite_records.items():
             try:
                 rel = record.path.resolve().relative_to(self._project_paths.root).as_posix()
@@ -9758,12 +15171,54 @@ class SpriteToolsWindow(QMainWindow):
                     except (TypeError, ValueError):
                         continue
             record.local_overrides = parsed_overrides
+
+            preserve_palette_raw = payload.get("preserve_palette_rgb")
+            preserve_alpha_raw = payload.get("preserve_palette_alpha")
+            preserve_palette_data: List[int] | None = None
+            preserve_alpha_data: List[int] | None = None
+
+            if isinstance(preserve_palette_raw, (list, tuple)):
+                preserve_palette_data = []
+                for raw in preserve_palette_raw[:768]:
+                    try:
+                        preserve_palette_data.append(max(0, min(255, int(raw))))
+                    except (TypeError, ValueError):
+                        preserve_palette_data.append(0)
+                if len(preserve_palette_data) < 768:
+                    preserve_palette_data.extend([0] * (768 - len(preserve_palette_data)))
+
+            if isinstance(preserve_alpha_raw, (list, tuple)):
+                preserve_alpha_data = []
+                for raw in preserve_alpha_raw[:256]:
+                    try:
+                        preserve_alpha_data.append(max(0, min(255, int(raw))))
+                    except (TypeError, ValueError):
+                        preserve_alpha_data.append(255)
+                if len(preserve_alpha_data) < 256:
+                    preserve_alpha_data.extend([255] * (256 - len(preserve_alpha_data)))
+
+            if record.load_mode == "preserve" and (preserve_palette_data is not None or preserve_alpha_data is not None):
+                if preserve_palette_data is not None:
+                    record.indexed_image.putpalette(preserve_palette_data[:768])
+                if preserve_alpha_data is not None:
+                    if any(alpha < 255 for alpha in preserve_alpha_data):
+                        record.indexed_image.info["transparency"] = bytes(preserve_alpha_data[:256])
+                    elif "transparency" in record.indexed_image.info:
+                        del record.indexed_image.info["transparency"]
+                record.palette = list(extract_palette(record.indexed_image, include_unused=True).colors[:256])
+                preserve_palette_restored += 1
+
             applied += 1
         if applied:
             self._refresh_palette_for_current_selection()
             self._update_canvas_inputs()
             self._update_sprite_offset_controls(self._current_record())
             self._schedule_preview_update()
+            logger.debug(
+                "Applied project sprite metadata records=%s preserve_palette_restored=%s",
+                applied,
+                preserve_palette_restored,
+            )
 
     def _on_load_mode_changed(self, _index: int) -> None:
         mode = self.images_panel.selected_load_mode()
@@ -9981,17 +15436,17 @@ class SpriteToolsWindow(QMainWindow):
     def _sorted_sprite_keys_for_browser(self, keys: Sequence[str]) -> List[str]:
         sort_mode = self.images_panel.browser_sort_mode()
         if sort_mode == "name":
-            return sorted(keys, key=lambda key: (Path(key).name.lower(), key.lower()))
+            return sorted(keys, key=lambda key: (_natural_sort_parts(Path(key).name), _natural_sort_parts(key)))
         if sort_mode == "path":
-            return sorted(keys, key=lambda key: key.lower())
+            return sorted(keys, key=lambda key: _natural_sort_parts(key))
         if sort_mode == "group":
             return sorted(
                 keys,
                 key=lambda key: (
                     1 if not (self.sprite_records.get(key).group_id if self.sprite_records.get(key) else None) else 0,
                     str((self.sprite_records.get(key).group_id if self.sprite_records.get(key) else "") or "").lower(),
-                    Path(key).name.lower(),
-                    key.lower(),
+                    _natural_sort_parts(Path(key).name),
+                    _natural_sort_parts(key),
                 ),
             )
         return list(keys)
@@ -10241,6 +15696,332 @@ class SpriteToolsWindow(QMainWindow):
             )
         return normalized
 
+    def _drop_replacement_target_sprite_key(self, event, source_widget: QWidget | None = None) -> str | None:
+        if not hasattr(self, "images_panel") or not hasattr(self.images_panel, "list_widget"):
+            return None
+        list_widget = self.images_panel.list_widget
+        viewport = list_widget.viewport()
+        if viewport is None:
+            return None
+        point_local = event.position().toPoint() if hasattr(event, "position") else event.pos()
+        origin = source_widget if source_widget is not None else self
+        point_global = origin.mapToGlobal(point_local)
+        point_view = viewport.mapFromGlobal(point_global)
+        if not viewport.rect().contains(point_view):
+            return None
+        item = list_widget.itemAt(point_view)
+        if item is None:
+            return None
+        key = item.data(Qt.ItemDataRole.UserRole)
+        return str(key) if key else None
+
+    def _drop_replacement_target_animation_frame(self, event, source_widget: QWidget | None = None) -> tuple[AnimationTag, int] | None:
+        if not hasattr(self, "animation_frame_list"):
+            return None
+        frame_list = self.animation_frame_list
+        viewport = frame_list.viewport()
+        if viewport is None:
+            return None
+        point_local = event.position().toPoint() if hasattr(event, "position") else event.pos()
+        origin = source_widget if source_widget is not None else self
+        point_global = origin.mapToGlobal(point_local)
+        point_view = viewport.mapFromGlobal(point_global)
+        if not viewport.rect().contains(point_view):
+            return None
+        item = frame_list.itemAt(point_view)
+        if item is None:
+            return None
+        if str(item.data(_TIMELINE_ITEM_KIND_ROLE) or "") != "frame":
+            return None
+        try:
+            frame_index = int(item.data(Qt.ItemDataRole.UserRole))
+        except (TypeError, ValueError):
+            return None
+        tag = self._selected_animation_tag()
+        if tag is None or frame_index < 0 or frame_index >= len(tag.frames):
+            return None
+        return tag, frame_index
+
+    def _first_dropped_image_file_path(self, event) -> Path | None:
+        paths = self._dropped_image_file_paths(event)
+        return paths[0] if paths else None
+
+    def _dropped_image_file_paths(self, event) -> List[Path]:
+        if not event.mimeData().hasUrls():
+            return []
+        paths: List[Path] = []
+        seen: set[str] = set()
+        for url in event.mimeData().urls():
+            local = Path(url.toLocalFile())
+            if local.is_file() and is_supported_image(local):
+                key = local.resolve().as_posix().lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                paths.append(local)
+        return paths
+
+    def _import_dropped_sprite_for_replacement(self, source_path: Path) -> tuple[str, SpriteRecord] | None:
+        prepared = self._prepare_paths_for_load([source_path])
+        if not prepared:
+            return None
+        resolved_path = prepared[0]
+        key = resolved_path.as_posix()
+        mode = self.images_panel.selected_load_mode()
+        existing = self.sprite_records.get(key)
+        if existing is not None and existing.load_mode == mode:
+            return key, existing
+        record = self._create_record(resolved_path, load_mode=mode)
+        if record is None:
+            return None
+        if key in self.sprite_records:
+            self._remove_record_from_group(key)
+            self.sprite_records.pop(key, None)
+        self.sprite_records[key] = record
+        self._assign_record_group(key, record)
+        self._merge_record_palette(record)
+        return key, record
+
+    def _replace_sprite_list_entry_from_drop(self, target_key: str, source_path: Path) -> bool:
+        old_record = self.sprite_records.get(target_key)
+        if old_record is None:
+            return False
+
+        prepared = self._prepare_paths_for_load([source_path])
+        if not prepared:
+            return False
+        resolved_path = prepared[0]
+        new_key = resolved_path.as_posix()
+        if new_key in self.sprite_records and new_key != target_key:
+            self.statusBar().showMessage("Dropped sprite is already loaded; cannot replace target with duplicate key", 3500)
+            return False
+
+        mode = self.images_panel.selected_load_mode()
+        new_record = self._create_record(resolved_path, load_mode=mode)
+        if new_record is None:
+            return False
+
+        self._record_history("replace-sprite-before", include_fields=["palette", "group_state", "animation_tags"])
+
+        remapped_frames = self._remap_animation_frame_sources(target_key, new_key)
+        self._remove_record_from_group(target_key)
+        self.sprite_records.pop(target_key, None)
+        self._used_index_cache.pop(target_key, None)
+        self._load_mode_overrides.pop(target_key, None)
+        if new_key in self.sprite_records:
+            self._remove_record_from_group(new_key)
+            self.sprite_records.pop(new_key, None)
+            self._used_index_cache.pop(new_key, None)
+            self._load_mode_overrides.pop(new_key, None)
+
+        self.sprite_records[new_key] = new_record
+        self._assign_record_group(new_key, new_record)
+        self._merge_record_palette(new_record)
+
+        self._rebuild_loaded_images_list()
+        list_widget = self.images_panel.list_widget
+        for row in range(list_widget.count()):
+            item = list_widget.item(row)
+            if item is None:
+                continue
+            if str(item.data(Qt.ItemDataRole.UserRole) or "") == new_key:
+                list_widget.setCurrentRow(row)
+                break
+
+        self._refresh_group_overview()
+        self._refresh_animation_tag_list()
+        self._refresh_palette_for_current_selection()
+        self._schedule_preview_update()
+        self._record_history("replace-sprite", include_fields=["palette", "group_state", "animation_tags"], force=True)
+        self._mark_project_dirty("replace-sprite")
+        self.statusBar().showMessage(
+            f"Replaced sprite with {Path(new_key).name} (updated {int(remapped_frames)} animation frame(s))",
+            3200,
+        )
+        return True
+
+    def _drop_replacement_target_sprite_row(self, event, source_widget: QWidget | None = None) -> int | None:
+        if not hasattr(self, "images_panel") or not hasattr(self.images_panel, "list_widget"):
+            return None
+        list_widget = self.images_panel.list_widget
+        viewport = list_widget.viewport()
+        if viewport is None:
+            return None
+        point_local = event.position().toPoint() if hasattr(event, "position") else event.pos()
+        origin = source_widget if source_widget is not None else self
+        point_global = origin.mapToGlobal(point_local)
+        point_view = viewport.mapFromGlobal(point_global)
+        if not viewport.rect().contains(point_view):
+            return None
+        item = list_widget.itemAt(point_view)
+        if item is None:
+            return None
+        row = list_widget.row(item)
+        return int(row) if row >= 0 else None
+
+    def _sprite_target_keys_from_row(self, start_row: int, limit: int) -> List[str]:
+        if limit <= 0:
+            return []
+        list_widget = self.images_panel.list_widget
+        count = int(list_widget.count())
+        keys: List[str] = []
+        for row in range(max(0, int(start_row)), count):
+            if len(keys) >= limit:
+                break
+            item = list_widget.item(row)
+            if item is None or item.isHidden():
+                continue
+            key = item.data(Qt.ItemDataRole.UserRole)
+            if not key:
+                continue
+            keys.append(str(key))
+        return keys
+
+    def _replace_sprite_batch_from_drop(self, start_row: int, source_paths: Sequence[Path]) -> bool:
+        paths = [Path(path) for path in source_paths]
+        if not paths:
+            return False
+        target_keys = self._sprite_target_keys_from_row(start_row, len(paths))
+        if not target_keys:
+            return False
+        replaced = 0
+        for target_key, source_path in zip(target_keys, paths):
+            if self._replace_sprite_list_entry_from_drop(target_key, source_path):
+                replaced += 1
+        remaining = max(0, len(paths) - len(target_keys))
+        if replaced > 0:
+            if remaining > 0:
+                self.statusBar().showMessage(
+                    f"Batch replaced {replaced} sprite(s); {remaining} dropped file(s) had no remaining targets",
+                    3600,
+                )
+            else:
+                self.statusBar().showMessage(f"Batch replaced {replaced} sprite(s)", 2800)
+            return True
+        return False
+
+    def _replace_animation_frame_from_drop(self, tag: AnimationTag, frame_index: int, source_path: Path) -> bool:
+        if frame_index < 0 or frame_index >= len(tag.frames):
+            return False
+        frame = tag.frames[frame_index]
+        target_key = self._resolve_animation_runtime_key(frame.sprite_key)
+        if not target_key or target_key not in self.sprite_records:
+            self.statusBar().showMessage("Frame source sprite not found; cannot replace", 2500)
+            return False
+        source_name = Path(target_key).name
+        replaced = self._replace_sprite_list_entry_from_drop(target_key, source_path)
+        if not replaced:
+            return False
+        self._refresh_animation_frame_list()
+        target_row = self._timeline_row_for_frame_index(frame_index)
+        if target_row is not None:
+            self.animation_frame_list.setCurrentRow(target_row)
+        self._seek_animation_playhead(float(self._animation_frame_start_offset(tag, frame_index)), from_user_scrub=False)
+        self.statusBar().showMessage(
+            f"Replaced source sprite '{source_name}' from frame {frame_index + 1}",
+            3200,
+        )
+        return True
+
+    def _replace_animation_frames_batch_from_drop(self, tag: AnimationTag, start_frame_index: int, source_paths: Sequence[Path]) -> bool:
+        paths = [Path(path) for path in source_paths]
+        if not paths:
+            return False
+        if start_frame_index < 0 or start_frame_index >= len(tag.frames):
+            return False
+
+        replace_count = min(len(paths), max(0, len(tag.frames) - int(start_frame_index)))
+        replaced = 0
+        for offset in range(replace_count):
+            frame_index = int(start_frame_index) + offset
+            if self._replace_animation_frame_from_drop(tag, frame_index, paths[offset]):
+                replaced += 1
+
+        appended = 0
+        extras = paths[replace_count:]
+        if extras:
+            self._record_history("animation-tags-before-frame-append-drop", include_fields=["animation_tags"])
+            for source_path in extras:
+                imported = self._import_dropped_sprite_for_replacement(source_path)
+                if imported is None:
+                    continue
+                new_key, _record = imported
+                tag.frames.append(AnimationFrameEntry(sprite_key=new_key, duration_frames=1, notes=""))
+                appended += 1
+            if appended > 0:
+                self._refresh_animation_frame_list()
+                self._record_history("animation-tags-frame-append-drop", include_fields=["animation_tags"], force=True)
+                self._mark_project_dirty("animation-tags-frame-append-drop")
+
+        if replaced <= 0 and appended <= 0:
+            return False
+        self.statusBar().showMessage(
+            f"Timeline batch replace: {replaced} frame source(s) replaced, {appended} frame(s) appended",
+            3800,
+        )
+        return True
+
+    def _handle_ctrl_drop_replace(self, event, source_widget: QWidget | None = None) -> bool:
+        if not bool(event.modifiers() & Qt.KeyboardModifier.ControlModifier):
+            return False
+        source_paths = self._dropped_image_file_paths(event)
+        if not source_paths:
+            return False
+
+        target_sprite_row = self._drop_replacement_target_sprite_row(event, source_widget)
+        if target_sprite_row is not None:
+            return self._replace_sprite_batch_from_drop(target_sprite_row, source_paths)
+
+        target_frame = self._drop_replacement_target_animation_frame(event, source_widget)
+        if target_frame is not None:
+            tag, frame_index = target_frame
+            return self._replace_animation_frames_batch_from_drop(tag, frame_index, source_paths)
+        return False
+
+    def _set_drop_feedback_message(self, text: str | None) -> None:
+        current = getattr(self, "_drop_feedback_message", None)
+        normalized = str(text or "").strip() or None
+        if current == normalized:
+            return
+        self._drop_feedback_message = normalized
+        if normalized is None:
+            self.statusBar().clearMessage()
+            return
+        self.statusBar().showMessage(normalized)
+
+    def _ctrl_drop_feedback_text(self, event, source_widget: QWidget | None = None) -> str | None:
+        if not bool(event.modifiers() & Qt.KeyboardModifier.ControlModifier):
+            return None
+        source_paths = self._dropped_image_file_paths(event)
+        if not source_paths:
+            return "Ctrl+Drop replace: drop a supported image file (.png/.bmp/.gif/.jpg/.jpeg)"
+        drop_count = len(source_paths)
+        drop_label = "1 file" if drop_count == 1 else f"{drop_count} files"
+
+        mode = self.images_panel.selected_load_mode()
+        mode_label = "Detect Indexes" if mode == "detect" else "Preserve Indexes"
+
+        target_sprite_key = self._drop_replacement_target_sprite_key(event, source_widget)
+        if target_sprite_key:
+            target_name = Path(target_sprite_key).name
+            return (
+                f"Ctrl+Drop replace: release to batch-replace from sprite '{target_name}' "
+                f"using {drop_label} (load mode: {mode_label})"
+            )
+
+        target_frame = self._drop_replacement_target_animation_frame(event, source_widget)
+        if target_frame is not None:
+            tag, frame_index = target_frame
+            frame = tag.frames[frame_index] if 0 <= frame_index < len(tag.frames) else None
+            runtime_key = self._resolve_animation_runtime_key(frame.sprite_key) if frame is not None else None
+            source_name = Path(runtime_key).name if runtime_key else "<missing source>"
+            return (
+                f"Ctrl+Drop replace: release to batch-replace timeline from frame {int(frame_index) + 1} "
+                f"(source '{source_name}', {drop_label}, load mode: {mode_label})"
+            )
+
+        return "Ctrl+Drop replace: hover a sprite entry or animation frame target"
+
     def _process_load_queue_tick(self) -> None:
         if not self._load_queue:
             self._load_timer.stop()
@@ -10293,6 +16074,8 @@ class SpriteToolsWindow(QMainWindow):
 
         if added:
             self._apply_group_display_names_from_manifest_settings()
+            self._apply_group_state_from_manifest_settings()
+            self._refresh_animation_tag_list()
 
         self._update_export_buttons()
         self._update_loaded_count()
@@ -10664,18 +16447,27 @@ class SpriteToolsWindow(QMainWindow):
         )
         self._sync_palette_model()
 
-    def _refresh_palette_for_current_selection(self) -> None:
-        record = self._current_record()
+    def _refresh_palette_for_record(self, record: SpriteRecord | None) -> None:
         if record is None:
             self.palette_list.set_colors([], emit_signal=False)
             self.palette_list.set_local_rows([])
             return
         if record.load_mode == "preserve":
-            self._sync_palette_from_current_record_preserve()
-            self._sync_local_override_visuals()
+            self._sync_palette_from_current_record_preserve(record)
+            self._sync_local_override_visuals(record)
             return
-        self._sync_palette_from_current_record_detect_group()
-        self._sync_local_override_visuals()
+        self._sync_palette_from_current_record_detect_group(record)
+        self._sync_local_override_visuals(record)
+
+    def _refresh_palette_for_current_selection(self) -> None:
+        self._refresh_palette_for_record(self._current_record())
+
+    def _refresh_palette_for_runtime_key(self, runtime_key: str | None) -> None:
+        record = self.sprite_records.get(str(runtime_key)) if runtime_key else None
+        if record is not None:
+            self._refresh_palette_for_record(record)
+            return
+        self._refresh_palette_for_current_selection()
 
     def _capture_palette_selection_rows(self) -> Tuple[List[int], int | None]:
         selected_rows = sorted({index.row() for index in self.palette_list.selectedIndexes() if 0 <= index.row() < 256})
@@ -10700,8 +16492,9 @@ class SpriteToolsWindow(QMainWindow):
             current_row,
         )
 
-    def _sync_local_override_visuals(self) -> None:
-        record = self._current_record()
+    def _sync_local_override_visuals(self, record: SpriteRecord | None = None) -> None:
+        if record is None:
+            record = self._current_record()
         if record is None:
             self.palette_list.set_local_rows([])
             return
@@ -10735,8 +16528,9 @@ class SpriteToolsWindow(QMainWindow):
             len(self.palette_colors),
         )
 
-    def _sync_palette_from_current_record_detect_group(self) -> None:
-        record = self._current_record()
+    def _sync_palette_from_current_record_detect_group(self, record: SpriteRecord | None = None) -> None:
+        if record is None:
+            record = self._current_record()
         if record is None or record.load_mode != "detect":
             self.palette_list.set_colors([], emit_signal=False)
             self._update_fill_preview()
@@ -11105,16 +16899,29 @@ class SpriteToolsWindow(QMainWindow):
                 preview_img.putdata(merged_index_data)
         rgba = preview_img.convert("RGBA")
 
-        if blink_highlight and highlight_index is not None:
+        hover_highlight_enabled = bool(
+            getattr(self, "hover_highlight_checkbox", None)
+            and self.hover_highlight_checkbox.isChecked()
+        )
+        selected_highlight_enabled = bool(
+            getattr(self, "highlight_checkbox", None)
+            and self.highlight_checkbox.isChecked()
+        )
+        should_highlight = highlight_index is not None and (blink_highlight or hover_highlight_enabled or selected_highlight_enabled)
+
+        if should_highlight and highlight_index is not None:
             index_data = merged_index_data if merged_index_data is not None else list(preview_img.getdata())
             rgba_data = list(rgba.getdata())
             import math
-            fade = (math.sin(blink_phase) + 1) / 2
-            alpha_min = int(getattr(self, "_overlay_alpha_min", 77))
-            alpha_max = int(getattr(self, "_overlay_alpha_max", 255))
+            if blink_highlight:
+                fade = (math.sin(blink_phase) + 1) / 2
+            else:
+                fade = 1.0
+            alpha_min = int(getattr(self, "_hover_overlay_alpha_min", getattr(self, "_overlay_alpha_min", 77)))
+            alpha_max = int(getattr(self, "_hover_overlay_alpha_max", getattr(self, "_overlay_alpha_max", 255)))
             alpha_range = max(0, alpha_max - alpha_min)
             animated_alpha = int(alpha_min + alpha_range * fade)
-            overlay_rgb = tuple(getattr(self, "_overlay_color", (255, 255, 255)))
+            overlay_rgb = tuple(getattr(self, "_hover_overlay_color", getattr(self, "_overlay_color", (255, 255, 255))))
             overlay_r, overlay_g, overlay_b = int(overlay_rgb[0]), int(overlay_rgb[1]), int(overlay_rgb[2])
             blend = max(0.0, min(1.0, animated_alpha / 255.0))
             highlighted: List[Tuple[int, int, int, int]] = []
@@ -11265,9 +17072,10 @@ class SpriteToolsWindow(QMainWindow):
             if self._group_display_name(other).strip().lower() == proposed.lower():
                 QMessageBox.warning(self, "Rename Group", "A group with that name already exists.")
                 return
+        self._record_history("group-rename-before", include_fields=["group_state"])
         group.display_name = proposed
         self._refresh_group_overview()
-        self._mark_project_dirty("rename-group")
+        self._record_history("group-rename", include_fields=["group_state"], force=True)
         self.statusBar().showMessage(f"Renamed group to {proposed}", 2500)
 
     def _selected_sprite_keys(self) -> List[str]:
@@ -11277,6 +17085,371 @@ class SpriteToolsWindow(QMainWindow):
             if key:
                 keys.append(str(key))
         return keys
+
+    def _sequence_keys_for_animation_tag(self, tag: AnimationTag) -> List[str]:
+        sequence_keys: List[str] = []
+        for frame in tag.frames:
+            runtime_key = self._resolve_animation_runtime_key(frame.sprite_key)
+            if runtime_key is None:
+                continue
+            if runtime_key not in self.sprite_records:
+                continue
+            sequence_keys.append(runtime_key)
+        return sequence_keys
+
+    def _sequence_frames_for_animation_tag(self, tag: AnimationTag) -> List[tuple[str, int, str]]:
+        sequence_frames: List[tuple[str, int, str]] = []
+        for index, frame in enumerate(tag.frames):
+            runtime_key = self._resolve_animation_runtime_key(frame.sprite_key)
+            if runtime_key is None or runtime_key not in self.sprite_records:
+                continue
+            duration = max(1, int(frame.duration_frames))
+            sequence_frames.append((runtime_key, duration, f"F{index + 1}"))
+        return sequence_frames
+
+    def _records_for_sequence_keys(self, sequence_keys: Sequence[str]) -> List[tuple[str, SpriteRecord]]:
+        records: List[tuple[str, SpriteRecord]] = []
+        seen: set[str] = set()
+        for key in sequence_keys:
+            if key in seen:
+                continue
+            record = self.sprite_records.get(key)
+            if record is None:
+                continue
+            records.append((key, record))
+            seen.add(key)
+        return records
+
+    def _apply_pivot_assist_dialog(
+        self,
+        records: Sequence[tuple[str, SpriteRecord]],
+        *,
+        sequence_keys: Sequence[str],
+        sequence_frames: Sequence[tuple[str, int, str]] | None = None,
+    ) -> None:
+        logger.debug(
+            "pivot.apply_dialog start records=%s sequence_keys=%s sequence_frames=%s",
+            len(records),
+            len(sequence_keys),
+            len(sequence_frames) if sequence_frames is not None else 0,
+        )
+        if len(records) < 2:
+            QMessageBox.information(
+                self,
+                "Pivot Assist",
+                "Select at least 2 source sprites to run Pivot Assist.",
+            )
+            return
+
+        dialog = PivotAssistDialog(
+            self,
+            records,
+            sequence_keys=sequence_keys,
+            sequence_frames=sequence_frames,
+            parent=self,
+        )
+        previous_active_dialog = self._active_pivot_assist_dialog
+        self._active_pivot_assist_dialog = dialog
+        self._sync_pivot_assist_shortcut_enablement()
+        try:
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                logger.debug("pivot.apply_dialog cancelled")
+                return
+
+            updates = dialog.proposed_offsets()
+            if not updates:
+                logger.debug("pivot.apply_dialog no_updates")
+                return
+
+            changed = 0
+            self._record_history("offset-local-before-pivot-assist", include_fields=["offsets"])
+            for key, (target_x, target_y) in updates.items():
+                record = self.sprite_records.get(key)
+                if record is None:
+                    logger.debug("pivot.apply_dialog missing_record key=%s", key)
+                    continue
+                if int(record.offset_x) == int(target_x) and int(record.offset_y) == int(target_y):
+                    logger.debug("pivot.apply_dialog unchanged key=%s value=(%s,%s)", key, int(target_x), int(target_y))
+                    continue
+                logger.debug(
+                    "pivot.apply_dialog update key=%s from=(%s,%s) to=(%s,%s)",
+                    key,
+                    int(record.offset_x),
+                    int(record.offset_y),
+                    int(target_x),
+                    int(target_y),
+                )
+                record.offset_x = int(target_x)
+                record.offset_y = int(target_y)
+                changed += 1
+
+            if changed <= 0:
+                self.statusBar().showMessage("Pivot Assist made no offset changes", 2500)
+                return
+
+            self._update_sprite_offset_controls(self._current_record())
+            if self._is_animation_assist_view_active() and not self.animation_play_btn.isChecked():
+                self._refresh_animation_assist_preview_frame()
+            else:
+                self._schedule_preview_update(delay_ms=0)
+            self._record_history("offset-local-pivot-assist", include_fields=["offsets"], force=True)
+            self._mark_project_dirty("offset-local-pivot-assist")
+            logger.debug("pivot.apply_dialog complete changed=%s", changed)
+            self.statusBar().showMessage(f"Pivot Assist updated local offsets for {changed} sprite(s)", 3500)
+        finally:
+            if self._active_pivot_assist_dialog is dialog:
+                self._active_pivot_assist_dialog = previous_active_dialog
+            self._sync_pivot_assist_shortcut_enablement()
+
+    def _open_pivot_assist_for_animation_tag(self, tag_id: str) -> None:
+        tag = self._animation_tags.get(tag_id)
+        if tag is None:
+            QMessageBox.information(self, "Pivot Assist", "Animation tag not found.")
+            return
+        sequence_keys = self._sequence_keys_for_animation_tag(tag)
+        sequence_frames = self._sequence_frames_for_animation_tag(tag)
+        records = self._records_for_sequence_keys(sequence_keys)
+        self._apply_pivot_assist_dialog(records, sequence_keys=sequence_keys, sequence_frames=sequence_frames)
+
+    def _animation_usage_rows_for_sprites(
+        self,
+        sprite_keys: Sequence[str],
+        *,
+        require_all: bool,
+    ) -> List[tuple[str, str, int, int]]:
+        key_set = {key for key in sprite_keys if key}
+        if not key_set:
+            return []
+        rows: List[tuple[str, str, int, int]] = []
+        for tag_id, tag in self._animation_tags.items():
+            tag_runtime_keys: List[str] = []
+            for frame in tag.frames:
+                runtime_key = self._resolve_animation_runtime_key(frame.sprite_key)
+                if runtime_key is not None:
+                    tag_runtime_keys.append(runtime_key)
+            if not tag_runtime_keys:
+                continue
+            tag_key_set = set(tag_runtime_keys)
+            if require_all:
+                if not key_set.issubset(tag_key_set):
+                    continue
+            else:
+                if key_set.isdisjoint(tag_key_set):
+                    continue
+            hit_count = sum(1 for key in tag_runtime_keys if key in key_set)
+            rows.append((tag_id, str(tag.name), int(hit_count), int(len(tag.frames))))
+        rows.sort(key=lambda item: (item[1].lower(), item[0]))
+        return rows
+
+    def _show_animation_usage_dialog(self, sprite_keys: Sequence[str], *, require_all: bool, title: str) -> None:
+        keys = [key for key in sprite_keys if key in self.sprite_records]
+        if not keys:
+            QMessageBox.information(self, title, "No valid sprite selection found.")
+            return
+        rows = self._animation_usage_rows_for_sprites(keys, require_all=require_all)
+        mode_text = "all selected sprites" if require_all else "at least one selected sprite"
+        subtitle = (
+            f"Showing animations that include {mode_text}. "
+            f"You can open Pivot Assist directly for a selected animation."
+        )
+        dialog = AnimationUsageDialog(self, title=title, subtitle=subtitle, rows=rows, parent=self)
+        if not rows:
+            QMessageBox.information(self, title, f"No animations match ({mode_text}).")
+            return
+        dialog.exec()
+
+    def _open_sprite_list_context_menu(self, pos: QPoint) -> None:
+        list_widget = self.images_panel.list_widget
+        item = list_widget.itemAt(pos)
+        selected_keys = self._selected_sprite_keys()
+        clicked_key = str(item.data(Qt.ItemDataRole.UserRole)) if item is not None else ""
+
+        menu = QMenu(list_widget)
+
+        if clicked_key:
+            single_action = menu.addAction("See animations that use this sprite")
+            single_action.triggered.connect(
+                lambda: self._show_animation_usage_dialog(
+                    [clicked_key],
+                    require_all=False,
+                    title="Animations Using Sprite",
+                )
+            )
+
+        if len(selected_keys) >= 2:
+            any_action = menu.addAction("See animations with at least one selected sprite")
+            any_action.triggered.connect(
+                lambda: self._show_animation_usage_dialog(
+                    selected_keys,
+                    require_all=False,
+                    title="Animations Using Any Selected Sprites",
+                )
+            )
+            all_action = menu.addAction("See animations utilizing all selected sprites")
+            all_action.triggered.connect(
+                lambda: self._show_animation_usage_dialog(
+                    selected_keys,
+                    require_all=True,
+                    title="Animations Using All Selected Sprites",
+                )
+            )
+
+        if menu.isEmpty():
+            return
+        menu.exec(list_widget.mapToGlobal(pos))
+
+    def _open_timeline_frame_context_menu(self, pos: QPoint) -> None:
+        list_widget = self.animation_frame_list
+        item = list_widget.itemAt(pos)
+        if item is None:
+            return
+        if str(item.data(_TIMELINE_ITEM_KIND_ROLE) or "") != "frame":
+            return
+        try:
+            frame_index = int(item.data(Qt.ItemDataRole.UserRole))
+        except (TypeError, ValueError):
+            return
+        tag = self._selected_animation_tag()
+        if tag is None or frame_index < 0 or frame_index >= len(tag.frames):
+            return
+        runtime_key = self._resolve_animation_runtime_key(tag.frames[frame_index].sprite_key)
+        if runtime_key is None:
+            return
+
+        selected_runtime_keys: List[str] = []
+        seen: set[str] = set()
+        for selected_item in self.animation_frame_list.selectedItems():
+            if str(selected_item.data(_TIMELINE_ITEM_KIND_ROLE) or "") != "frame":
+                continue
+            try:
+                selected_frame_index = int(selected_item.data(Qt.ItemDataRole.UserRole))
+            except (TypeError, ValueError):
+                continue
+            if selected_frame_index < 0 or selected_frame_index >= len(tag.frames):
+                continue
+            selected_runtime_key = self._resolve_animation_runtime_key(tag.frames[selected_frame_index].sprite_key)
+            if selected_runtime_key is None or selected_runtime_key in seen:
+                continue
+            selected_runtime_keys.append(selected_runtime_key)
+            seen.add(selected_runtime_key)
+
+        if not selected_runtime_keys:
+            selected_runtime_keys = [runtime_key]
+        elif runtime_key not in seen:
+            selected_runtime_keys.insert(0, runtime_key)
+
+        menu = QMenu(list_widget)
+        action = menu.addAction("See animations that use this sprite")
+        action.triggered.connect(
+            lambda: self._show_animation_usage_dialog(
+                [runtime_key],
+                require_all=False,
+                title="Animations Using Sprite",
+            )
+        )
+
+        if len(selected_runtime_keys) >= 2:
+            any_action = menu.addAction("See animations with at least one selected sprite")
+            any_action.triggered.connect(
+                lambda: self._show_animation_usage_dialog(
+                    selected_runtime_keys,
+                    require_all=False,
+                    title="Animations Using Any Selected Sprites",
+                )
+            )
+            all_action = menu.addAction("See animations utilizing all selected sprites")
+            all_action.triggered.connect(
+                lambda: self._show_animation_usage_dialog(
+                    selected_runtime_keys,
+                    require_all=True,
+                    title="Animations Using All Selected Sprites",
+                )
+            )
+        menu.exec(list_widget.mapToGlobal(pos))
+
+    def _selected_sprite_records_for_pivot_assist(self, *, from_timeline: bool) -> List[tuple[str, SpriteRecord]]:
+        ordered_keys: List[str] = []
+        seen: set[str] = set()
+
+        if from_timeline:
+            tag = self._selected_animation_tag()
+            explicit_rows: List[int] = []
+            for item in self.animation_frame_list.selectedItems():
+                if str(item.data(_TIMELINE_ITEM_KIND_ROLE) or "") != "frame":
+                    continue
+                try:
+                    explicit_rows.append(int(item.data(Qt.ItemDataRole.UserRole)))
+                except (TypeError, ValueError):
+                    continue
+            frame_rows = sorted({row for row in explicit_rows if row >= 0})
+            if tag is not None and not frame_rows:
+                frame_rows = list(range(len(tag.frames)))
+            if tag is not None:
+                for row in frame_rows:
+                    if row < 0 or row >= len(tag.frames):
+                        continue
+                    runtime_key = self._resolve_animation_runtime_key(tag.frames[row].sprite_key)
+                    if runtime_key is None or runtime_key in seen:
+                        continue
+                    if runtime_key not in self.sprite_records:
+                        continue
+                    ordered_keys.append(runtime_key)
+                    seen.add(runtime_key)
+
+        if not from_timeline:
+            for key in self._selected_sprite_keys():
+                if key in seen:
+                    continue
+                if key not in self.sprite_records:
+                    continue
+                ordered_keys.append(key)
+                seen.add(key)
+
+        if not ordered_keys and not from_timeline:
+            current = self._current_record()
+            if current is not None:
+                current_key = current.path.as_posix()
+                if current_key in self.sprite_records:
+                    ordered_keys.append(current_key)
+
+        selected: List[tuple[str, SpriteRecord]] = []
+        for key in ordered_keys:
+            record = self.sprite_records.get(key)
+            if record is None:
+                continue
+            selected.append((key, record))
+        return selected
+
+    def _open_pivot_assist_dialog(self, *, from_timeline: bool = False) -> None:
+        selected = self._selected_sprite_records_for_pivot_assist(from_timeline=from_timeline)
+        sequence_keys = [key for key, _record in selected]
+        sequence_frames: List[tuple[str, int, str]] = [(key, 1, f"S{index + 1}") for index, key in enumerate(sequence_keys)]
+        if from_timeline:
+            tag = self._selected_animation_tag()
+            if tag is not None:
+                explicit_rows: List[int] = []
+                for item in self.animation_frame_list.selectedItems():
+                    if str(item.data(_TIMELINE_ITEM_KIND_ROLE) or "") != "frame":
+                        continue
+                    try:
+                        explicit_rows.append(int(item.data(Qt.ItemDataRole.UserRole)))
+                    except (TypeError, ValueError):
+                        continue
+                frame_rows = sorted({row for row in explicit_rows if row >= 0})
+                if not frame_rows:
+                    frame_rows = list(range(len(tag.frames)))
+                timeline_frames: List[tuple[str, int, str]] = []
+                for row in frame_rows:
+                    if row < 0 or row >= len(tag.frames):
+                        continue
+                    frame = tag.frames[row]
+                    runtime_key = self._resolve_animation_runtime_key(frame.sprite_key)
+                    if runtime_key is None or runtime_key not in self.sprite_records:
+                        continue
+                    timeline_frames.append((runtime_key, max(1, int(frame.duration_frames)), f"F{row + 1}"))
+                if timeline_frames:
+                    sequence_frames = timeline_frames
+        self._apply_pivot_assist_dialog(selected, sequence_keys=sequence_keys, sequence_frames=sequence_frames)
 
     def _assign_record_to_group(self, key: str, record: SpriteRecord, target_group: PaletteGroup) -> bool:
         if record.group_id == target_group.group_id:
@@ -11317,6 +17490,7 @@ class SpriteToolsWindow(QMainWindow):
         first = self.sprite_records.get(keys[0])
         if first is None:
             return
+        self._record_history("group-create-before", include_fields=["group_state"])
         group = self._create_palette_group(mode=first.load_mode, signature=f"manual:{first.load_mode}:{self._next_group_id}")
         self._palette_groups[group.group_id] = group
         changed = 0
@@ -11333,6 +17507,7 @@ class SpriteToolsWindow(QMainWindow):
             f"Created group {self._group_display_name(group)} with {changed} sprite(s)",
             3000,
         )
+        self._record_history("group-create", include_fields=["group_state"], force=True)
         logger.debug("Created manual group id=%s mode=%s assigned=%s", group.group_id, group.mode, changed)
 
     def _assign_selected_sprites_to_selected_group(self) -> None:
@@ -11347,6 +17522,7 @@ class SpriteToolsWindow(QMainWindow):
         if not keys:
             self.statusBar().showMessage("Select sprites to assign", 2500)
             return
+        self._record_history("group-assign-before", include_fields=["group_state"])
         changed = 0
         skipped = 0
         for key in keys:
@@ -11364,6 +17540,8 @@ class SpriteToolsWindow(QMainWindow):
             f"Assigned {changed} sprite(s) to {group_id}" + (f" ({skipped} skipped)" if skipped else ""),
             3500,
         )
+        if changed > 0:
+            self._record_history("group-assign", include_fields=["group_state"], force=True)
         logger.debug("Assign selected sprites target=%s changed=%s skipped=%s", group_id, changed, skipped)
 
     def _set_selected_group_color(self) -> None:
@@ -11378,8 +17556,10 @@ class SpriteToolsWindow(QMainWindow):
         chosen = QColorDialog.getColor(initial, self, f"Group Color {group.group_id}")
         if not chosen.isValid():
             return
+        self._record_history("group-color-before", include_fields=["group_state"])
         group.color = (chosen.red(), chosen.green(), chosen.blue())
         self._refresh_group_overview()
+        self._record_history("group-color", include_fields=["group_state"], force=True)
         logger.debug("Updated group color group=%s color=%s", group.group_id, group.color)
 
     def _detach_selected_sprites_to_individual_groups(self) -> None:
@@ -11387,6 +17567,7 @@ class SpriteToolsWindow(QMainWindow):
         if not keys:
             self.statusBar().showMessage("Select sprites to detach", 2500)
             return
+        self._record_history("group-detach-before", include_fields=["group_state"])
         detached = 0
         for key in keys:
             record = self.sprite_records.get(key)
@@ -11403,6 +17584,8 @@ class SpriteToolsWindow(QMainWindow):
         self._refresh_palette_for_current_selection()
         self._schedule_preview_update()
         self.statusBar().showMessage(f"Detached {detached} sprite(s)", 3000)
+        if detached > 0:
+            self._record_history("group-detach", include_fields=["group_state"], force=True)
         logger.debug("Detached sprites count=%s selected=%s", detached, len(keys))
 
     def _auto_assign_selected_sprites_to_signature_groups(self) -> None:
@@ -11410,6 +17593,7 @@ class SpriteToolsWindow(QMainWindow):
         if not keys:
             self.statusBar().showMessage("Select sprites to auto-assign", 2500)
             return
+        self._record_history("group-auto-assign-before", include_fields=["group_state"])
         reassigned = 0
         for key in keys:
             record = self.sprite_records.get(key)
@@ -11422,6 +17606,8 @@ class SpriteToolsWindow(QMainWindow):
         self._refresh_palette_for_current_selection()
         self._schedule_preview_update()
         self.statusBar().showMessage(f"Auto-assigned {reassigned} sprite(s)", 3000)
+        if reassigned > 0:
+            self._record_history("group-auto-assign", include_fields=["group_state"], force=True)
         logger.debug("Auto-assigned sprites by signature count=%s", reassigned)
 
     def _selected_palette_rows(self) -> List[int]:
@@ -11767,8 +17953,9 @@ class SpriteToolsWindow(QMainWindow):
                     alphas[idx] = 255
         return alphas
 
-    def _sync_palette_from_current_record_preserve(self) -> None:
-        record = self._current_record()
+    def _sync_palette_from_current_record_preserve(self, record: SpriteRecord | None = None) -> None:
+        if record is None:
+            record = self._current_record()
         if record is None:
             self.palette_colors = []
             self.palette_alphas = []
@@ -11951,14 +18138,25 @@ class SpriteToolsWindow(QMainWindow):
             self._update_sprite_offset_controls(None)
             self._refresh_palette_for_current_selection()
             return
+
+        # Selecting a sprite from the sprite list must always show Sprite Edit mode.
+        if self._preview_view_mode != "sprite_edit":
+            self._preview_view_mode = "sprite_edit"
+            if self.animation_play_btn.isChecked():
+                self._stop_animation_preview()
+            if hasattr(self, "preview_context_combo"):
+                idx = self.preview_context_combo.findData("sprite_edit")
+                if idx >= 0:
+                    blocked = self.preview_context_combo.blockSignals(True)
+                    self.preview_context_combo.setCurrentIndex(idx)
+                    self.preview_context_combo.blockSignals(blocked)
+            self._sync_preview_context_controls()
+            self._save_preview_ui_settings()
+
         self.statusBar().showMessage(f"Previewing {record.path.name}", 2000)
         # Update per-sprite offset controls
         self._update_sprite_offset_controls(record)
         self._refresh_palette_for_current_selection()
-        if self._is_animation_assist_view_active() and not self.animation_play_btn.isChecked():
-            if self._preview_animation_follow_selection:
-                self._refresh_animation_assist_preview_frame()
-            return
         # Don't reset zoom when switching images - retain user's zoom level
         self._reset_zoom_next = False
         self._schedule_preview_update()
@@ -12562,10 +18760,13 @@ class SpriteToolsWindow(QMainWindow):
         processed: Image.Image,
         palette: PaletteInfo,
         options: ProcessOptions,
+        *,
+        output_stem: str | None = None,
     ) -> tuple[Path, Path | None]:
         output_dir = options.output_dir
         output_dir.mkdir(parents=True, exist_ok=True)
-        output_path = output_dir / (record.path.stem + ".png")
+        stem = str(output_stem).strip() if output_stem is not None and str(output_stem).strip() else record.path.stem
+        output_path = output_dir / f"{stem}.png"
         processed.save(output_path)
         act_path: Path | None = None
         if options.write_act:
@@ -12587,11 +18788,81 @@ class SpriteToolsWindow(QMainWindow):
         self._update_export_buttons()
 
     def _export_selected(self) -> None:
-        record = self._current_record()
-        if record is None:
-            self.statusBar().showMessage("Select an image first", 3000)
-            return
-        self._export_records([record])
+        selected_records: List[SpriteRecord] = []
+        unresolved_items: List[str] = []
+        seen_keys: set[str] = set()
+        selected_items = list(self.images_panel.list_widget.selectedItems())
+
+        if logger.isEnabledFor(logging.DEBUG):
+            snapshot: List[Dict[str, Any]] = []
+            for item in selected_items:
+                raw_key = item.data(Qt.ItemDataRole.UserRole)
+                snapshot.append(
+                    {
+                        "row": int(self.images_panel.list_widget.row(item)),
+                        "text": str(item.text() or ""),
+                        "key": str(raw_key) if raw_key is not None else "",
+                        "key_type": type(raw_key).__name__ if raw_key is not None else "None",
+                    }
+                )
+            logger.debug("Export Selected snapshot count=%s items=%s", len(snapshot), snapshot)
+
+        for item in selected_items:
+            raw_key = item.data(Qt.ItemDataRole.UserRole)
+            key_text = ""
+            if isinstance(raw_key, Path):
+                key_text = raw_key.as_posix()
+            elif raw_key is not None:
+                key_text = str(raw_key).strip()
+
+            record: SpriteRecord | None = None
+            if key_text:
+                record = self.sprite_records.get(key_text)
+                if record is None:
+                    try:
+                        resolved_key = Path(key_text).resolve().as_posix()
+                        record = self.sprite_records.get(resolved_key)
+                    except Exception:  # noqa: BLE001
+                        record = None
+
+            if record is None:
+                item_name = str(item.text() or "").strip()
+                if item_name:
+                    candidates = [candidate for candidate in self.sprite_records.values() if candidate.path.name == item_name]
+                    if len(candidates) == 1:
+                        record = candidates[0]
+
+            if record is None:
+                unresolved_items.append(str(item.text() or "(unknown)"))
+                continue
+
+            record_key = record.path.as_posix()
+            if record_key in seen_keys:
+                continue
+            seen_keys.add(record_key)
+            selected_records.append(record)
+
+        if not selected_records:
+            record = self._current_record()
+            if record is None:
+                self.statusBar().showMessage("Select one or more images first", 3000)
+                return
+            selected_records = [record]
+
+        if unresolved_items:
+            logger.warning("Export Selected unresolved items=%s", unresolved_items)
+            self.statusBar().showMessage(
+                f"Exporting {len(selected_records)} selected sprite(s); {len(unresolved_items)} could not be resolved",
+                5000,
+            )
+            QMessageBox.warning(
+                self,
+                "Export Selected",
+                "Some selected sprites could not be resolved for export:\n"
+                + "\n".join(unresolved_items[:20]),
+            )
+
+        self._export_records(selected_records)
 
     def _export_all(self) -> None:
         records = list(self.sprite_records.values())
@@ -12605,12 +18876,31 @@ class SpriteToolsWindow(QMainWindow):
             return
         successes = 0
         failures: List[str] = []
+        used_stems: set[str] = set()
+
+        def _unique_output_stem(record: SpriteRecord) -> str:
+            base_stem = str(record.path.stem or "sprite").strip() or "sprite"
+            candidate = base_stem
+            suffix = 2
+            while candidate.lower() in used_stems:
+                candidate = f"{base_stem}_{suffix}"
+                suffix += 1
+            used_stems.add(candidate.lower())
+            return candidate
+
         for record in records:
             options = self._build_process_options(record, output_dir=self.output_dir, write_act=False)
             self._log_process_options("export", options, record)
             try:
                 processed, palette = self._process_record_image(record, options)
-                output_path, _ = self._save_processed_image(record, processed, palette, options)
+                output_stem = _unique_output_stem(record)
+                output_path, _ = self._save_processed_image(
+                    record,
+                    processed,
+                    palette,
+                    options,
+                    output_stem=output_stem,
+                )
                 successes += 1
                 logger.debug("Exported %s -> %s", record.path.name, output_path)
             except Exception as exc:  # noqa: BLE001 - surfaced via dialog
@@ -12930,17 +19220,238 @@ class SpriteToolsWindow(QMainWindow):
             self._sprite_browser_zoom_reset,
         )
 
+        self._sync_pivot_assist_shortcut_enablement()
+
+    def _active_visible_pivot_assist_dialog(self) -> PivotAssistDialog | None:
+        dialog = self._active_pivot_assist_dialog
+        if dialog is None:
+            return None
+        if not dialog.isVisible() or not dialog.isActiveWindow():
+            return None
+        return dialog
+
+    def _sync_pivot_assist_shortcut_enablement(self) -> None:
+        enabled = self._active_visible_pivot_assist_dialog() is not None
+        runtime = getattr(self, "_runtime_binding_shortcuts", {}) or {}
+        for binding_key, shortcuts in runtime.items():
+            if not str(binding_key).startswith("pivot_assist/"):
+                continue
+            for shortcut in shortcuts:
+                shortcut.setEnabled(enabled)
+
+    def _dispatch_pivot_assist_nudge(self, dx: int, dy: int) -> None:
+        dialog = self._active_visible_pivot_assist_dialog()
+        if dialog is None:
+            return
+        dialog.handle_shortcut_nudge(int(dx), int(dy))
+
+    def _dispatch_pivot_assist_play_pause(self) -> None:
+        dialog = self._active_visible_pivot_assist_dialog()
+        if dialog is None:
+            return
+        dialog.handle_shortcut_play_pause()
+
+    def _dispatch_pivot_assist_seek(self, delta: int) -> None:
+        dialog = self._active_visible_pivot_assist_dialog()
+        if dialog is None:
+            return
+        dialog.handle_shortcut_seek(int(delta))
+
+    def _dispatch_pivot_assist_reset_micro(self) -> None:
+        dialog = self._active_visible_pivot_assist_dialog()
+        if dialog is None:
+            return
+        dialog.handle_shortcut_reset_micro()
+
+    def _dispatch_pivot_assist_macro(self, dx: int, dy: int) -> None:
+        dialog = self._active_visible_pivot_assist_dialog()
+        if dialog is None:
+            return
+        dialog.handle_shortcut_macro(int(dx), int(dy))
+
     def _setup_history_manager(self) -> None:
         manager = HistoryManager()
         manager.register_field("palette", self._history_capture_palette, self._history_apply_palette)
         manager.register_field("fill", self._history_capture_fill, self._history_apply_fill)
         manager.register_field("canvas", self._history_capture_canvas, self._history_apply_canvas)
         manager.register_field("offsets", self._history_capture_offsets, self._history_apply_offsets)
+        manager.register_field("group_state", self._history_capture_group_state, self._history_apply_group_state)
         manager.register_field("animation_tags", self._history_capture_animation_tags, self._history_apply_animation_tags)
         manager.register_field("animation_timeline_range", self._history_capture_animation_timeline_range, self._history_apply_animation_timeline_range)
         self._history_manager = manager
 
+    def _history_capture_group_state(self) -> Dict[str, Any]:
+        groups: Dict[str, Dict[str, Any]] = {}
+        for group_id, group in self._palette_groups.items():
+            groups[group_id] = {
+                "group_id": str(group.group_id),
+                "mode": str(group.mode),
+                "signature": str(group.signature),
+                "display_name": str(group.display_name or ""),
+                "color": [int(group.color[0]), int(group.color[1]), int(group.color[2])],
+                "member_keys": sorted(str(key) for key in group.member_keys if key in self.sprite_records),
+                "detect_palette_colors": [
+                    [int(color[0]), int(color[1]), int(color[2])]
+                    for color in group.detect_palette_colors
+                ],
+                "detect_palette_alphas": [int(alpha) for alpha in group.detect_palette_alphas],
+                "detect_palette_slot_ids": [int(slot) for slot in group.detect_palette_slot_ids],
+                "canvas_width": int(group.canvas_width),
+                "canvas_height": int(group.canvas_height),
+                "offset_x": int(group.offset_x),
+                "offset_y": int(group.offset_y),
+                "canvas_override_enabled": bool(group.canvas_override_enabled),
+            }
+        return {
+            "groups": groups,
+            "record_groups": {
+                str(path_key): (str(record.group_id) if record.group_id else None)
+                for path_key, record in self.sprite_records.items()
+            },
+            "group_key_to_id": {str(key): str(value) for key, value in self._group_key_to_id.items()},
+            "next_group_id": int(self._next_group_id),
+        }
+
+    def _history_apply_group_state(self, payload: Dict[str, Any]) -> None:
+        raw_groups = payload.get("groups", {})
+        raw_record_groups = payload.get("record_groups", {})
+        raw_group_key_to_id = payload.get("group_key_to_id", {})
+        raw_next_group_id = payload.get("next_group_id", self._next_group_id)
+
+        restored_groups: Dict[str, PaletteGroup] = {}
+        if isinstance(raw_groups, dict):
+            for group_id, raw_group in raw_groups.items():
+                if not isinstance(raw_group, dict):
+                    continue
+                normalized_group_id = str(raw_group.get("group_id", group_id) or group_id).strip()
+                if not normalized_group_id:
+                    continue
+                mode = str(raw_group.get("mode", "detect") or "detect").strip().lower()
+                if mode not in ("detect", "preserve"):
+                    mode = "detect"
+                signature = str(raw_group.get("signature", "") or "")
+                display_name = str(raw_group.get("display_name", "") or "")
+                raw_color = raw_group.get("color", [120, 120, 120])
+                if isinstance(raw_color, (list, tuple)) and len(raw_color) >= 3:
+                    try:
+                        color: ColorTuple = (
+                            max(0, min(255, int(raw_color[0]))),
+                            max(0, min(255, int(raw_color[1]))),
+                            max(0, min(255, int(raw_color[2]))),
+                        )
+                    except Exception:  # noqa: BLE001
+                        color = (120, 120, 120)
+                else:
+                    color = (120, 120, 120)
+                detect_palette_colors: List[ColorTuple] = []
+                for raw_entry in raw_group.get("detect_palette_colors", []) or []:
+                    if not isinstance(raw_entry, (list, tuple)) or len(raw_entry) < 3:
+                        continue
+                    try:
+                        detect_palette_colors.append(
+                            (
+                                max(0, min(255, int(raw_entry[0]))),
+                                max(0, min(255, int(raw_entry[1]))),
+                                max(0, min(255, int(raw_entry[2]))),
+                            )
+                        )
+                    except Exception:  # noqa: BLE001
+                        continue
+                detect_palette_alphas: List[int] = []
+                for raw_alpha in raw_group.get("detect_palette_alphas", []) or []:
+                    try:
+                        detect_palette_alphas.append(max(0, min(255, int(raw_alpha))))
+                    except Exception:  # noqa: BLE001
+                        continue
+                detect_palette_slot_ids: List[int] = []
+                for raw_slot in raw_group.get("detect_palette_slot_ids", []) or []:
+                    try:
+                        detect_palette_slot_ids.append(int(raw_slot))
+                    except Exception:  # noqa: BLE001
+                        continue
+                group = PaletteGroup(
+                    group_id=normalized_group_id,
+                    mode=cast(Literal["detect", "preserve"], mode),
+                    signature=signature,
+                    display_name=display_name,
+                    color=color,
+                    member_keys=set(),
+                    detect_palette_colors=detect_palette_colors,
+                    detect_palette_alphas=detect_palette_alphas,
+                    detect_palette_slot_ids=detect_palette_slot_ids,
+                    canvas_width=int(raw_group.get("canvas_width", 304)),
+                    canvas_height=int(raw_group.get("canvas_height", 224)),
+                    offset_x=int(raw_group.get("offset_x", 0)),
+                    offset_y=int(raw_group.get("offset_y", 0)),
+                    canvas_override_enabled=bool(raw_group.get("canvas_override_enabled", False)),
+                )
+                restored_groups[normalized_group_id] = group
+
+        self._palette_groups = restored_groups
+
+        for record in self.sprite_records.values():
+            record.group_id = None
+
+        assigned_from_record_map = False
+        if isinstance(raw_record_groups, dict):
+            for path_key, raw_group_id in raw_record_groups.items():
+                key = str(path_key)
+                record = self.sprite_records.get(key)
+                if record is None or raw_group_id is None:
+                    continue
+                group_id = str(raw_group_id).strip()
+                if not group_id or group_id not in self._palette_groups:
+                    continue
+                record.group_id = group_id
+                assigned_from_record_map = True
+
+        if not assigned_from_record_map and isinstance(raw_groups, dict):
+            for raw_group in raw_groups.values():
+                if not isinstance(raw_group, dict):
+                    continue
+                group_id = str(raw_group.get("group_id", "") or "").strip()
+                if not group_id or group_id not in self._palette_groups:
+                    continue
+                for path_key in raw_group.get("member_keys", []) or []:
+                    key = str(path_key)
+                    record = self.sprite_records.get(key)
+                    if record is None:
+                        continue
+                    record.group_id = group_id
+
+        for group in self._palette_groups.values():
+            group.member_keys.clear()
+        for path_key, record in self.sprite_records.items():
+            if record.group_id and record.group_id in self._palette_groups:
+                self._palette_groups[record.group_id].member_keys.add(str(path_key))
+
+        restored_key_map: Dict[str, str] = {}
+        if isinstance(raw_group_key_to_id, dict):
+            for key, value in raw_group_key_to_id.items():
+                normalized_key = str(key)
+                normalized_group_id = str(value)
+                if normalized_group_id in self._palette_groups:
+                    restored_key_map[normalized_key] = normalized_group_id
+        self._group_key_to_id = restored_key_map
+
+        inferred_next_group_id = 1
+        for group_id in self._palette_groups.keys():
+            if group_id.startswith("G"):
+                try:
+                    inferred_next_group_id = max(inferred_next_group_id, int(group_id[1:]) + 1)
+                except Exception:  # noqa: BLE001
+                    continue
+        try:
+            requested_next_group_id = int(raw_next_group_id)
+        except Exception:  # noqa: BLE001
+            requested_next_group_id = inferred_next_group_id
+        self._next_group_id = max(1, inferred_next_group_id, requested_next_group_id)
+
+        self._refresh_group_overview()
+        self._refresh_palette_for_current_selection()
+
     def _history_capture_animation_tags(self) -> Dict[str, Any]:
+        self._sync_animation_tag_slots_with_tags()
         tags_payload = [
             AnimationTag(
                 tag_id=tag.tag_id,
@@ -12956,13 +19467,23 @@ class SpriteToolsWindow(QMainWindow):
                     for frame in tag.frames
                 ],
                 notes=tag.notes,
+                color=tag.color,
+                in_frame=int(tag.in_frame),
+                out_frame=int(tag.out_frame),
+                created_at_utc=str(tag.created_at_utc or ""),
             ).to_dict()
             for tag in sorted(self._animation_tags.values(), key=lambda entry: entry.tag_id)
         ]
-        return {"tags": tags_payload}
+        return {
+            "tags": tags_payload,
+            "slots": [None if slot is None else str(slot) for slot in self._animation_tag_slots],
+            "slot_count": int(self._animation_list_slot_count),
+        }
 
     def _history_apply_animation_tags(self, payload: Dict[str, Any]) -> None:
         raw_tags = payload.get("tags", [])
+        raw_slots = payload.get("slots", [])
+        raw_slot_count = payload.get("slot_count", self._animation_list_slot_count)
         restored: Dict[str, AnimationTag] = {}
         if isinstance(raw_tags, list):
             for item in raw_tags:
@@ -12974,6 +19495,28 @@ class SpriteToolsWindow(QMainWindow):
                     continue
                 restored[parsed.tag_id] = parsed
         self._animation_tags = restored
+
+        restored_slots: List[str | None] = []
+        if isinstance(raw_slots, list):
+            for slot in raw_slots:
+                if slot is None:
+                    restored_slots.append(None)
+                    continue
+                tag_id = str(slot or "").strip()
+                if tag_id and tag_id in self._animation_tags:
+                    restored_slots.append(tag_id)
+        self._animation_tag_slots = restored_slots
+
+        try:
+            self._animation_list_slot_count = max(1, min(512, int(raw_slot_count)))
+        except Exception:  # noqa: BLE001
+            self._animation_list_slot_count = max(1, min(512, int(self._animation_list_slot_count)))
+
+        if hasattr(self, "animation_list_slots_spin"):
+            blocked = self.animation_list_slots_spin.blockSignals(True)
+            self.animation_list_slots_spin.setValue(int(self._animation_list_slot_count))
+            self.animation_list_slots_spin.blockSignals(blocked)
+
         if self._animation_preview_tag_id is not None and self._animation_preview_tag_id not in self._animation_tags:
             self._stop_animation_preview()
         if hasattr(self, "animation_tag_list"):
@@ -12981,18 +19524,33 @@ class SpriteToolsWindow(QMainWindow):
         if not self.animation_play_btn.isChecked():
             self._set_animation_playhead_from_selected_frame()
 
-    def _history_capture_animation_timeline_range(self) -> Dict[str, int]:
+    def _history_capture_animation_timeline_range(self) -> Dict[str, Any]:
+        tag = self._selected_animation_tag()
+        if tag is not None:
+            return {
+                "tag_id": str(tag.tag_id),
+                "in_frame": int(tag.in_frame),
+                "out_frame": int(tag.out_frame),
+            }
         return {
+            "tag_id": "",
             "in_frame": int(self._animation_timeline_in_frame),
             "out_frame": int(self._animation_timeline_out_frame),
         }
 
     def _history_apply_animation_timeline_range(self, payload: Dict[str, Any]) -> None:
+        tag_id = str(payload.get("tag_id", "") or "").strip()
+        target_tag = self._animation_tags.get(tag_id) if tag_id else self._selected_animation_tag()
         in_frame = max(0, int(payload.get("in_frame", self._animation_timeline_in_frame)))
         out_frame = max(in_frame + 1, int(payload.get("out_frame", self._animation_timeline_out_frame)))
-        self._animation_timeline_in_frame = in_frame
-        self._animation_timeline_out_frame = out_frame
-        self._sync_animation_timeline_range_controls()
+        if target_tag is not None:
+            target_tag.in_frame = in_frame
+            target_tag.out_frame = out_frame
+            self._sync_animation_timeline_range_controls(target_tag)
+        else:
+            self._animation_timeline_in_frame = in_frame
+            self._animation_timeline_out_frame = out_frame
+            self._sync_animation_timeline_range_controls()
         self._save_animation_timeline_ui_settings()
         if self.animation_play_btn.isChecked():
             pos = max(
@@ -13266,6 +19824,10 @@ class SpriteToolsWindow(QMainWindow):
         spinner.blockSignals(blocked)
 
     def _undo_history(self) -> None:
+        pivot_dialog = self._active_visible_pivot_assist_dialog()
+        if pivot_dialog is not None and pivot_dialog.handle_shortcut_undo():
+            self.statusBar().showMessage("Pivot Assist: Undid local adjustment", 1800)
+            return
         self._commit_animation_timeline_range_history()
         if self._history_manager and self._history_manager.undo():
             self._sync_palette_model()
@@ -13279,6 +19841,10 @@ class SpriteToolsWindow(QMainWindow):
             self._update_animation_tag_controls()
 
     def _redo_history(self) -> None:
+        pivot_dialog = self._active_visible_pivot_assist_dialog()
+        if pivot_dialog is not None and pivot_dialog.handle_shortcut_redo():
+            self.statusBar().showMessage("Pivot Assist: Redid local adjustment", 1800)
+            return
         self._commit_animation_timeline_range_history()
         if self._history_manager and self._history_manager.redo():
             self._sync_palette_model()
@@ -13992,6 +20558,9 @@ class SpriteToolsWindow(QMainWindow):
         self._save_preview_ui_settings()
         if not self._refresh_assist_visible_frame():
             self._request_preview_pixmap_update(0)
+        if self._merge_dialog is not None and self._merge_dialog.isVisible():
+            self._merge_dialog._update_destination_blink_state()
+            self._merge_dialog._refresh_preview_from_state()
 
     def _on_hover_highlight_checkbox_toggled(self, checked: bool) -> None:
         self._set_pref("preview/highlight_hover_enabled", bool(checked))
@@ -14000,6 +20569,9 @@ class SpriteToolsWindow(QMainWindow):
         self._save_preview_ui_settings()
         if not self._refresh_assist_visible_frame():
             self._request_preview_pixmap_update(0)
+        if self._merge_dialog is not None and self._merge_dialog.isVisible():
+            self._merge_dialog._update_destination_blink_state()
+            self._merge_dialog._refresh_preview_from_state()
 
     def _set_preview_hover_palette_row(self, row: int | None) -> None:
         if self._preview_hover_palette_row == row:
@@ -14113,7 +20685,11 @@ class SpriteToolsWindow(QMainWindow):
             return
         self._request_preview_pixmap_update(0)
 
-    def _preview_highlight_targets(self) -> List[tuple[Literal["hover", "selected"], int, ColorTuple]]:
+    def _preview_highlight_targets(
+        self,
+        *,
+        prefer_selected_over_hover: bool = False,
+    ) -> List[tuple[Literal["hover", "selected"], int, ColorTuple]]:
         model = self.palette_list.model_obj
 
         hover_target: tuple[Literal["hover", "selected"], int, ColorTuple] | None = None
@@ -14127,9 +20703,9 @@ class SpriteToolsWindow(QMainWindow):
 
         selected_target: tuple[Literal["hover", "selected"], int, ColorTuple] | None = None
         if self.highlight_checkbox.isChecked():
-            index = self.palette_list.currentIndex()
-            if index.isValid() and 0 <= index.row() < 256:
-                slot_index = index.row()
+            selected_index = self._current_selected_palette_index()
+            if selected_index is not None and 0 <= int(selected_index) < 256:
+                slot_index = int(selected_index)
                 color = model.colors[slot_index]
                 if color is not None:
                     actual_color = self.palette_colors[slot_index] if slot_index < len(self.palette_colors) else color
@@ -14145,10 +20721,10 @@ class SpriteToolsWindow(QMainWindow):
                 targets.append(selected_target)
             return targets
 
-        if hover_target is not None:
-            return [hover_target]
         if selected_target is not None:
             return [selected_target]
+        if hover_target is not None:
+            return [hover_target]
         return []
 
     def _build_overlay_layers_from_index_data(
@@ -14158,11 +20734,12 @@ class SpriteToolsWindow(QMainWindow):
         index_data: Sequence[int],
         *,
         include_dragging: bool = False,
+        prefer_selected_over_hover: bool = False,
         source_token: Any = None,
     ) -> tuple[List[tuple[int, QRegion, QColor]], tuple[tuple[int, int, int, int, int], ...]]:
         targets: List[tuple[Literal["hover", "selected"], int, ColorTuple]] = []
         if include_dragging or not self.preview_panel.is_dragging():
-            targets = self._preview_highlight_targets()
+            targets = self._preview_highlight_targets(prefer_selected_over_hover=prefer_selected_over_hover)
         if not targets:
             return [], ()
 
@@ -14226,6 +20803,7 @@ class SpriteToolsWindow(QMainWindow):
             int(height),
             index_bytes,
             include_dragging=False,
+            prefer_selected_over_hover=True,
             source_token=("assist", cache_key),
         )
         return layers, QSize(int(width), int(height)), (key, signature)
@@ -14741,12 +21319,13 @@ class SpriteToolsWindow(QMainWindow):
             source_after_mode="compact_shift",
         )
     
-    def _auto_merge_colors(self) -> None:
-        """Auto-merge similar colors based on tolerance."""
-        tolerance = self.tolerance_spin.value()
+    def _auto_merge_colors_with_tolerance(self, tolerance: int, *, parent: QWidget | None = None) -> bool:
+        """Auto-merge similar colors based on tolerance. Returns True when changes are applied."""
+        tolerance = max(0, min(255, int(tolerance)))
+        dialog_parent = parent if parent is not None else self
         if not self.palette_colors:
-            QMessageBox.information(self, "Auto-Merge", "No colors in palette to merge.")
-            return
+            QMessageBox.information(dialog_parent, "Auto-Merge", "No colors in palette to merge.")
+            return False
         
         tolerance_sq = tolerance * tolerance * 3  # RGB distance squared
         
@@ -14773,14 +21352,14 @@ class SpriteToolsWindow(QMainWindow):
         
         if not merge_map:
             QMessageBox.information(
-                self,
+                dialog_parent,
                 "Auto-Merge",
                 f"No similar colors found within tolerance {tolerance}."
             )
-            return
+            return False
         
         reply = QMessageBox.question(
-            self,
+            dialog_parent,
             "Auto-Merge Confirmation",
             f"Found {len(merge_map)} colors to merge. Continue?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
@@ -14788,7 +21367,7 @@ class SpriteToolsWindow(QMainWindow):
         )
         
         if reply != QMessageBox.StandardButton.Yes:
-            return
+            return False
         
         logger.info(f"=== AUTO-MERGE: tolerance={tolerance}, merging {len(merge_map)} colors")
         
@@ -14859,6 +21438,12 @@ class SpriteToolsWindow(QMainWindow):
         self.statusBar().showMessage(f"Auto-merged {len(merge_map)} similar colors", 3000)
         self._record_history("auto-merge")
         self._schedule_preview_update()
+        return True
+
+    def _auto_merge_colors(self) -> None:
+        """Auto-merge similar colors based on tolerance."""
+        tolerance = max(0, min(255, self._get_pref_int("merge/auto_tolerance", 10)))
+        self._auto_merge_colors_with_tolerance(int(tolerance), parent=self)
 
     def _show_sprites_using_index_dialog(self, index: int) -> None:
         """Show a dialog with a list of sprites that use the specified palette index."""
@@ -15034,6 +21619,7 @@ class SpriteToolsWindow(QMainWindow):
         self.preview_panel.set_drag_backdrop_rgba(self._resolve_drag_backdrop_rgba())
         self.preview_panel.set_static_pixmap(None)
         if self._last_preview_rgba is None:
+            self.preview_panel.set_guide_options({})
             self.preview_panel.set_overlay_layers([], QSize(0, 0))
             record = self._current_record()
             if record is None:
@@ -15065,15 +21651,43 @@ class SpriteToolsWindow(QMainWindow):
                 source_token=("sprite", base_cache_key),
             )
 
+        custom_axes_signature = tuple(
+            (
+                int(axis.get("slot", 0)),
+                str(axis.get("name", "")),
+                int(axis.get("x", 0)),
+                int(axis.get("y", 0)),
+                str(axis.get("layer", "top")),
+                tuple(int(v) for v in self._normalize_rgb_color(axis.get("color", (255, 190, 120)), (255, 190, 120))),
+            )
+            for axis in self._enabled_custom_axis_guides()
+        )
+        guide_signature: tuple[Any, ...] = (
+            bool(self._preview_guides_show_grid),
+            int(self._preview_guides_grid_step),
+            bool(self._preview_guides_show_axis),
+            int(self._preview_guides_axis_x),
+            int(self._preview_guides_axis_y),
+            str(self._preview_guides_axis_layer),
+            tuple(int(v) for v in self._preview_guides_axis_color),
+            custom_axes_signature,
+        )
         render_signature: tuple[Any, ...] = (
             base_cache_key,
             bool(self._reset_zoom_next),
             layer_signature,
+            guide_signature,
         )
         if self._last_preview_render_signature == render_signature:
             return
         self._last_preview_render_signature = render_signature
 
+        self.preview_panel.set_guide_options(
+            self._build_main_preview_guide_options(
+                max(1, int(base_pixmap.width())),
+                max(1, int(base_pixmap.height())),
+            )
+        )
         self.preview_panel.set_overlay_layers(overlay_layers, base_pixmap.size())
         self.preview_panel.set_pixmap(base_pixmap, reset_zoom=self._reset_zoom_next)
         self._reset_zoom_next = False
@@ -15183,9 +21797,178 @@ class SpriteToolsWindow(QMainWindow):
                 if event.key() == Qt.Key.Key_A and event.modifiers() & Qt.KeyboardModifier.ControlModifier:
                     self.images_panel.list_widget.selectAll()
                     return True
+        if hasattr(self, "animation_tag_list") and source is self.animation_tag_list.viewport():
+            if event.type() in (QEvent.Type.DragEnter, QEvent.Type.DragMove):
+                if self._sprite_list_is_drop_source(event):
+                    point = event.position().toPoint() if hasattr(event, "position") else event.pos()
+                    slot_row = self._animation_tag_slot_row_from_point(point)
+                    selected_count = len(self._selected_sprite_keys_in_view_order())
+                    count_text = "1 sprite" if selected_count == 1 else f"{selected_count} sprites"
+                    if slot_row is None:
+                        self._set_drop_feedback_message("Drop on an empty animation slot to create from selection")
+                        event.ignore()
+                        return True
+                    target_item = self.animation_tag_list.item(int(slot_row))
+                    slot_kind = str(target_item.data(_ANIM_TAG_SLOT_KIND_ROLE) or "") if target_item is not None else ""
+                    if slot_kind != "empty":
+                        self._set_drop_feedback_message("Drop on an empty animation slot to create from selection")
+                        event.ignore()
+                        return True
+                    self.animation_tag_list.setCurrentRow(int(slot_row))
+                    self._set_drop_feedback_message(
+                        f"Drop to create animation from {count_text} in slot {int(slot_row) + 1}"
+                    )
+                    event.setDropAction(Qt.DropAction.CopyAction)
+                    event.accept()
+                    return True
+            if event.type() == QEvent.Type.Drop:
+                if self._sprite_list_is_drop_source(event):
+                    point = event.position().toPoint() if hasattr(event, "position") else event.pos()
+                    slot_row = self._animation_tag_slot_row_from_point(point)
+                    sprite_keys = self._selected_sprite_keys_in_view_order()
+                    if not sprite_keys:
+                        self._set_drop_feedback_message(None)
+                        self.statusBar().showMessage("Select one or more sprites first", 2500)
+                        event.ignore()
+                        return True
+                    if slot_row is None:
+                        self._set_drop_feedback_message(None)
+                        self.statusBar().showMessage("Drop on an empty animation slot to create from selection", 2500)
+                        event.ignore()
+                        return True
+                    target_item = self.animation_tag_list.item(int(slot_row))
+                    slot_kind = str(target_item.data(_ANIM_TAG_SLOT_KIND_ROLE) or "") if target_item is not None else ""
+                    if slot_kind != "empty":
+                        self._set_drop_feedback_message(None)
+                        self.statusBar().showMessage("Drop on an empty animation slot to create from selection", 2500)
+                        event.ignore()
+                        return True
+                    self.animation_tag_list.setCurrentRow(int(slot_row))
+                    self._set_drop_feedback_message(None)
+                    self._create_animation_tag(initial_sprite_keys=sprite_keys, target_slot_override=int(slot_row))
+                    event.setDropAction(Qt.DropAction.CopyAction)
+                    event.accept()
+                    return True
+            if event.type() in (QEvent.Type.DragLeave, QEvent.Type.Leave, QEvent.Type.HoverLeave):
+                self._set_drop_feedback_message(None)
+            if event.type() == QEvent.Type.Wheel and isinstance(event, QWheelEvent):
+                if self._apply_ctrl_wheel_zoom(self.animation_list_zoom_slider, event):
+                    return True
         if hasattr(self, "animation_frame_list") and source is self.animation_frame_list.viewport():
+            if event.type() in (QEvent.Type.DragEnter, QEvent.Type.DragMove):
+                if self._sprite_list_is_drop_source(event):
+                    tag = self._selected_animation_tag()
+                    if tag is None:
+                        self._set_drop_feedback_message("Drag from Sprites: select/create an animation tag first")
+                        event.ignore()
+                        return True
+                    point = event.position().toPoint() if hasattr(event, "position") else event.pos()
+                    insert_index, marker_x = self._animation_drop_insert_index_from_point(point)
+                    self._show_animation_timeline_marker(marker_x, color="#6fd08c")
+                    selected_count = len(self._selected_sprite_keys_in_view_order())
+                    count_text = "1 sprite" if selected_count == 1 else f"{selected_count} sprites"
+                    self._set_drop_feedback_message(
+                        f"Drop to add {count_text} at frame position {int(insert_index) + 1}"
+                    )
+                    event.setDropAction(Qt.DropAction.CopyAction)
+                    event.accept()
+                    return True
+                if event.mimeData().hasUrls():
+                    feedback = self._ctrl_drop_feedback_text(event, source_widget=self.animation_frame_list.viewport())
+                    self._set_drop_feedback_message(feedback)
+                    if feedback is not None:
+                        event.setDropAction(Qt.DropAction.CopyAction)
+                        event.accept()
+                    else:
+                        event.acceptProposedAction()
+                    return True
+                self._set_drop_feedback_message(None)
+                event.ignore()
+                return True
+            if event.type() == QEvent.Type.Drop:
+                if self._sprite_list_is_drop_source(event):
+                    self._hide_animation_timeline_marker()
+                    tag = self._selected_animation_tag()
+                    if tag is None:
+                        self._set_drop_feedback_message(None)
+                        self.statusBar().showMessage("Select or create an animation tag first", 2500)
+                        event.ignore()
+                        return True
+                    point = event.position().toPoint() if hasattr(event, "position") else event.pos()
+                    insert_index, _marker_x = self._animation_drop_insert_index_from_point(point)
+                    inserted = self._insert_sprite_keys_into_animation_tag(
+                        tag,
+                        int(insert_index),
+                        self._selected_sprite_keys_in_view_order(),
+                    )
+                    self._set_drop_feedback_message(None)
+                    if inserted > 0:
+                        self.statusBar().showMessage(f"Added {inserted} sprite frame(s) to '{tag.name}'", 3200)
+                        event.setDropAction(Qt.DropAction.CopyAction)
+                        event.accept()
+                    else:
+                        self.statusBar().showMessage("No valid sprite selection to add", 2200)
+                        event.ignore()
+                    return True
+                if not event.mimeData().hasUrls():
+                    self._set_drop_feedback_message(None)
+                    event.ignore()
+                    return True
+                replaced = self._handle_ctrl_drop_replace(event, source_widget=self.animation_frame_list.viewport())
+                self._set_drop_feedback_message(None)
+                if replaced:
+                    event.setDropAction(Qt.DropAction.CopyAction)
+                    event.accept()
+                    return True
+                paths: List[Path] = []
+                for url in event.mimeData().urls():
+                    local = Path(url.toLocalFile())
+                    if not local.exists():
+                        continue
+                    if local.is_dir():
+                        options = ScanOptions(roots=[local], recursive=True)
+                        paths.extend(iter_image_files(options))
+                    elif local.is_file() and is_supported_image(local):
+                        paths.append(local)
+                if paths:
+                    self._load_images(paths)
+                    event.acceptProposedAction()
+                else:
+                    event.ignore()
+                return True
+            if event.type() in (QEvent.Type.DragLeave, QEvent.Type.Leave, QEvent.Type.HoverLeave):
+                self._hide_animation_timeline_marker()
+                self._set_drop_feedback_message(None)
+            if event.type() == QEvent.Type.Wheel and isinstance(event, QWheelEvent):
+                if self._apply_ctrl_wheel_zoom(self.animation_timeline_zoom_slider, event):
+                    return True
             if event.type() == QEvent.Type.MouseButtonPress and isinstance(event, QMouseEvent):
                 if event.button() == Qt.MouseButton.LeftButton:
+                    if event.modifiers() & Qt.KeyboardModifier.ShiftModifier and not (event.modifiers() & Qt.KeyboardModifier.ControlModifier):
+                        clicked_frame = self._animation_frame_row_at_point(event.pos())
+                        tag = self._selected_animation_tag()
+                        if clicked_frame is not None and tag is not None and 0 <= clicked_frame < len(tag.frames):
+                            anchor_frame = self._selected_animation_frame_index()
+                            if anchor_frame is None or anchor_frame < 0 or anchor_frame >= len(tag.frames):
+                                anchor_frame = clicked_frame
+                            start_frame = min(anchor_frame, clicked_frame)
+                            end_frame = max(anchor_frame, clicked_frame)
+                            selection_model = self.animation_frame_list.selectionModel()
+                            if selection_model is not None:
+                                selection_model.clearSelection()
+                                for frame in range(start_frame, end_frame + 1):
+                                    item_row = self._timeline_row_for_frame_index(frame)
+                                    if item_row is None:
+                                        continue
+                                    idx = self.animation_frame_list.model().index(item_row, 0)
+                                    selection_model.select(idx, QItemSelectionModel.SelectionFlag.Select)
+                            clicked_item_row = self._timeline_row_for_frame_index(clicked_frame)
+                            if clicked_item_row is not None:
+                                self._set_animation_timeline_current_row(clicked_item_row, preserve_selection=True)
+                            return True
+                        return super().eventFilter(source, event)
+                    if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+                        return super().eventFilter(source, event)
                     row = self._animation_frame_row_at_point(event.pos())
                     if row is not None:
                         tag = self._selected_animation_tag()
@@ -15200,6 +21983,7 @@ class SpriteToolsWindow(QMainWindow):
                         self._animation_manual_drag_start_x = int(event.pos().x())
                         self._animation_manual_drag_changed = False
                         self._animation_manual_drag_gap_target_timeline_position = None
+                        self._animation_manual_drag_duplicate_mode = bool(event.modifiers() & Qt.KeyboardModifier.AltModifier)
                         current_rows = self._selected_animation_frame_rows()
                         if edge_hit is None and row not in current_rows:
                             selection_model = self.animation_frame_list.selectionModel()
@@ -15255,10 +22039,11 @@ class SpriteToolsWindow(QMainWindow):
                             self._show_animation_timeline_marker(marker_x, color="#7fb6ff")
                             self.animation_frame_list.viewport().setCursor(Qt.CursorShape.ClosedHandCursor)
                             logger.debug(
-                                "Timeline move-start drag_id=%s source_row=%s insert_index=%s",
+                                "Timeline move-start drag_id=%s source_row=%s insert_index=%s duplicate=%s",
                                 self._animation_manual_drag_session_id,
                                 row,
                                 insert_index,
+                                self._animation_manual_drag_duplicate_mode,
                             )
                         return True
             if event.type() == QEvent.Type.MouseMove and isinstance(event, QMouseEvent):
@@ -15309,7 +22094,7 @@ class SpriteToolsWindow(QMainWindow):
                             target_frame = max(0, min(frame_count - 1, insert_index if insert_index < frame_count else (frame_count - 1)))
                             item_row = self._timeline_row_for_frame_index(target_frame)
                             if item_row is not None:
-                                self.animation_frame_list.setCurrentRow(item_row)
+                                self._set_animation_timeline_current_row(item_row, preserve_selection=True)
                         gap_slot_rect = self._animation_gap_slot_rect_at_point(event.pos())
                         if gap_slot_rect is not None:
                             if gap_target_timeline_pos is not None:
@@ -15345,6 +22130,7 @@ class SpriteToolsWindow(QMainWindow):
                     self._hide_animation_timeline_marker()
                     self._hide_animation_timeline_drop_zone()
                     mode = self._animation_manual_drag_mode
+                    duplicate_mode = bool(self._animation_manual_drag_duplicate_mode)
                     source_row = self._animation_manual_drag_source_row
                     target_row = self._animation_manual_drag_target_row
                     selected_rows = list(self._animation_manual_drag_selected_rows)
@@ -15383,6 +22169,7 @@ class SpriteToolsWindow(QMainWindow):
                     self._animation_manual_drag_target_row = -1
                     self._animation_manual_drag_selected_rows = []
                     self._animation_manual_drag_gap_target_timeline_position = None
+                    self._animation_manual_drag_duplicate_mode = False
                     self._animation_manual_drag_mode = "none"
                     self._animation_manual_drag_resize_edge = "none"
                     self._animation_manual_drag_session_id = 0
@@ -15398,6 +22185,9 @@ class SpriteToolsWindow(QMainWindow):
                         self._animation_manual_drag_changed = False
                     else:
                         rows = sorted({int(row) for row in selected_rows if row >= 0})
+                        if duplicate_mode:
+                            self._duplicate_animation_frames_to_index(rows if rows else [source_row], target_row)
+                            return True
                         no_reorder = False
                         if rows:
                             first = rows[0]
@@ -15424,20 +22214,52 @@ class SpriteToolsWindow(QMainWindow):
     # Drag-and-drop image loading support
     def dragEnterEvent(self, event) -> None:  # type: ignore[override]
         if event.mimeData().hasUrls():
-            event.acceptProposedAction()
+            feedback = self._ctrl_drop_feedback_text(event)
+            self._set_drop_feedback_message(feedback)
+            if feedback is not None:
+                event.setDropAction(Qt.DropAction.CopyAction)
+                event.accept()
+            else:
+                event.acceptProposedAction()
         else:
+            self._set_drop_feedback_message(None)
             event.ignore()
 
     def dragMoveEvent(self, event) -> None:  # type: ignore[override]
         if event.mimeData().hasUrls():
-            event.acceptProposedAction()
+            feedback = self._ctrl_drop_feedback_text(event)
+            self._set_drop_feedback_message(feedback)
+            if feedback is not None:
+                event.setDropAction(Qt.DropAction.CopyAction)
+                event.accept()
+            else:
+                event.acceptProposedAction()
         else:
+            self._set_drop_feedback_message(None)
             event.ignore()
+
+    def dragLeaveEvent(self, event) -> None:  # type: ignore[override]
+        self._set_drop_feedback_message(None)
+        super().dragLeaveEvent(event)
 
     def dropEvent(self, event) -> None:  # type: ignore[override]
         if not event.mimeData().hasUrls():
+            self._set_drop_feedback_message(None)
             event.ignore()
             return
+
+        ctrl_replace_intent = bool(event.modifiers() & Qt.KeyboardModifier.ControlModifier)
+        if ctrl_replace_intent:
+            replaced = self._handle_ctrl_drop_replace(event)
+            self._set_drop_feedback_message(None)
+            if replaced:
+                event.setDropAction(Qt.DropAction.CopyAction)
+                event.accept()
+            else:
+                self.statusBar().showMessage("Ctrl+Drop replace target not found (hover a sprite entry or animation frame)", 2500)
+                event.ignore()
+            return
+
         paths: List[Path] = []
         for url in event.mimeData().urls():
             local = Path(url.toLocalFile())
@@ -15450,8 +22272,10 @@ class SpriteToolsWindow(QMainWindow):
                 paths.append(local)
         if paths:
             self._load_images(paths)
+            self._set_drop_feedback_message(None)
             event.acceptProposedAction()
         else:
+            self._set_drop_feedback_message(None)
             event.ignore()
 
 
